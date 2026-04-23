@@ -1,0 +1,39 @@
+  async addStock(sku: string, qtyUnits: number, costUSD: number, expiry: Date, warehouse: string = 'Galpon D3', supplier?: string, paymentType?: 'CASH' | 'CREDIT', invoiceImage?: string) {
+    const { error } = await supabase.from('inventory_batches').insert({
+      product_code: sku,
+      quantity: qtyUnits,
+      cost_usd: costUSD,
+      expiry_date: expiry.toISOString().split('T')[0],
+      purchase_date: new Date().toISOString().split('T')[0],
+      warehouse: warehouse,
+      supplier: supplier,
+      payment_type: paymentType,
+      invoice_image_url: invoiceImage
+    }).select().single();
+
+    if (error) {
+      console.error('Error agregando stock:', error);
+    }
+
+    await supabase.from('movements').insert({
+      product_code: sku,
+      type: 'IN',
+      quantity: qtyUnits,
+      warehouse: warehouse,
+      reason: `Entrada: ${supplier || 'S/Proveedor'} (${paymentType === 'CREDIT' ? 'CRÉDITO' : 'CONTADO'})`,
+      operator: this.currentUser.name
+    });
+
+    if (paymentType === 'CREDIT' && supplier) {
+      await this.addAPEntry(
+        supplier,
+        `Factura Mercancía: ${sku} (${qtyUnits} kg)`,
+        qtyUnits * costUSD,
+        15
+      );
+    }
+
+    await this.init();
+    return !error;
+  }
+

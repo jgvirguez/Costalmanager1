@@ -1,0 +1,8 @@
+Al momento de pedir el inventario que el sistema sea eficaz y rapido.
+
+Son 3 Almacenes los que se van a agregar, los reportes deben ser por almacen que hay en cada uno, que tengo sumando todos los almacenes y que tengo en almacen 1, 2 o 3.
+
+Yo queiro saber si el cliente con un link puede ver su estado de cuenta que deba a la empresa. Y que vean sus transferencias adjuntos en documentos
+
+
+

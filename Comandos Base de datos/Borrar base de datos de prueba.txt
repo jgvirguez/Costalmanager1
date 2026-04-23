@@ -1,0 +1,7 @@
+delete from sales;
+delete from movements;
+delete from inventory_batches;
+delete from ar_entries;
+delete from ap_entries;
+delete from expenses;
+-- No borramos a los Usuarios ni la configuración de Productos

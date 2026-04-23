@@ -1,0 +1,12 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# Credenciales / archivos locales (no subir a remoto)
+ClaveBasedeDatos.txt
+base64.txt

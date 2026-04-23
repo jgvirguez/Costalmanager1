@@ -1,0 +1,32 @@
+export interface CreateProductInput {
+  code?: string;
+  description: string;
+  unit: string;
+  priceUSD?: number;
+  minStock?: number;
+  conversionRatio?: number;
+  baseUnit?: string;
+}
+
+export interface PurchaseRegistrationInput {
+  sku?: string;
+  newProduct?: CreateProductInput;
+  supplier: string;
+  invoiceNumber: string;
+  invoiceDate: Date;
+  expiryDate: Date;
+  qty: number;
+  costUSD: number;
+  totalInvoiceUSD: number;
+  paymentType: 'CASH' | 'CREDIT';
+  files?: File[];
+  warehouse?: string;
+}
+
+export interface PurchaseRegistrationResult {
+  sku: string;
+  createdProduct: boolean;
+  apEntryId?: string;
+  supportsUploadError?: string;
+}
+

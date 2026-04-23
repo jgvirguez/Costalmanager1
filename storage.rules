@@ -1,0 +1,10 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Endurecimiento mínimo seguro para producción:
+    // impedir acceso público a Storage.
+    match /{allPaths=**} {
+      allow read, write: if request.auth != null;
+    }
+  }
+}
