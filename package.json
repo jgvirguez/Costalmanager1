@@ -12,7 +12,8 @@
     "supabase:create-supports-bucket": "tsx scripts/createSupabaseSupportsBucket.ts",
     "sync:products-txt": "tsx scripts/syncProductsFromTxt.ts",
     "deploy": "npm run build && firebase deploy --only firestore:rules,storage,hosting",
-    "deploy:watch": "node scripts/auto-deploy.js"
+    "deploy:watch": "node scripts/auto-deploy.js",
+    "postinstall": "node scripts/install-platform-binding.cjs"
   },
   "dependencies": {
     "@google/genai": "^1.29.0",
@@ -39,9 +40,5 @@
     "tsx": "^4.21.0",
     "typescript": "~5.8.2",
     "vite": "^6.2.0"
-  },
-  "optionalDependencies": {
-    "@tailwindcss/oxide-linux-x64-gnu": "*",
-    "@tailwindcss/oxide-win32-x64-msvc": "*"
   }
 }
