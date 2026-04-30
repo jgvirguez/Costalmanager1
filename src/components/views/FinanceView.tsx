@@ -30,7 +30,6 @@ import {
   Copy,
   MapPin,
   ExternalLink,
-  CheckCircle2 as CheckIcon,
   ChevronDown,
   ChevronUp,
   ReceiptText,
@@ -46,6 +45,8 @@ import { buildExcelFriendlyCsv } from '../../utils/csvExport';
 import { PurchaseEntryModal } from '../modals/PurchaseEntryModal';
 import { ConfirmModal } from '../ConfirmModal';
 import { BillingClient } from '../../types/billing';
+
+const CheckIcon = CheckCircle2;
 
 const formatInvoiceProductDetails = (lines: any[]): string => {
   const list = Array.isArray(lines) ? lines : [];
@@ -539,6 +540,8 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
   const [expenseMonthFilter, setExpenseMonthFilter] = useState('');
   const [showPayrollModal, setShowPayrollModal] = useState(false);
   const [payrollEmpId, setPayrollEmpId] = useState('');
+  const [payrollEmpSearch, setPayrollEmpSearch] = useState('');
+  const [payrollEmpOpen, setPayrollEmpOpen] = useState(false);
   const [payrollSalary, setPayrollSalary] = useState('');
   const [payrollPeriod, setPayrollPeriod] = useState('');
   const [payrollCxcCurrency, setPayrollCxcCurrency] = useState<'USD'|'BS'>('USD');
@@ -583,6 +586,8 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
   const [showCreateLoanModal, setShowCreateLoanModal] = useState(false);
   const [loanSubmitting, setLoanSubmitting] = useState(false);
   const [loanError, setLoanError] = useState('');
+  const [loanBenSearch, setLoanBenSearch] = useState('');
+  const [loanBenOpen, setLoanBenOpen] = useState(false);
   const [loanForm, setLoanForm] = useState({
     beneficiaryType: 'EMPLOYEE' as 'EMPLOYEE' | 'PARTNER',
     beneficiaryName: '',
@@ -2085,7 +2090,8 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
   const payrollPendiente = Math.max(0, payrollNeto - payrollTotalPaid);
   const closePayrollModal = () => {
     setShowPayrollModal(false);
-    setPayrollEmpId(''); setPayrollSalary(''); setPayrollPeriod('');
+    setPayrollEmpId(''); setPayrollEmpSearch(''); setPayrollEmpOpen(false);
+    setPayrollSalary(''); setPayrollPeriod('');
     setPayrollCxcCurrency('USD'); setPayrollCxcAmount('');
     setPayrollObservation(''); setPayrollError('');
     setPayrollLines([{ method: 'cash_usd', amountUSD: '', ref: '' }]);
@@ -4649,58 +4655,77 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
                   <div>
                     <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest block mb-1.5">Empleado / Socio *</label>
                     <div className="relative">
-                      <select
-                        value={payrollEmpId}
-                        onChange={e => {
-                          setPayrollEmpId(e.target.value);
-                          setPayrollCxcInvoices({});
-                          setPayrollCxcAbonos({});
-                          setPayrollCxcAmount('');
-                        }}
-                        className="w-full border border-slate-200 rounded-2xl pl-10 pr-4 py-2.5 text-sm font-bold outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100 transition-all bg-white appearance-none"
-                      >
-                        <option value="">Seleccionar persona...</option>
-                        {payrollSystemUsers.map(u => (
-                          <option key={u.id} value={u.id}>
-                            {u.name} · {u.companyRole}{u.cedula ? ` · ${u.cedula}` : ''}
-                          </option>
-                        ))}
-                      </select>
-                      <div className="absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none">
+                      {/* Input buscador */}
+                      <div className="flex items-center gap-2 border border-slate-200 rounded-2xl px-3 py-2.5 focus-within:border-emerald-500 focus-within:ring-2 focus-within:ring-emerald-100 transition-all bg-white">
                         {payrollSelectedUser?.photoURL ? (
-                          <img src={payrollSelectedUser.photoURL} alt="" className="w-5 h-5 rounded-lg object-cover"/>
+                          <img src={payrollSelectedUser.photoURL} alt="" className="w-6 h-6 rounded-lg object-cover shrink-0"/>
                         ) : payrollSelectedUser ? (
-                          <div className={`w-5 h-5 rounded-lg flex items-center justify-center text-[9px] font-black
+                          <div className={`w-6 h-6 rounded-lg flex items-center justify-center text-[10px] font-black shrink-0
                             ${payrollSelectedUser.companyRole === 'SOCIO' ? 'bg-violet-100 text-violet-700' : 'bg-emerald-100 text-emerald-700'}`}>
                             {payrollSelectedUser.name.charAt(0)}
                           </div>
                         ) : (
-                          <Users className="w-4 h-4 text-slate-300"/>
+                          <Users className="w-4 h-4 text-slate-300 shrink-0"/>
+                        )}
+                        <input
+                          type="text"
+                          value={payrollEmpSearch}
+                          onChange={e => { setPayrollEmpSearch(e.target.value); setPayrollEmpOpen(true); if (!e.target.value) { setPayrollEmpId(''); setPayrollCxcInvoices({}); setPayrollCxcAbonos({}); setPayrollCxcAmount(''); } }}
+                          onFocus={() => setPayrollEmpOpen(true)}
+                          placeholder={payrollSelectedUser ? payrollSelectedUser.name : 'Buscar por nombre o cédula...'}
+                          className="flex-1 text-sm font-bold outline-none bg-transparent placeholder:text-slate-300 placeholder:font-normal"
+                        />
+                        {payrollSelectedUser && (
+                          <button type="button" onClick={() => { setPayrollEmpId(''); setPayrollEmpSearch(''); setPayrollEmpOpen(false); setPayrollCxcInvoices({}); setPayrollCxcAbonos({}); setPayrollCxcAmount(''); }}
+                            className="p-0.5 hover:bg-slate-100 rounded-lg transition-all">
+                            <X className="w-3.5 h-3.5 text-slate-400"/>
+                          </button>
                         )}
                       </div>
+                      {/* Dropdown resultados */}
+                      {payrollEmpOpen && (() => {
+                        const q = payrollEmpSearch.toLowerCase().trim();
+                        const filtered = payrollSystemUsers.filter(u =>
+                          !q || u.name.toLowerCase().includes(q) || (u.cedula ?? '').toLowerCase().includes(q)
+                        );
+                        if (!filtered.length) return null;
+                        return (
+                          <div className="absolute z-50 top-full left-0 right-0 mt-1 bg-white border border-slate-200 rounded-2xl shadow-xl overflow-hidden max-h-52 overflow-y-auto">
+                            {filtered.map(u => (
+                              <button key={u.id} type="button"
+                                onMouseDown={() => {
+                                  setPayrollEmpId(u.id);
+                                  setPayrollEmpSearch('');
+                                  setPayrollEmpOpen(false);
+                                  setPayrollCxcInvoices({});
+                                  setPayrollCxcAbonos({});
+                                  setPayrollCxcAmount('');
+                                }}
+                                className="w-full flex items-center gap-3 px-4 py-2.5 hover:bg-emerald-50 transition-all text-left">
+                                {u.photoURL ? (
+                                  <img src={u.photoURL} alt="" className="w-8 h-8 rounded-xl object-cover shrink-0 border border-slate-100"/>
+                                ) : (
+                                  <div className={`w-8 h-8 rounded-xl flex items-center justify-center text-sm font-black shrink-0
+                                    ${u.companyRole === 'SOCIO' ? 'bg-violet-100 text-violet-700' : 'bg-emerald-100 text-emerald-700'}`}>
+                                    {u.name.charAt(0)}
+                                  </div>
+                                )}
+                                <div className="flex-1 min-w-0">
+                                  <p className="text-sm font-black text-slate-900 truncate">{u.name}</p>
+                                  {u.cedula && <p className="text-[10px] font-bold text-slate-400">CI: {u.cedula}</p>}
+                                </div>
+                                <span className={`text-[8px] font-black px-2 py-0.5 rounded-full uppercase tracking-widest shrink-0
+                                  ${u.companyRole === 'SOCIO' ? 'bg-violet-100 text-violet-600' : 'bg-emerald-100 text-emerald-600'}`}>
+                                  {u.companyRole}
+                                </span>
+                              </button>
+                            ))}
+                          </div>
+                        );
+                      })()}
                     </div>
                     {payrollSystemUsers.length === 0 && (
                       <p className="text-[10px] text-amber-600 font-bold mt-1">Sin empleados/socios. Asigna el rol en Seguridad.</p>
-                    )}
-                    {/* Mini-cards de usuarios disponibles */}
-                    {payrollSystemUsers.length > 0 && !payrollEmpId && (
-                      <div className="mt-2 flex gap-2 flex-wrap">
-                        {payrollSystemUsers.slice(0, 5).map(u => (
-                          <button key={u.id} type="button"
-                            onClick={() => { setPayrollEmpId(u.id); setPayrollCxcInvoices({}); setPayrollCxcAbonos({}); setPayrollCxcAmount(''); }}
-                            className="flex items-center gap-1.5 px-2 py-1 bg-slate-50 hover:bg-emerald-50 border border-slate-200 hover:border-emerald-300 rounded-xl transition-all">
-                            {u.photoURL ? (
-                              <img src={u.photoURL} alt="" className="w-5 h-5 rounded-lg object-cover"/>
-                            ) : (
-                              <div className={`w-5 h-5 rounded-lg flex items-center justify-center text-[8px] font-black shrink-0
-                                ${u.companyRole === 'SOCIO' ? 'bg-violet-100 text-violet-700' : 'bg-emerald-100 text-emerald-700'}`}>
-                                {u.name.charAt(0)}
-                              </div>
-                            )}
-                            <span className="text-[9px] font-black text-slate-700 max-w-[80px] truncate">{u.name.split(' ')[0]}</span>
-                          </button>
-                        ))}
-                      </div>
                     )}
                   </div>
                   <div>
@@ -7132,71 +7157,273 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
         </div>
       )}
 
-      {showCreateLoanModal && (
-        <div className="fixed inset-0 z-[120] bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="w-full max-w-2xl rounded-3xl border border-slate-200 bg-white shadow-2xl overflow-hidden">
-            <div className="px-6 py-4 border-b border-slate-100 bg-slate-50/70 flex items-center justify-between">
-              <div>
-                <p className="text-[9px] font-black uppercase tracking-widest text-emerald-600">Préstamos internos</p>
-                <h4 className="font-headline font-black text-lg uppercase tracking-tight text-slate-900">Registrar préstamo (trabajador/socio)</h4>
+      {showCreateLoanModal && (() => {
+        const roleMap: Record<string, string> = { EMPLOYEE: 'EMPLEADO', PARTNER: 'SOCIO' };
+        const companyRoleFilter = roleMap[loanForm.beneficiaryType];
+        const loanCandidates = dataService.getUsers().filter(u =>
+          u.active && u.companyRole === companyRoleFilter
+        );
+        const q = loanBenSearch.trim().toLowerCase();
+        const filteredCandidates = q
+          ? loanCandidates.filter(u =>
+              u.name.toLowerCase().includes(q) ||
+              (u.cedula ?? '').toLowerCase().includes(q) ||
+              (u.email ?? '').toLowerCase().includes(q)
+            )
+          : loanCandidates;
+        const selectedBen = loanCandidates.find(u => u.name === loanForm.beneficiaryName);
+        return (
+        <div className="fixed inset-0 z-[120] bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => setLoanBenOpen(false)}>
+          <div className="w-full max-w-2xl rounded-3xl border border-slate-200 bg-white shadow-2xl overflow-hidden" onClick={e => e.stopPropagation()}>
+
+            {/* Header */}
+            <div className="bg-gradient-to-r from-slate-900 to-slate-800 px-6 py-5 flex items-center justify-between gap-4">
+              <div className="flex items-center gap-4">
+                {selectedBen?.photoURL ? (
+                  <img src={selectedBen.photoURL} alt={selectedBen.name}
+                    className="w-12 h-12 rounded-2xl object-cover border-2 border-emerald-400/40 shadow-lg shrink-0"/>
+                ) : selectedBen ? (
+                  <div className={`w-12 h-12 rounded-2xl flex items-center justify-center text-xl font-black border-2 border-white/10 shrink-0
+                    ${loanForm.beneficiaryType === 'PARTNER' ? 'bg-violet-900/60 text-violet-300' : 'bg-emerald-900/60 text-emerald-300'}`}>
+                    {selectedBen.name.charAt(0)}
+                  </div>
+                ) : (
+                  <div className="w-12 h-12 rounded-2xl bg-white/5 border-2 border-dashed border-white/20 flex items-center justify-center shrink-0">
+                    <Users className="w-5 h-5 text-slate-500"/>
+                  </div>
+                )}
+                <div>
+                  <p className="text-[9px] font-black uppercase tracking-widest text-emerald-400">Préstamos internos</p>
+                  <h4 className="font-black text-lg text-white tracking-tight">
+                    {selectedBen ? selectedBen.name : 'Registrar Préstamo'}
+                  </h4>
+                  {selectedBen?.cedula && (
+                    <p className="text-[9px] text-slate-400 font-bold">CI/RIF: {selectedBen.cedula}</p>
+                  )}
+                </div>
               </div>
               <button
-                onClick={() => { if (!loanSubmitting) setShowCreateLoanModal(false); }}
-                className="p-2 rounded-xl bg-white border border-slate-200 text-slate-500 hover:bg-slate-100"
+                onClick={() => { if (!loanSubmitting) { setShowCreateLoanModal(false); setLoanBenSearch(''); setLoanBenOpen(false); } }}
+                className="p-2 rounded-xl bg-white/10 hover:bg-white/20 text-slate-300 transition-all"
                 disabled={loanSubmitting}
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
-            <div className="p-6 grid grid-cols-1 md:grid-cols-2 gap-3">
-              <label className="text-[10px] font-black uppercase text-slate-500">Tipo beneficiario
-                <select
-                  value={loanForm.beneficiaryType}
-                  onChange={(e) => setLoanForm((p) => ({ ...p, beneficiaryType: e.target.value as CompanyLoan['beneficiaryType'] }))}
-                  className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 text-[11px] font-bold"
-                >
-                  <option value="EMPLOYEE">Trabajador</option>
-                  <option value="PARTNER">Socio</option>
-                </select>
-              </label>
-              <label className="text-[10px] font-black uppercase text-slate-500">Nombre
-                <input value={loanForm.beneficiaryName} onChange={(e) => setLoanForm((p) => ({ ...p, beneficiaryName: e.target.value }))} className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 text-[11px] font-bold" placeholder="Nombre completo" />
-              </label>
-              <label className="text-[10px] font-black uppercase text-slate-500">Documento / ID
-                <input value={loanForm.beneficiaryId} onChange={(e) => setLoanForm((p) => ({ ...p, beneficiaryId: e.target.value }))} className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 text-[11px] font-bold" placeholder="Cédula o identificador" />
-              </label>
-              <label className="text-[10px] font-black uppercase text-slate-500">Monto USD
-                <input type="number" min="0.01" step="0.01" value={loanForm.amountUSD} onChange={(e) => setLoanForm((p) => ({ ...p, amountUSD: e.target.value }))} className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 text-[11px] font-bold" placeholder="0.00" />
-              </label>
-              <label className="text-[10px] font-black uppercase text-slate-500 md:col-span-2">Concepto
-                <input value={loanForm.description} onChange={(e) => setLoanForm((p) => ({ ...p, description: e.target.value }))} className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 text-[11px] font-bold" placeholder="Motivo del préstamo" />
-              </label>
-              <label className="text-[10px] font-black uppercase text-slate-500">Plazo (días)
-                <input type="number" min="1" step="1" value={loanForm.daysToPay} onChange={(e) => setLoanForm((p) => ({ ...p, daysToPay: e.target.value }))} className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 text-[11px] font-bold" />
-              </label>
-              <label className="text-[10px] font-black uppercase text-slate-500">Método salida
-                <input value={loanForm.sourceMethod} onChange={(e) => setLoanForm((p) => ({ ...p, sourceMethod: e.target.value }))} className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 text-[11px] font-bold" placeholder="Transferencia / Efectivo / Zelle..." />
-              </label>
-              <label className="text-[10px] font-black uppercase text-slate-500">Banco (opcional)
-                <input value={loanForm.sourceBankName} onChange={(e) => setLoanForm((p) => ({ ...p, sourceBankName: e.target.value }))} className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 text-[11px] font-bold" placeholder="Banco origen" />
-              </label>
-              <label className="text-[10px] font-black uppercase text-slate-500">Referencia
-                <input value={loanForm.reference} onChange={(e) => setLoanForm((p) => ({ ...p, reference: e.target.value }))} className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 text-[11px] font-bold" placeholder="Referencia bancaria/documento" />
-              </label>
-              <label className="text-[10px] font-black uppercase text-slate-500 md:col-span-2">Nota
-                <input value={loanForm.note} onChange={(e) => setLoanForm((p) => ({ ...p, note: e.target.value }))} className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 text-[11px] font-bold" placeholder="Observación para auditoría" />
-              </label>
-              {loanError && <div className="md:col-span-2 text-[10px] font-black text-red-600 bg-red-50 border border-red-200 rounded-xl px-3 py-2">{loanError}</div>}
+
+            <div className="p-6 grid grid-cols-1 md:grid-cols-2 gap-4">
+
+              {/* Tipo beneficiario */}
+              <div className="md:col-span-2">
+                <p className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-2">Tipo de beneficiario</p>
+                <div className="flex gap-2">
+                  {([['EMPLOYEE', 'Trabajador / Empleado'], ['PARTNER', 'Socio']] as const).map(([val, label]) => (
+                    <button key={val} type="button"
+                      onClick={() => {
+                        setLoanForm(p => ({ ...p, beneficiaryType: val, beneficiaryName: '', beneficiaryId: '' }));
+                        setLoanBenSearch(''); setLoanBenOpen(false);
+                      }}
+                      className={`flex-1 py-2.5 rounded-2xl text-[10px] font-black uppercase tracking-widest border-2 transition-all
+                        ${loanForm.beneficiaryType === val
+                          ? val === 'PARTNER' ? 'bg-violet-600 border-violet-600 text-white' : 'bg-emerald-600 border-emerald-600 text-white'
+                          : 'bg-white border-slate-200 text-slate-500 hover:border-slate-300'}`}>
+                      {label}
+                      <span className={`ml-1.5 text-[8px] px-1.5 py-0.5 rounded-full font-black
+                        ${loanForm.beneficiaryType === val ? 'bg-white/20' : 'bg-slate-100'}`}>
+                        {dataService.getUsers().filter(u => u.active && u.companyRole === (val === 'EMPLOYEE' ? 'EMPLEADO' : 'SOCIO')).length}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Buscador inteligente de beneficiario */}
+              <div className="md:col-span-2 relative">
+                <p className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-1.5">
+                  Buscar {loanForm.beneficiaryType === 'EMPLOYEE' ? 'empleado' : 'socio'} *
+                </p>
+                <div className="relative">
+                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400 pointer-events-none"/>
+                  <input
+                    type="text"
+                    value={loanBenSearch || loanForm.beneficiaryName}
+                    onChange={e => {
+                      setLoanBenSearch(e.target.value);
+                      setLoanForm(p => ({ ...p, beneficiaryName: e.target.value, beneficiaryId: '' }));
+                      setLoanBenOpen(true);
+                    }}
+                    onFocus={() => setLoanBenOpen(true)}
+                    placeholder={`Nombre, cédula o correo del ${loanForm.beneficiaryType === 'EMPLOYEE' ? 'empleado' : 'socio'}...`}
+                    className="w-full border-2 border-slate-200 rounded-2xl pl-9 pr-4 py-3 text-sm font-bold outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100 transition-all"
+                  />
+                  {loanForm.beneficiaryName && (
+                    <button type="button"
+                      onClick={() => { setLoanForm(p => ({ ...p, beneficiaryName: '', beneficiaryId: '' })); setLoanBenSearch(''); setLoanBenOpen(false); }}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 p-1 text-slate-300 hover:text-slate-500 transition-all">
+                      <X className="w-3.5 h-3.5"/>
+                    </button>
+                  )}
+                </div>
+
+                {/* Dropdown resultados */}
+                {loanBenOpen && (
+                  <div className="absolute top-full left-0 right-0 z-50 mt-1.5 bg-white border border-slate-200 rounded-2xl shadow-2xl overflow-hidden max-h-64 overflow-y-auto">
+                    {filteredCandidates.length === 0 ? (
+                      <div className="px-4 py-6 text-center">
+                        <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">
+                          {loanCandidates.length === 0
+                            ? `Sin ${loanForm.beneficiaryType === 'EMPLOYEE' ? 'empleados' : 'socios'} registrados en el sistema`
+                            : 'Sin resultados para esa búsqueda'}
+                        </p>
+                        {loanCandidates.length === 0 && (
+                          <p className="text-[9px] text-slate-400 mt-1">Asigna el rol en Seguridad → editar usuario → Rol en empresa</p>
+                        )}
+                      </div>
+                    ) : (
+                      filteredCandidates.map(u => (
+                        <button key={u.id} type="button"
+                          onClick={() => {
+                            setLoanForm(p => ({ ...p, beneficiaryName: u.name, beneficiaryId: u.cedula ?? '' }));
+                            setLoanBenSearch('');
+                            setLoanBenOpen(false);
+                          }}
+                          className="w-full flex items-center gap-3 px-4 py-3 hover:bg-emerald-50 transition-all border-b border-slate-50 last:border-0 text-left">
+                          {u.photoURL ? (
+                            <img src={u.photoURL} alt={u.name} className="w-9 h-9 rounded-xl object-cover shrink-0"/>
+                          ) : (
+                            <div className={`w-9 h-9 rounded-xl flex items-center justify-center font-black text-sm shrink-0
+                              ${u.companyRole === 'SOCIO' ? 'bg-violet-100 text-violet-700' : 'bg-emerald-100 text-emerald-700'}`}>
+                              {u.name.charAt(0)}
+                            </div>
+                          )}
+                          <div className="flex-1 min-w-0">
+                            <p className="text-sm font-black text-slate-900 truncate">{u.name}</p>
+                            <div className="flex items-center gap-2 mt-0.5 flex-wrap">
+                              {u.cedula && <span className="text-[9px] font-bold text-slate-500">CI/RIF: {u.cedula}</span>}
+                              {u.email && <span className="text-[9px] font-mono text-slate-400 truncate">{u.email}</span>}
+                            </div>
+                          </div>
+                          <span className={`text-[8px] font-black px-2 py-0.5 rounded-full uppercase shrink-0
+                            ${u.companyRole === 'SOCIO' ? 'bg-violet-100 text-violet-600' : 'bg-emerald-100 text-emerald-600'}`}>
+                            {u.companyRole}
+                          </span>
+                        </button>
+                      ))
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* Documento / Cédula — auto-llenado pero editable */}
+              <div>
+                <p className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-1.5">Documento / Cédula</p>
+                <input
+                  value={loanForm.beneficiaryId}
+                  onChange={e => setLoanForm(p => ({ ...p, beneficiaryId: e.target.value }))}
+                  className="w-full border border-slate-200 rounded-2xl px-3 py-2.5 text-sm font-bold outline-none focus:border-emerald-500 transition-all"
+                  placeholder="Auto-detectado o manual"
+                />
+              </div>
+
+              {/* Monto */}
+              <div>
+                <p className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-1.5">Monto USD *</p>
+                <div className="relative">
+                  <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 font-black text-sm">$</span>
+                  <input type="number" min="0.01" step="0.01" value={loanForm.amountUSD}
+                    onChange={e => setLoanForm(p => ({ ...p, amountUSD: e.target.value }))}
+                    className="w-full border border-slate-200 rounded-2xl pl-7 pr-3 py-2.5 text-sm font-black outline-none focus:border-emerald-500 transition-all"
+                    placeholder="0.00"/>
+                </div>
+              </div>
+
+              {/* Concepto */}
+              <div className="md:col-span-2">
+                <p className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-1.5">Concepto *</p>
+                <input value={loanForm.description}
+                  onChange={e => setLoanForm(p => ({ ...p, description: e.target.value }))}
+                  className="w-full border border-slate-200 rounded-2xl px-3 py-2.5 text-sm font-bold outline-none focus:border-emerald-500 transition-all"
+                  placeholder="Motivo del préstamo"/>
+              </div>
+
+              {/* Plazo + Método */}
+              <div>
+                <p className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-1.5">Plazo (días)</p>
+                <input type="number" min="1" step="1" value={loanForm.daysToPay}
+                  onChange={e => setLoanForm(p => ({ ...p, daysToPay: e.target.value }))}
+                  className="w-full border border-slate-200 rounded-2xl px-3 py-2.5 text-sm font-bold outline-none focus:border-emerald-500 transition-all"/>
+              </div>
+              <div>
+                <p className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-1.5">Método salida</p>
+                <input value={loanForm.sourceMethod}
+                  onChange={e => setLoanForm(p => ({ ...p, sourceMethod: e.target.value }))}
+                  className="w-full border border-slate-200 rounded-2xl px-3 py-2.5 text-sm font-bold outline-none focus:border-emerald-500 transition-all"
+                  placeholder="Transferencia / Efectivo / Zelle..."/>
+              </div>
+
+              {/* Banco + Referencia */}
+              <div>
+                <p className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-1.5">Banco (opcional)</p>
+                <input value={loanForm.sourceBankName}
+                  onChange={e => setLoanForm(p => ({ ...p, sourceBankName: e.target.value }))}
+                  className="w-full border border-slate-200 rounded-2xl px-3 py-2.5 text-sm font-bold outline-none focus:border-emerald-500 transition-all"
+                  placeholder="Banco origen"/>
+              </div>
+              <div>
+                <p className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-1.5">Referencia</p>
+                <input value={loanForm.reference}
+                  onChange={e => setLoanForm(p => ({ ...p, reference: e.target.value }))}
+                  className="w-full border border-slate-200 rounded-2xl px-3 py-2.5 text-sm font-bold outline-none focus:border-emerald-500 transition-all"
+                  placeholder="Referencia bancaria/documento"/>
+              </div>
+
+              {/* Nota */}
+              <div className="md:col-span-2">
+                <p className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-1.5">Nota</p>
+                <input value={loanForm.note}
+                  onChange={e => setLoanForm(p => ({ ...p, note: e.target.value }))}
+                  className="w-full border border-slate-200 rounded-2xl px-3 py-2.5 text-sm font-bold outline-none focus:border-emerald-500 transition-all"
+                  placeholder="Observación para auditoría"/>
+              </div>
+
+              {loanError && (
+                <div className="md:col-span-2 flex items-center gap-2 text-[10px] font-black text-red-600 bg-red-50 border border-red-200 rounded-2xl px-4 py-3">
+                  <X className="w-3.5 h-3.5 shrink-0"/> {loanError}
+                </div>
+              )}
             </div>
-            <div className="px-6 py-4 border-t border-slate-100 bg-slate-50/60 flex justify-end gap-2">
-              <button onClick={() => setShowCreateLoanModal(false)} className="px-4 py-2 rounded-xl border border-slate-200 text-[10px] font-black uppercase text-slate-600 bg-white hover:bg-slate-100" disabled={loanSubmitting}>Cancelar</button>
-              <button onClick={handleCreateLoan} className="px-4 py-2 rounded-xl text-[10px] font-black uppercase text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60" disabled={loanSubmitting}>
-                {loanSubmitting ? 'Guardando...' : 'Registrar préstamo'}
-              </button>
+
+            <div className="px-6 py-4 border-t border-slate-100 bg-slate-50/60 flex justify-between items-center gap-2">
+              <div>
+                {selectedBen && (
+                  <div className="flex items-center gap-2">
+                    {selectedBen.photoURL
+                      ? <img src={selectedBen.photoURL} alt="" className="w-7 h-7 rounded-xl object-cover"/>
+                      : <div className={`w-7 h-7 rounded-xl flex items-center justify-center text-xs font-black
+                          ${loanForm.beneficiaryType === 'PARTNER' ? 'bg-violet-100 text-violet-700' : 'bg-emerald-100 text-emerald-700'}`}>
+                          {selectedBen.name.charAt(0)}
+                        </div>
+                    }
+                    <span className="text-[10px] font-black text-slate-600">{selectedBen.name}</span>
+                    {selectedBen.cedula && <span className="text-[9px] text-slate-400 font-bold">{selectedBen.cedula}</span>}
+                  </div>
+                )}
+              </div>
+              <div className="flex gap-2">
+                <button onClick={() => { setShowCreateLoanModal(false); setLoanBenSearch(''); setLoanBenOpen(false); }}
+                  className="px-4 py-2 rounded-2xl border border-slate-200 text-[10px] font-black uppercase text-slate-600 bg-white hover:bg-slate-100 transition-all"
+                  disabled={loanSubmitting}>Cancelar</button>
+                <button onClick={handleCreateLoan}
+                  className="px-5 py-2 rounded-2xl text-[10px] font-black uppercase text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 transition-all flex items-center gap-1.5"
+                  disabled={loanSubmitting}>
+                  {loanSubmitting ? <><Loader2 className="w-3 h-3 animate-spin"/> Guardando...</> : <><Check className="w-3 h-3"/> Registrar préstamo</>}
+                </button>
+              </div>
             </div>
           </div>
         </div>
-      )}
+        );
+      })()}
 
       <ConfirmModal
         open={confirmModal.open}
