@@ -21,10 +21,7 @@ jobs:
       - name: Install dependencies (clean)
         run: |
           rm -rf node_modules package-lock.json
-          npm install --prefer-offline=false
-
-      - name: Rebuild native bindings
-        run: npm rebuild
+          npm install --include=optional
 
       - name: Build project
         run: npm run build
