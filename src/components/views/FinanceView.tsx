@@ -4396,7 +4396,7 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
                     <h4 className="font-black text-base text-slate-900 flex items-center gap-2"><Plus className="w-4 h-4 text-emerald-600"/> Registrar Gasto</h4>
                     <button
                       type="button"
-                      onClick={() => { setPayrollEmpId(''); setPayrollSalary(''); setPayrollPeriod(''); setPayrollCxcCurrency('USD'); setPayrollCxcAmount(''); setPayrollObservation(''); setPayrollError(''); setPayrollLines([{ method: 'cash_usd', amountUSD: '', ref: '' }]); setShowPayrollModal(true); }}
+                      onClick={() => { setPayrollEmpId(''); setPayrollEmpSearch(''); setPayrollEmpOpen(false); setPayrollSalary(''); setPayrollPeriod(''); setPayrollCxcCurrency('USD'); setPayrollCxcAmount(''); setPayrollObservation(''); setPayrollError(''); setPayrollLines([{ method: 'cash_usd', bankId: '', accountId: '', currency: 'USD', amountUSD: '', amountBS: '', rate: '', ref: '' }]); setShowPayrollModal(true); }}
                       className="flex items-center gap-1.5 px-3 py-1.5 bg-indigo-900 hover:bg-indigo-800 text-white rounded-xl text-[9px] font-black uppercase tracking-widest transition-all"
                     >
                       <Users className="w-3 h-3" /> Pago Nómina
@@ -4981,31 +4981,59 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
                             )}
                           </div>
                           {line.currency === 'BS' ? (
-                            <div className="grid grid-cols-2 gap-2 items-end">
-                              <div>
-                                <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1">Monto Bs *</p>
-                                <input type="number" min="0" step="0.01" value={line.amountBS}
-                                  onChange={e => {
-                                    const bs = e.target.value;
+                            <div className="space-y-2">
+                              <div className="flex items-end gap-2">
+                                <div className="flex-1">
+                                  <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1">Monto Bs *</p>
+                                  <input type="number" min="0" step="0.01" value={line.amountBS}
+                                    onChange={e => {
+                                      const bs = e.target.value;
+                                      const rn = parseFloat(line.rate) || exchangeRate || 1;
+                                      const usd = parseFloat(bs) ? String((parseFloat(bs) / rn).toFixed(2)) : '';
+                                      setPayrollLines(prev => prev.map((l, i) => i === idx ? { ...l, amountBS: bs, amountUSD: usd } : l));
+                                    }}
+                                    className="w-full border border-slate-200 rounded-xl px-3 py-2 text-sm font-black outline-none focus:border-emerald-500"/>
+                                </div>
+                                <button type="button"
+                                  title="Calcular Bs equivalente al pendiente"
+                                  onClick={() => {
                                     const rn = parseFloat(line.rate) || exchangeRate || 1;
-                                    const usd = parseFloat(bs) ? String((parseFloat(bs) / rn).toFixed(2)) : '';
-                                    setPayrollLines(prev => prev.map((l, i) => i === idx ? { ...l, amountBS: bs, amountUSD: usd } : l));
+                                    const paidOthers = payrollLines.filter((_, i) => i !== idx).reduce((s, l) => s + (parseFloat(l.amountUSD) || 0), 0);
+                                    const pendUSD = Math.max(0, netoCalc - paidOthers);
+                                    const bsCalc = (pendUSD * rn).toFixed(2);
+                                    setPayrollLines(prev => prev.map((l, i) => i === idx ? { ...l, amountBS: bsCalc, amountUSD: String(pendUSD.toFixed(2)) } : l));
                                   }}
-                                  className="w-full border border-slate-200 rounded-xl px-3 py-2 text-sm font-black outline-none focus:border-emerald-500"/>
+                                  className="shrink-0 px-3 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-[9px] font-black uppercase tracking-widest transition-all whitespace-nowrap">
+                                  = Bs Pend.
+                                </button>
                               </div>
-                              <div className="bg-emerald-50 rounded-xl px-3 py-2 text-center">
-                                <p className="text-[9px] font-black text-emerald-600 uppercase tracking-widest">Equivale a</p>
-                                <p className="text-sm font-black text-emerald-700">${lineAmtBS > 0 ? (lineAmtBS / lineRateNum).toFixed(2) : '0.00'}</p>
-                              </div>
+                              {lineAmtBS > 0 && (
+                                <div className="bg-emerald-50 rounded-xl px-3 py-2 flex items-center justify-between">
+                                  <span className="text-[9px] font-black text-emerald-600 uppercase tracking-widest">Equivale a USD</span>
+                                  <span className="text-sm font-black text-emerald-700">${(lineAmtBS / lineRateNum).toFixed(2)}</span>
+                                </div>
+                              )}
                             </div>
                           ) : (
                             <div>
                               <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1">Monto USD *</p>
-                              <div className="relative">
-                                <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 font-black text-xs">$</span>
-                                <input type="number" min="0" step="0.01" value={line.amountUSD}
-                                  onChange={e => setPayrollLines(prev => prev.map((l, i) => i === idx ? { ...l, amountUSD: e.target.value } : l))}
-                                  className="w-full border border-slate-200 rounded-xl pl-6 pr-3 py-2 text-sm font-black outline-none focus:border-emerald-500"/>
+                              <div className="flex items-center gap-2">
+                                <div className="relative flex-1">
+                                  <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 font-black text-xs">$</span>
+                                  <input type="number" min="0" step="0.01" value={line.amountUSD}
+                                    onChange={e => setPayrollLines(prev => prev.map((l, i) => i === idx ? { ...l, amountUSD: e.target.value } : l))}
+                                    className="w-full border border-slate-200 rounded-xl pl-6 pr-3 py-2 text-sm font-black outline-none focus:border-emerald-500"/>
+                                </div>
+                                <button type="button"
+                                  title="Completar con el pendiente"
+                                  onClick={() => {
+                                    const paidOthers = payrollLines.filter((_, i) => i !== idx).reduce((s, l) => s + (parseFloat(l.amountUSD) || 0), 0);
+                                    const pendUSD = Math.max(0, netoCalc - paidOthers);
+                                    setPayrollLines(prev => prev.map((l, i) => i === idx ? { ...l, amountUSD: String(pendUSD.toFixed(2)) } : l));
+                                  }}
+                                  className="shrink-0 px-3 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-[9px] font-black uppercase tracking-widest transition-all whitespace-nowrap">
+                                  = Pend.
+                                </button>
                               </div>
                             </div>
                           )}
