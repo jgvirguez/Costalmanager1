@@ -547,7 +547,7 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
   const [payrollCxcCurrency, setPayrollCxcCurrency] = useState<'USD'|'BS'>('USD');
   const [payrollCxcAmount, setPayrollCxcAmount] = useState('');
   const [payrollObservation, setPayrollObservation] = useState('');
-  const [payrollLines, setPayrollLines] = useState<Array<{method: string; amountUSD: string; ref: string}>>([{ method: 'cash_usd', amountUSD: '', ref: '' }]);
+  const [payrollLines, setPayrollLines] = useState<Array<{method: string; bankId: string; accountId: string; currency: 'USD'|'BS'; amountUSD: string; amountBS: string; rate: string; ref: string}>>([{ method: 'cash_usd', bankId: '', accountId: '', currency: 'USD', amountUSD: '', amountBS: '', rate: '', ref: '' }]);
   const [payrollCxcInvoices, setPayrollCxcInvoices] = useState<Record<string, boolean>>({});
   const [payrollCxcAbonos, setPayrollCxcAbonos] = useState<Record<string, string>>({});
   const [payrollSubmitting, setPayrollSubmitting] = useState(false);
@@ -2098,7 +2098,7 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
     setPayrollSalary(''); setPayrollPeriod('');
     setPayrollCxcCurrency('USD'); setPayrollCxcAmount('');
     setPayrollObservation(''); setPayrollError('');
-    setPayrollLines([{ method: 'cash_usd', amountUSD: '', ref: '' }]);
+    setPayrollLines([{ method: 'cash_usd', bankId: '', accountId: '', currency: 'USD', amountUSD: '', amountBS: '', rate: '', ref: '' }]);
     setPayrollCxcInvoices({});
     setPayrollCxcAbonos({});
   };
@@ -4877,48 +4877,148 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
                       <p className="text-[10px] font-black text-slate-600 uppercase tracking-widest">Líneas de pago</p>
                     </div>
                     <button type="button"
-                      onClick={() => setPayrollLines(prev => [...prev, { method: 'cash_usd', amountUSD: '', ref: '' }])}
+                      onClick={() => setPayrollLines(prev => [...prev, { method: 'cash_usd', bankId: '', accountId: '', currency: 'USD', amountUSD: '', amountBS: '', rate: '', ref: '' }])}
                       className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-[9px] font-black uppercase tracking-widest transition-all">
                       <Plus className="w-3 h-3"/> Línea
                     </button>
                   </div>
                   <div className="p-4 space-y-3">
-                    {payrollLines.map((line, idx) => (
-                      <div key={idx} className="rounded-2xl border border-slate-200 p-4 bg-white space-y-3">
-                        <div className="flex items-center justify-between">
-                          <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Línea {idx + 1}</span>
-                          {payrollLines.length > 1 && (
-                            <button type="button"
-                              onClick={() => setPayrollLines(prev => prev.filter((_, i) => i !== idx))}
-                              className="p-1 text-red-300 hover:text-red-500 transition-all rounded-lg hover:bg-red-50">
-                              <X className="w-3.5 h-3.5"/>
-                            </button>
-                          )}
-                        </div>
-                        <select value={line.method}
-                          onChange={e => setPayrollLines(prev => prev.map((l, i) => i === idx ? { ...l, method: e.target.value } : l))}
-                          className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm font-bold outline-none focus:border-emerald-500 bg-white">
-                          {Object.entries(EXPENSE_PAY_METHODS).map(([k,v]) => <option key={k} value={k}>{v}</option>)}
-                        </select>
-                        <div className="grid grid-cols-2 gap-3">
-                          <div>
-                            <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1">Monto USD *</p>
-                            <div className="relative">
-                              <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 font-black text-xs">$</span>
-                              <input type="number" min="0" step="0.01" value={line.amountUSD}
-                                onChange={e => setPayrollLines(prev => prev.map((l, i) => i === idx ? { ...l, amountUSD: e.target.value } : l))}
-                                className="w-full border border-slate-200 rounded-xl pl-6 pr-3 py-2.5 text-sm font-black outline-none focus:border-emerald-500"/>
-                            </div>
+                    {payrollLines.map((line, idx) => {
+                      const isCashLine = line.method === 'cash_usd' || line.method === 'cash_ves';
+                      const isUSDMethod = line.method === 'cash_usd' || line.method === 'zelle';
+                      const lineBankOpts = isCashLine ? [] : activeBanks.filter((b: any) => {
+                        const sm = Array.isArray(b?.supportedMethods) ? b.supportedMethods : [];
+                        return sm.length === 0 || sm.includes(line.method);
+                      });
+                      const lineSelBank = lineBankOpts.find((b: any) => String(b.id) === line.bankId);
+                      const lineAccCurr = isUSDMethod ? 'USD' : 'VES';
+                      const lineAccOpts = lineSelBank
+                        ? (() => { const ac = Array.isArray(lineSelBank.accounts) ? lineSelBank.accounts : []; const m = ac.filter((a: any) => String(a?.currency ?? '').toUpperCase() === lineAccCurr); return m.length > 0 ? m : ac; })()
+                        : [];
+                      const lineRateNum = parseFloat(line.rate) || exchangeRate || 1;
+                      const lineAmtUSD = parseFloat(line.amountUSD) || 0;
+                      const lineAmtBS = parseFloat(line.amountBS) || 0;
+                      return (
+                        <div key={idx} className="rounded-2xl border border-slate-200 p-4 bg-white space-y-3">
+                          <div className="flex items-center justify-between">
+                            <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Línea {idx + 1}</span>
+                            {payrollLines.length > 1 && (
+                              <button type="button" onClick={() => setPayrollLines(prev => prev.filter((_, i) => i !== idx))}
+                                className="p-1 text-red-300 hover:text-red-500 transition-all rounded-lg hover:bg-red-50">
+                                <X className="w-3.5 h-3.5"/>
+                              </button>
+                            )}
                           </div>
+                          {/* Método */}
+                          <select value={line.method}
+                            onChange={e => {
+                              const m = e.target.value;
+                              const isUSD = m === 'cash_usd' || m === 'zelle';
+                              setPayrollLines(prev => prev.map((l, i) => i === idx ? { ...l, method: m, bankId: '', accountId: '', currency: isUSD ? 'USD' : 'BS', amountUSD: '', amountBS: '' } : l));
+                            }}
+                            className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm font-bold outline-none focus:border-emerald-500 bg-white">
+                            {Object.entries(EXPENSE_PAY_METHODS).map(([k,v]) => <option key={k} value={k}>{v}</option>)}
+                          </select>
+                          {/* Banco + Cuenta */}
+                          {isCashLine ? (
+                            <div className="bg-slate-50 rounded-xl px-3 py-2 flex items-center gap-2">
+                              <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Banco:</span>
+                              <span className="text-sm font-black text-slate-700">{line.method === 'cash_usd' ? 'Efectivo USD (Caja)' : 'Efectivo Bs (Caja)'}</span>
+                            </div>
+                          ) : (
+                            <div className="grid grid-cols-2 gap-2">
+                              <div>
+                                <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1">Banco</p>
+                                <select value={line.bankId}
+                                  onChange={e => {
+                                    const bid = e.target.value;
+                                    const bank = lineBankOpts.find((b: any) => String(b.id) === bid);
+                                    setPayrollLines(prev => prev.map((l, i) => i === idx ? { ...l, bankId: bid, accountId: '' } : l));
+                                    void bank;
+                                  }}
+                                  className="w-full border border-slate-200 rounded-xl px-2 py-2 text-xs font-bold outline-none focus:border-emerald-500 bg-white">
+                                  <option value="">Seleccionar...</option>
+                                  {lineBankOpts.map((b: any) => <option key={b.id} value={b.id}>{b.name}</option>)}
+                                </select>
+                                {lineBankOpts.length === 0 && <p className="text-[9px] text-amber-600 font-bold mt-1">Sin bancos para este método</p>}
+                              </div>
+                              <div>
+                                <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1">Cuenta</p>
+                                <select value={line.accountId}
+                                  onChange={e => setPayrollLines(prev => prev.map((l, i) => i === idx ? { ...l, accountId: e.target.value } : l))}
+                                  disabled={!line.bankId}
+                                  className="w-full border border-slate-200 rounded-xl px-2 py-2 text-xs font-bold outline-none focus:border-emerald-500 bg-white disabled:opacity-50">
+                                  <option value="">Cuenta...</option>
+                                  {lineAccOpts.map((a: any) => <option key={a.id} value={a.id}>{a.label}{a.accountNumber ? ` ···${a.accountNumber.slice(-4)}` : ''}</option>)}
+                                </select>
+                              </div>
+                            </div>
+                          )}
+                          {/* Moneda + Montos + Tasa */}
+                          <div className="grid grid-cols-2 gap-2">
+                            <div>
+                              <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1">Moneda</p>
+                              <select value={line.currency}
+                                onChange={e => setPayrollLines(prev => prev.map((l, i) => i === idx ? { ...l, currency: e.target.value as 'USD'|'BS', amountUSD: '', amountBS: '' } : l))}
+                                disabled={isUSDMethod || line.method === 'cash_ves'}
+                                className="w-full border border-slate-200 rounded-xl px-2 py-2 text-xs font-bold outline-none focus:border-emerald-500 bg-white disabled:opacity-60">
+                                <option value="USD">USD $</option>
+                                <option value="BS">Bs</option>
+                              </select>
+                            </div>
+                            {line.currency === 'BS' && (
+                              <div>
+                                <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1">Tasa Bs/$</p>
+                                <input type="number" min="1" step="0.01" value={line.rate}
+                                  onChange={e => {
+                                    const r = e.target.value;
+                                    const rn = parseFloat(r) || 1;
+                                    setPayrollLines(prev => prev.map((l, i) => i === idx ? { ...l, rate: r, amountUSD: l.amountBS ? String((parseFloat(l.amountBS) / rn).toFixed(2)) : '' } : l));
+                                  }}
+                                  placeholder={String(exchangeRate)}
+                                  className="w-full border border-slate-200 rounded-xl px-2 py-2 text-xs font-black outline-none focus:border-emerald-500"/>
+                              </div>
+                            )}
+                          </div>
+                          {line.currency === 'BS' ? (
+                            <div className="grid grid-cols-2 gap-2 items-end">
+                              <div>
+                                <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1">Monto Bs *</p>
+                                <input type="number" min="0" step="0.01" value={line.amountBS}
+                                  onChange={e => {
+                                    const bs = e.target.value;
+                                    const rn = parseFloat(line.rate) || exchangeRate || 1;
+                                    const usd = parseFloat(bs) ? String((parseFloat(bs) / rn).toFixed(2)) : '';
+                                    setPayrollLines(prev => prev.map((l, i) => i === idx ? { ...l, amountBS: bs, amountUSD: usd } : l));
+                                  }}
+                                  className="w-full border border-slate-200 rounded-xl px-3 py-2 text-sm font-black outline-none focus:border-emerald-500"/>
+                              </div>
+                              <div className="bg-emerald-50 rounded-xl px-3 py-2 text-center">
+                                <p className="text-[9px] font-black text-emerald-600 uppercase tracking-widest">Equivale a</p>
+                                <p className="text-sm font-black text-emerald-700">${lineAmtBS > 0 ? (lineAmtBS / lineRateNum).toFixed(2) : '0.00'}</p>
+                              </div>
+                            </div>
+                          ) : (
+                            <div>
+                              <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1">Monto USD *</p>
+                              <div className="relative">
+                                <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 font-black text-xs">$</span>
+                                <input type="number" min="0" step="0.01" value={line.amountUSD}
+                                  onChange={e => setPayrollLines(prev => prev.map((l, i) => i === idx ? { ...l, amountUSD: e.target.value } : l))}
+                                  className="w-full border border-slate-200 rounded-xl pl-6 pr-3 py-2 text-sm font-black outline-none focus:border-emerald-500"/>
+                              </div>
+                            </div>
+                          )}
+                          {/* Referencia */}
                           <div>
                             <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1">Referencia / Nº Op.</p>
                             <input type="text" value={line.ref}
                               onChange={e => setPayrollLines(prev => prev.map((l, i) => i === idx ? { ...l, ref: e.target.value } : l))}
-                              className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm font-bold outline-none focus:border-emerald-500"/>
+                              className="w-full border border-slate-200 rounded-xl px-3 py-2 text-sm font-bold outline-none focus:border-emerald-500"/>
                           </div>
                         </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 </div>
 
