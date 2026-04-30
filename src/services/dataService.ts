@@ -4656,12 +4656,16 @@ export class DataService {
           .limit(5000);
 
         if (invErr) {
-          const errText = String((invErr as any)?.message ?? '').toLowerCase();
+          const errText = String((invErr as any)?.message ?? (invErr as any)?.details ?? '').toLowerCase();
           const errCode = String((invErr as any)?.code ?? '').toUpperCase();
+          const errStatus = Number((invErr as any)?.status ?? (invErr as any)?.statusCode ?? 0);
           const tableMissing =
-            errCode === 'PGRST205'
-            || errText.includes('inventory_movements')
-            || errText.includes('relation') && errText.includes('does not exist');
+            errStatus === 404
+            || errCode === 'PGRST205'
+            || errCode === '42P01'
+            || errText.includes('does not exist')
+            || errText.includes('relation')
+            || errText.includes('inventory_movements');
           if (tableMissing) {
             this.inventoryMovementsAvailable = false;
           } else {
@@ -5489,6 +5493,10 @@ export class DataService {
 
   async updateUserPhoto(userId: string, file: File): Promise<string> {
     const { ref, uploadBytes, getDownloadURL } = await import('firebase/storage');
+    const { signInAnonymously } = await import('firebase/auth');
+    if (!auth.currentUser) {
+      await signInAnonymously(auth);
+    }
     const path = `user_photos/${userId}/${Date.now()}_${file.name.replace(/[^a-zA-Z0-9.]/g, '_')}`;
     const storageRef = ref(storage, path);
     await uploadBytes(storageRef, file);
@@ -8590,7 +8598,9 @@ export class DataService {
       const { error } = await supabase.from('inventory_movements').insert(payload as any);
       if (!error) return;
       const errText = String((error as any)?.message ?? (error as any)?.details ?? error ?? '').toLowerCase();
-      if (errText.includes('404') || errText.includes('inventory_movements') || errText.includes('relation') || errText.includes('does not exist')) {
+      const errStatus = Number((error as any)?.status ?? (error as any)?.statusCode ?? 0);
+      const errCode = String((error as any)?.code ?? '').toUpperCase();
+      if (errStatus === 404 || errCode === '42P01' || errText.includes('404') || errText.includes('inventory_movements') || errText.includes('relation') || errText.includes('does not exist')) {
         this.inventoryMovementsAvailable = false;
         console.warn('inventory_movements no disponible; se omite insercion de trazabilidad detallada.');
         return;
