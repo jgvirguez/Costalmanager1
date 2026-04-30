@@ -595,8 +595,10 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
     description: '',
     amountUSD: '',
     daysToPay: '30',
-    sourceMethod: 'Transferencia',
+    sourceMethod: 'transfer',
     sourceBankName: '',
+    sourceBankId: '',
+    sourceAccountId: '',
     reference: '',
     note: ''
   });
@@ -1947,8 +1949,10 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
         description: '',
         amountUSD: '',
         daysToPay: '30',
-        sourceMethod: 'Transferencia',
+        sourceMethod: 'transfer',
         sourceBankName: '',
+        sourceBankId: '',
+        sourceAccountId: '',
         reference: '',
         note: ''
       });
@@ -7355,20 +7359,78 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
               </div>
               <div>
                 <p className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-1.5">Método salida</p>
-                <input value={loanForm.sourceMethod}
-                  onChange={e => setLoanForm(p => ({ ...p, sourceMethod: e.target.value }))}
-                  className="w-full border border-slate-200 rounded-2xl px-3 py-2.5 text-sm font-bold outline-none focus:border-emerald-500 transition-all"
-                  placeholder="Transferencia / Efectivo / Zelle..."/>
+                <select value={loanForm.sourceMethod}
+                  onChange={e => setLoanForm(p => ({ ...p, sourceMethod: e.target.value, sourceBankName: '', sourceBankId: '', sourceAccountId: '' }))}
+                  className="w-full border border-slate-200 rounded-2xl px-3 py-2.5 text-sm font-bold outline-none focus:border-emerald-500 transition-all bg-white">
+                  <option value="cash_usd">Efectivo USD</option>
+                  <option value="cash_ves">Efectivo Bs</option>
+                  <option value="transfer">Transferencia</option>
+                  <option value="mobile">Pago Móvil</option>
+                  <option value="zelle">Zelle</option>
+                  <option value="debit">Débito</option>
+                  <option value="other">Otro</option>
+                </select>
               </div>
 
-              {/* Banco + Referencia */}
-              <div>
-                <p className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-1.5">Banco (opcional)</p>
-                <input value={loanForm.sourceBankName}
-                  onChange={e => setLoanForm(p => ({ ...p, sourceBankName: e.target.value }))}
-                  className="w-full border border-slate-200 rounded-2xl px-3 py-2.5 text-sm font-bold outline-none focus:border-emerald-500 transition-all"
-                  placeholder="Banco origen"/>
-              </div>
+              {/* Banco + Cuenta (solo si no es efectivo) */}
+              {(() => {
+                const isCash = loanForm.sourceMethod === 'cash_usd' || loanForm.sourceMethod === 'cash_ves';
+                const loanBankOptions = isCash ? [] : activeBanks.filter((b: any) => {
+                  const sm = Array.isArray(b?.supportedMethods) ? b.supportedMethods : [];
+                  return sm.length === 0 || sm.includes(loanForm.sourceMethod);
+                });
+                const loanSelectedBank = loanBankOptions.find((b: any) => String(b.id) === loanForm.sourceBankId);
+                const loanAccountCurrency = (loanForm.sourceMethod === 'zelle' || loanForm.sourceMethod === 'digital_usd') ? 'USD' : loanForm.sourceMethod === 'cash_usd' ? 'USD' : 'VES';
+                const loanAccountOptions = loanSelectedBank
+                  ? (() => {
+                      const accs = Array.isArray(loanSelectedBank.accounts) ? loanSelectedBank.accounts : [];
+                      const match = accs.filter((a: any) => String(a?.currency ?? '').toUpperCase() === loanAccountCurrency);
+                      return match.length > 0 ? match : accs;
+                    })()
+                  : [];
+                if (isCash) return (
+                  <div className="md:col-span-2 bg-slate-50 rounded-2xl px-4 py-2.5 flex items-center gap-2">
+                    <span className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Banco:</span>
+                    <span className="text-sm font-black text-slate-700">{loanForm.sourceMethod === 'cash_usd' ? 'Efectivo USD (Caja)' : 'Efectivo Bs (Caja)'}</span>
+                  </div>
+                );
+                return (
+                  <>
+                    <div>
+                      <p className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-1.5">Banco origen</p>
+                      <select value={loanForm.sourceBankId ?? ''}
+                        onChange={e => {
+                          const bid = e.target.value;
+                          const bank = loanBankOptions.find((b: any) => String(b.id) === bid);
+                          setLoanForm(p => ({ ...p, sourceBankId: bid, sourceBankName: bank ? String(bank.name) : '', sourceAccountId: '' }));
+                        }}
+                        className="w-full border border-slate-200 rounded-2xl px-3 py-2.5 text-sm font-bold outline-none focus:border-emerald-500 transition-all bg-white">
+                        <option value="">Seleccionar banco...</option>
+                        {loanBankOptions.map((b: any) => (
+                          <option key={b.id} value={b.id}>{b.name}</option>
+                        ))}
+                      </select>
+                      {loanBankOptions.length === 0 && (
+                        <p className="text-[10px] text-amber-600 font-bold mt-1">Sin bancos configurados para este método.</p>
+                      )}
+                    </div>
+                    <div>
+                      <p className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-1.5">Cuenta</p>
+                      <select value={loanForm.sourceAccountId ?? ''}
+                        onChange={e => setLoanForm(p => ({ ...p, sourceAccountId: e.target.value }))}
+                        disabled={!loanForm.sourceBankId}
+                        className="w-full border border-slate-200 rounded-2xl px-3 py-2.5 text-sm font-bold outline-none focus:border-emerald-500 transition-all bg-white disabled:opacity-50">
+                        <option value="">Seleccionar cuenta...</option>
+                        {loanAccountOptions.map((a: any) => (
+                          <option key={a.id} value={a.id}>{a.label}{a.accountNumber ? ` · ${a.accountNumber.slice(-4)}` : ''}</option>
+                        ))}
+                      </select>
+                    </div>
+                  </>
+                );
+              })()}
+
+              {/* Referencia */}
               <div>
                 <p className="text-[9px] font-black uppercase tracking-widest text-slate-400 mb-1.5">Referencia</p>
                 <input value={loanForm.reference}
