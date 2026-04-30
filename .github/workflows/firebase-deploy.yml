@@ -21,7 +21,13 @@ jobs:
       - name: Install dependencies (clean)
         run: |
           rm -rf node_modules package-lock.json
-          npm install --include=optional
+          npm install
+
+      - name: Install @tailwindcss/oxide Linux binding (npm bug #4828 workaround)
+        run: |
+          OXIDE_VERSION=$(node -e "console.log(require('./node_modules/@tailwindcss/oxide/package.json').version)")
+          echo "Installing @tailwindcss/oxide-linux-x64-gnu@$OXIDE_VERSION"
+          npm install "@tailwindcss/oxide-linux-x64-gnu@$OXIDE_VERSION" --no-save
 
       - name: Build project
         run: npm run build
