@@ -12,6 +12,7 @@ import {
   onSnapshot,
   orderBy,
   query,
+  runTransaction,
   setDoc,
   updateDoc,
   where
@@ -21,6 +22,7 @@ import { supabase } from './supabaseConfig';
 import { normalizeDocumentId } from '../utils/idNormalization';
 import { auth, db, storage } from './firebaseConfig';
 import { authService } from './authService';
+import { LedgerOperationType, LedgerService, MissingLedgerRuleError } from './ledgerService';
 
 export type UserRole = 'ADMIN' | 'ALMACENISTA' | 'CAJERO' | 'FINANZAS' | 'SUPERVISOR';
 
@@ -39,9 +41,19 @@ export type PermissionKey =
   | 'REPORTS_VIEW'
   | 'REPORTS_SALES'
   | 'REPORTS_INVENTORY'
+  | 'REPORTS_PROFIT_VIEW'
+  | 'REPORTS_PURCHASES_EXPORT'
+  | 'REPORTS_SHRINKAGE_EXPORT'
+  | 'REPORTS_TREASURY_EXPORT'
+  | 'REPORTS_EXPENSES_EXPORT'
+  | 'REPORTS_MARGINS_EXPORT'
+  | 'REPORTS_ZCLOSURE_EXPORT'
+  | 'REPORTS_CASHIER_EXPORT'
+  | 'REPORTS_PROFIT_EXPORT'
   | 'SECURITY_VIEW'
   | 'SETTINGS_RATES'
-  | 'ACCOUNTING_ALERTS';
+  | 'ACCOUNTING_ALERTS'
+  | 'FINANCE_RECONCILE_OVERRIDE';
 
 export interface PermissionDefinition {
   key: PermissionKey;
@@ -75,9 +87,19 @@ export const PERMISSION_DEFINITIONS: PermissionDefinition[] = [
   { key: 'REPORTS_VIEW', label: 'Ver reportes', module: 'Reportes' },
   { key: 'REPORTS_SALES', label: 'Ver reportes de ventas', module: 'Reportes' },
   { key: 'REPORTS_INVENTORY', label: 'Ver reportes de inventario', module: 'Reportes' },
+  { key: 'REPORTS_PROFIT_VIEW', label: 'Ver reporte de utilidad bruta', module: 'Reportes' },
+  { key: 'REPORTS_PURCHASES_EXPORT', label: 'Exportar libro de compras', module: 'Reportes' },
+  { key: 'REPORTS_SHRINKAGE_EXPORT', label: 'Exportar reporte de mermas', module: 'Reportes' },
+  { key: 'REPORTS_TREASURY_EXPORT', label: 'Exportar reportes de tesorería', module: 'Reportes' },
+  { key: 'REPORTS_EXPENSES_EXPORT', label: 'Exportar reportes de egresos', module: 'Reportes' },
+  { key: 'REPORTS_MARGINS_EXPORT', label: 'Exportar reportes de márgenes', module: 'Reportes' },
+  { key: 'REPORTS_ZCLOSURE_EXPORT', label: 'Exportar cierre Z', module: 'Reportes' },
+  { key: 'REPORTS_CASHIER_EXPORT', label: 'Exportar facturación por cajero', module: 'Reportes' },
+  { key: 'REPORTS_PROFIT_EXPORT', label: 'Exportar utilidad bruta', module: 'Reportes' },
   { key: 'SECURITY_VIEW', label: 'Gestionar usuarios y permisos', module: 'Seguridad' },
   { key: 'SETTINGS_RATES', label: 'Ajustar tasas operativas', module: 'Configuración' },
-  { key: 'ACCOUNTING_ALERTS', label: 'Ver alertas contables (CxP, CxC, DxC, etc.)', module: 'Contabilidad' }
+  { key: 'ACCOUNTING_ALERTS', label: 'Ver alertas contables (CxP, CxC, DxC, etc.)', module: 'Contabilidad' },
+  { key: 'FINANCE_RECONCILE_OVERRIDE', label: 'Autorizar desconciliación bancaria', module: 'Finanzas' }
 ];
 
 export interface BankAccount {
@@ -213,11 +235,17 @@ export interface ProductStock {
 
 export interface SaleHistoryEntry {
   id?: string;
+  /** Idempotency key del intento de facturación (INT-01). */
+  clientRequestId?: string;
   correlativo: string;
   client: BillingClient;
   items: BillingItem[];
   totalUSD: number;
   totalVES: number;
+  /** Precio de lista USD (suma nominal); distinto de totalUSD cuando el crédito en Bs usa tasa interna. */
+  nominalUSD?: number;
+  /** Tasas y moneda del crédito guardadas al registrar la venta (si existen en BD o en memoria). */
+  creditMeta?: { rateInternal?: number; rateBCV?: number; creditCurrency?: string };
   paymentMethod: string;
   exchangeRate: number;
   captures?: string[];
@@ -311,6 +339,7 @@ function mapSupabaseSaleRowToHistoryEntry(s: any): SaleHistoryEntry {
         : new Date();
   return {
     id: s?.id,
+    clientRequestId: String(s?.client_request_id ?? s?.clientRequestId ?? '').trim() || undefined,
     correlativo: String(s?.correlativo ?? ''),
     client: {
       name: String(s?.customer_name ?? ''),
@@ -323,6 +352,14 @@ function mapSupabaseSaleRowToHistoryEntry(s: any): SaleHistoryEntry {
     payments: Array.isArray(s?.payments) ? s.payments : [],
     totalUSD: Number(s?.total_usd ?? s?.totalUSD ?? 0),
     totalVES: Number(s?.total_ves ?? s?.totalVES ?? 0),
+    nominalUSD:
+      s?.nominal_usd != null && s?.nominal_usd !== ''
+        ? Number(s.nominal_usd)
+        : undefined,
+    creditMeta:
+      s?.credit_meta && typeof s.credit_meta === 'object'
+        ? (s.credit_meta as SaleHistoryEntry['creditMeta'])
+        : (s as any)?.creditMeta,
     paymentMethod: rawPaymentMethod || 'MIXTO',
     exchangeRate: Number(s?.exchange_rate ?? s?.exchangeRate ?? 0) || 0,
     captures: [],
@@ -414,6 +451,51 @@ export interface AREntry {
   voidReason?: string;
   voidedBy?: string;
   voidedAt?: string;
+  meta?: {
+    kind?: 'SALE_CREDIT' | 'COMPANY_LOAN';
+    loanId?: string;
+    beneficiaryType?: 'EMPLOYEE' | 'PARTNER';
+    skipAutoPenalty?: boolean;
+    [key: string]: any;
+  };
+}
+
+/** Fila del mayor analítico por cuenta (RPC `mayor_por_cuenta_saldo` en Supabase). */
+export interface MayorCuentaMovimientoRow {
+  cuentaContableCodigo: string;
+  cuentaContableNombre: string;
+  asientoId: string;
+  lineNumber: number;
+  fecha: Date;
+  tipoOperacion: string;
+  descripcionAsiento: string;
+  debe: number;
+  haber: number;
+  saldoAcumulado: number;
+}
+
+export interface CompanyLoan {
+  id: string;
+  loanCorrelativo: string;
+  arEntryId: string;
+  issuedAt: string;
+  dueDate: string;
+  beneficiaryType: 'EMPLOYEE' | 'PARTNER';
+  beneficiaryId: string;
+  beneficiaryName: string;
+  description: string;
+  principalUSD: number;
+  balanceUSD: number;
+  currency: 'USD' | 'VES';
+  amountVES: number;
+  rateUsed: number;
+  status: 'PENDING' | 'PARTIAL' | 'PAID' | 'VOID';
+  sourceMethod: string;
+  sourceBankName: string;
+  reference?: string;
+  note?: string;
+  createdBy: string;
+  updatedAt: string;
 }
 
 export interface ClientAdvance {
@@ -529,6 +611,8 @@ export interface PurchaseRegistrationInvoiceInput {
   files?: File[];
   warehouse?: string;
   items: PurchaseRegistrationItemInput[];
+  /** Recepción contra OC aprobada (CMP-03); valida SKUs y cantidades vs pendientes */
+  purchaseOrderId?: string;
 }
 
 export interface PurchaseRegistrationResult {
@@ -586,6 +670,40 @@ export interface APEntryDetail {
   lines: APInvoiceDetailLine[];
 }
 
+export interface PurchaseInvoiceHistoryLine {
+  id: string;
+  lineNumber: number;
+  sku: string;
+  productDescription: string;
+  qty: number;
+  unit?: string;
+  costUSD: number;
+  totalLineUSD: number;
+  batch?: string;
+  warehouse?: string;
+}
+
+export interface PurchaseInvoiceHistoryEntry {
+  id: string;
+  invoiceGroupId: string;
+  invoiceNumber: string;
+  supplier: string;
+  supplierDocument?: string;
+  invoiceDate?: string;
+  invoiceDueDate?: string;
+  createdAt?: string;
+  operatorName?: string;
+  paymentType: 'CASH' | 'CREDIT' | 'MIXED' | 'UNKNOWN';
+  status: 'ACTIVE' | 'VOID';
+  totalInvoiceUSD: number;
+  apEntryId?: string;
+  apBalanceUSD?: number;
+  paidUSD?: number;
+  paymentMethods: string[];
+  supports: ARPaymentSupport[];
+  lines: PurchaseInvoiceHistoryLine[];
+}
+
 export interface APPaymentLineInput {
   note?: string;
   files?: File[];
@@ -635,6 +753,52 @@ export interface PurchaseAdjustmentNoteResult {
   apEntryId?: string;
   createdAPEntryId?: string;
   supportsUploadError?: string;
+}
+
+/** CMP-03 — Orden de compra (Firestore `purchase_orders`) */
+export type PurchaseOrderStatus = 'DRAFT' | 'SUBMITTED' | 'APPROVED' | 'CLOSED' | 'CANCELLED';
+
+export interface PurchaseOrderLine {
+  id: string;
+  sku: string;
+  productDescription: string;
+  unit: string;
+  qtyOrdered: number;
+  qtyReceived: number;
+  warehouse: string;
+}
+
+export interface PurchaseOrder {
+  id: string;
+  correlativo: string;
+  supplier: string;
+  supplierDocument?: string;
+  supplierPhone?: string;
+  supplierAddress?: string;
+  status: PurchaseOrderStatus;
+  lines: PurchaseOrderLine[];
+  note?: string;
+  createdAt: string;
+  createdBy?: string;
+  submittedAt?: string;
+  approvedAt?: string;
+  approvedBy?: string;
+  cancelledAt?: string;
+  cancelReason?: string;
+  closedAt?: string;
+  updatedAt?: string;
+}
+
+export interface PurchaseOrderApprovalAlert {
+  id: string;
+  type: 'PO_SUBMITTED';
+  purchaseOrderId: string;
+  purchaseOrderCorrelativo: string;
+  supplier: string;
+  createdAt: string;
+  createdBy?: string;
+  targetRoles: UserRole[];
+  readByUserIds?: string[];
 }
 
 export interface ManufacturingComponentInput {
@@ -949,6 +1113,7 @@ export interface CashBoxClosureRecord {
   totalSalesUSD: number;
   totalSalesVES: number;
   totalItemsSold: number;
+  denominationReport?: CashBoxDenominationReport;
   createdAt: string;
   updatedAt: string;
 }
@@ -1046,7 +1211,7 @@ export interface BankTransactionRecord {
   accountId?: string;
   accountLabel?: string;
   method: string;
-  source: 'AR_PAYMENT' | 'SALE_PAYMENT' | 'CREDIT_DOWN' | 'AP_PAYMENT' | 'PURCHASE_PAYMENT' | 'MANUAL_ENTRY' | 'SALE_RETURN';
+  source: 'AR_PAYMENT' | 'SALE_PAYMENT' | 'CREDIT_DOWN' | 'AP_PAYMENT' | 'PURCHASE_PAYMENT' | 'MANUAL_ENTRY' | 'SALE_RETURN' | 'LOAN_DISBURSEMENT';
   sourceId: string;
   cashBoxSessionId?: string;
   posTerminalId?: string;
@@ -1132,6 +1297,33 @@ const ACCOUNTING_ALERT_META: Record<string, { label: string; description: string
 };
 
 export class DataService {
+  private async findSaleByClientRequestId(clientRequestId: string): Promise<SaleHistoryEntry | null> {
+    const requestId = String(clientRequestId ?? '').trim();
+    if (!requestId) return null;
+
+    const inMemory = this.sales.find((s: any) => String(s?.clientRequestId ?? '').trim() === requestId);
+    if (inMemory) return inMemory;
+
+    try {
+      const { data, error } = await supabase
+        .from('sales')
+        .select('*')
+        .eq('client_request_id', requestId)
+        .limit(1)
+        .maybeSingle();
+
+      if (error) {
+        const missing = String(this.extractMissingColumnName(error) ?? '').toLowerCase();
+        if (missing === 'client_request_id') return null;
+        return null;
+      }
+      if (!data) return null;
+      return mapSupabaseSaleRowToHistoryEntry(data);
+    } catch {
+      return null;
+    }
+  }
+
   private products: ProductStock[] = [];
   private allProducts: ProductStock[] = [];
   /** Libro de movimientos (tabla `movements` en Supabase) */
@@ -1142,11 +1334,14 @@ export class DataService {
    */
   private inventoryLedgerMovements: InventoryMovement[] = [];
   private sales: SaleHistoryEntry[] = [];
+  private consolidatedLedgerEntries: Array<{ timestamp: Date; type: 'INCOME' | 'EXPENSE'; category: string; description: string; amountUSD: number }> = [];
   private auditLog: AuditEntry[] = [];
   private expenses: OperationalExpense[] = [];
   private apEntries: APEntry[] = [];
   private arEntries: AREntry[] = [];
   private arUnsubscribe: (() => void) | null = null;
+  private companyLoans: CompanyLoan[] = [];
+  private companyLoansUnsubscribe: (() => void) | null = null;
   private creditNotes: any[] = [];
   private creditNotesUnsubscribe: (() => void) | null = null;
   private clientAdvances: ClientAdvance[] = [];
@@ -1154,6 +1349,12 @@ export class DataService {
   private currentSessionSales: CashBoxSaleAudit[] = [];
   private currentSessionSalesUnsubscribe: (() => void) | null = null;
   private supabaseSubscribed: boolean = false;
+  private purchaseOrders: PurchaseOrder[] = [];
+  private purchaseOrdersUnsubscribe: (() => void) | null = null;
+  private purchaseEntriesUnsubscribe: (() => void) | null = null;
+  private purchaseEntriesCache: Array<{ id: string; [key: string]: any }> = [];
+  private bankTransactionsUnsubscribe: (() => void) | null = null;
+  private bankTransactionsCache: Array<BankTransactionRecord & { id: string }> = [];
   private usersRealtimeChannel: any = null;
   private banks: BankEntity[] = [];
   private banksUnsubscribe: (() => void) | null = null;
@@ -1175,10 +1376,19 @@ export class DataService {
   };
   private listeners: (() => void)[] = [];
   private lastInitTime: number = 0;
-  private readonly INIT_DEBOUNCE_MS = 2000; // Mínimo 2 segundos entre recargas completas
+  // CONC-FIX-02: Aumentado a 5s para reducir saturación con 30 usuarios concurrentes.
+  // Cada venta dispara realtime events que llamaban init() constantemente.
+  private readonly INIT_DEBOUNCE_MS = 5000; // Mínimo 5 segundos entre recargas completas
   private initPromise: Promise<void> | null = null;
+  private pendingInitReload: ReturnType<typeof setTimeout> | null = null;
+  private stockRecoveryInFlight = false;
   /** Evita doble envío en paralelo para la misma factura mientras dura el proceso de devolución. */
   private partialReturnSaleFlight = new Set<string>();
+  // Algunos entornos no tienen la tabla public.inventory_movements.
+  // Si detectamos ausencia (404/tabla no existe), desactivamos su consulta/suscripción
+  // para evitar errores repetitivos sin impactar otros módulos.
+  private inventoryMovementsAvailable = true;
+  private ledgerService = new LedgerService();
 
   constructor() {
     this.init();
@@ -1187,12 +1397,14 @@ export class DataService {
   private normalizePermissions(permissions: Array<string | PermissionKey> | undefined, role?: UserRole): PermissionKey[] {
     const allowed = new Set<PermissionKey>(PERMISSION_DEFINITIONS.map((entry) => entry.key));
     const fallback = this.getPermissionsForRole(role ?? 'CAJERO');
+    const hasExplicitPermissions = Array.isArray(permissions);
     const normalized = Array.from(new Set(
-      (Array.isArray(permissions) ? permissions : fallback)
+      (hasExplicitPermissions ? permissions : fallback)
         .map((entry) => String(entry ?? '').trim().toUpperCase() as PermissionKey)
         .filter((entry): entry is PermissionKey => allowed.has(entry))
     ));
     if (normalized.includes('ALL')) return ['ALL'];
+    if (hasExplicitPermissions) return normalized;
     return normalized.length > 0 ? normalized : fallback;
   }
 
@@ -1202,13 +1414,120 @@ export class DataService {
     return permissions.includes('ALL') || permissions.includes(permission);
   }
 
+  private hasReconcileOverridePermission(user: User | null): boolean {
+    if (!user) return false;
+    const permissions = this.normalizePermissions(user.permissions, user.role);
+    return permissions.includes('ALL') || permissions.includes('FINANCE_RECONCILE_OVERRIDE');
+  }
+
+  private resolveReconcileApproverByPin(pin: string): User | null {
+    const normalizedPin = String(pin ?? '').trim();
+    if (!normalizedPin) return null;
+    const approvedUser = this.users.find((u) =>
+      u?.active !== false
+      && String(u?.pin ?? '').trim() === normalizedPin
+      && this.hasReconcileOverridePermission(u)
+    );
+    return approvedUser ?? null;
+  }
+
   getPermissionDefinitions(): PermissionDefinition[] {
     return PERMISSION_DEFINITIONS;
   }
 
-  async toggleBankTransactionReconciled(txId: string, currentValue: boolean): Promise<void> {
+  private async postLedgerAlert(message: string, context: Record<string, unknown> = {}) {
+    const alertText = `[LEDGER] ${message}`;
+    try {
+      await this.addAuditEntry('ACCOUNTING', 'LEDGER_ERROR', `${alertText} | Contexto: ${JSON.stringify(context)}`);
+    } catch {
+      // Evitar romper flujo por falla de auditoría.
+    }
+    try {
+      await addDoc(collection(db, 'security_alerts'), {
+        type: 'LEDGER_ERROR',
+        targetUserId: String(this.currentUser?.id ?? ''),
+        targetUserName: String(this.currentUser?.name ?? 'SISTEMA'),
+        actorName: String(this.currentUser?.name ?? 'SISTEMA'),
+        detail: `${alertText} | Contexto: ${JSON.stringify(context)}`,
+        timestamp: new Date().toISOString(),
+        read: false
+      });
+    } catch {
+      // Sin ruptura si no existe colección/permisos.
+    }
+  }
+
+  private async createLedgerFromAmount(params: {
+    operationType: LedgerOperationType;
+    amountUSD: number;
+    originOperationId: string;
+    operationDate: string;
+    description: string;
+    currency?: 'USD' | 'VES';
+    exchangeRate?: number;
+    metadata?: Record<string, unknown>;
+  }): Promise<string> {
+    const details = await this.ledgerService.buildBalancedDetailsFromAmount({
+      operationType: params.operationType,
+      amount: params.amountUSD,
+      note: params.description
+    });
+    const result = await this.ledgerService.createLedgerEntry({
+      operationDate: params.operationDate,
+      originOperationId: params.originOperationId,
+      operationType: params.operationType,
+      description: params.description,
+      currency: params.currency ?? 'USD',
+      exchangeRate: params.exchangeRate,
+      createdBy: String(this.currentUser?.id ?? ''),
+      metadata: {
+        createdByName: String(this.currentUser?.name ?? 'SISTEMA'),
+        ...params.metadata
+      },
+      details
+    });
+    const flowType = this.mapLedgerOperationTypeToFlow(params.operationType);
+    this.consolidatedLedgerEntries.unshift({
+      timestamp: new Date(params.operationDate || new Date().toISOString()),
+      type: flowType,
+      category: params.operationType,
+      description: params.description,
+      amountUSD: Math.abs(Number(params.amountUSD ?? 0) || 0)
+    });
+    this.consolidatedLedgerEntries = this.consolidatedLedgerEntries
+      .sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime())
+      .slice(0, 500);
+    return result.seatId;
+  }
+
+  private mapLedgerOperationTypeToFlow(operationType: LedgerOperationType): 'INCOME' | 'EXPENSE' {
+    const incomeOps = new Set<LedgerOperationType>([
+      'SALE_CASH',
+      'SALE_CREDIT',
+      'AR_PAYMENT',
+      'INVENTORY_ADJUST_INCREASE'
+    ]);
+    return incomeOps.has(operationType) ? 'INCOME' : 'EXPENSE';
+  }
+
+  async toggleBankTransactionReconciled(txId: string, currentValue: boolean, approvalPin?: string): Promise<void> {
     const newValue = !currentValue;
     const actor = this.getCurrentUser()?.name ?? 'SISTEMA';
+    if (!newValue) {
+      const approver = this.resolveReconcileApproverByPin(String(approvalPin ?? ''));
+      if (!approver) {
+        throw new Error('Autorización requerida: ingrese clave válida de Presidente o Gerente.');
+      }
+      await setDoc(doc(db, 'bank_transactions', txId), {
+        reconciled: false,
+        reconciledAt: '',
+        reconciledBy: '',
+        unreconciledAt: new Date().toISOString(),
+        unreconciledBy: actor,
+        unreconciledApprovedBy: approver.name
+      } as any, { merge: true });
+      return;
+    }
     await setDoc(doc(db, 'bank_transactions', txId), {
       reconciled: newValue,
       reconciledAt: newValue ? new Date().toISOString() : '',
@@ -1220,6 +1539,12 @@ export class DataService {
     const bank = this.banks.find(b => String(b.id) === String(input.bankId));
     if (!bank) throw new Error('Banco no encontrado');
     const actor = this.getCurrentUser()?.name ?? 'SISTEMA';
+    const amountUSD = Number(input.amountUSD ?? 0) || 0;
+    const amountVES = Number(input.amountVES ?? 0) || 0;
+    const absUSD = Math.abs(amountUSD);
+    const absVES = Math.abs(amountVES);
+    const currency: 'USD' | 'VES' = absVES > 0.0001 && absUSD <= 0.0001 ? 'VES' : 'USD';
+    const inferredRate = absUSD > 0.0001 ? roundMoney(absVES / absUSD) : 0;
     const tx: BankTransactionRecord = {
       bankId: String(bank.id),
       bankName: bank.name,
@@ -1230,10 +1555,10 @@ export class DataService {
       customerId: '',
       customerName: input.description,
       saleCorrelativo: '',
-      currency: 'USD',
-      amountUSD: input.amountUSD,
-      amountVES: input.amountVES,
-      rateUsed: 1,
+      currency,
+      amountUSD,
+      amountVES,
+      rateUsed: inferredRate > 0 ? inferredRate : 1,
       reference: input.reference ?? '',
       note: input.description,
       actor,
@@ -1322,6 +1647,10 @@ export class DataService {
     const initial = await supabase.from('movements').insert(payload);
     if (!initial.error) return initial;
 
+    if (await this.handleMovementConflictAsIdempotent(initial.error, payload)) {
+      return { data: null, error: null } as any;
+    }
+
     const errorMessage = String(initial.error?.message ?? '').toLowerCase();
     const missingOperator = Object.prototype.hasOwnProperty.call(payload, 'operator')
       && errorMessage.includes("could not find the 'operator' column")
@@ -1335,7 +1664,58 @@ export class DataService {
     }
 
     // Generic fallback: drop any other missing column reported by Supabase
-    return await this.insertWithColumnFallback('movements', payload);
+    const fallback = await this.insertWithColumnFallback('movements', payload);
+    if (fallback?.error && await this.handleMovementConflictAsIdempotent(fallback.error, payload)) {
+      return { data: null, error: null } as any;
+    }
+    return fallback;
+  }
+
+  private isMovementConflictError(error: any): boolean {
+    const code = String(error?.code ?? '').trim().toLowerCase();
+    const msg = String(error?.message ?? '').toLowerCase();
+    const details = String(error?.details ?? '').toLowerCase();
+    return code === '23505'
+      || msg.includes('duplicate key')
+      || msg.includes('unique constraint')
+      || details.includes('duplicate key')
+      || details.includes('unique constraint');
+  }
+
+  private async handleMovementConflictAsIdempotent(error: any, payload: Record<string, any>): Promise<boolean> {
+    if (!this.isMovementConflictError(error)) return false;
+    try {
+      const normalized = {
+        product_code: String(payload?.product_code ?? '').trim(),
+        type: String(payload?.type ?? '').trim(),
+        warehouse: String(payload?.warehouse ?? '').trim(),
+        reason: String(payload?.reason ?? '').trim(),
+        operator: String(payload?.operator ?? '').trim(),
+        quantity: Number(payload?.quantity ?? 0) || 0
+      };
+      if (!normalized.product_code || !normalized.type || !normalized.warehouse) return false;
+
+      const { data, error: readError } = await supabase
+        .from('movements')
+        .select('id')
+        .eq('product_code', normalized.product_code)
+        .eq('type', normalized.type)
+        .eq('warehouse', normalized.warehouse)
+        .eq('reason', normalized.reason)
+        .eq('operator', normalized.operator)
+        .eq('quantity', normalized.quantity)
+        .order('created_at', { ascending: false })
+        .limit(1);
+
+      if (readError) return false;
+      if (Array.isArray(data) && data.length > 0) {
+        console.warn('[movements] 409 duplicado detectado; se toma como idempotente.', normalized);
+        return true;
+      }
+    } catch {
+      return false;
+    }
+    return false;
   }
 
   private generateUniqueBatchNumber(sku: string): string {
@@ -2060,6 +2440,11 @@ export class DataService {
   private async getPurchaseEntriesByInvoiceGroupId(sourceId: string): Promise<any[]> {
     const id = String(sourceId ?? '').trim();
     if (!id) return [];
+    if (this.purchaseEntriesCache.length > 0) {
+      return this.purchaseEntriesCache
+        .filter((row: any) => String(row?.invoiceGroupId ?? '').trim() === id)
+        .sort((a: any, b: any) => Number(a?.lineNumber ?? 0) - Number(b?.lineNumber ?? 0));
+    }
     const snap = await getDocs(query(collection(db, 'purchase_entries'), where('invoiceGroupId', '==', id)));
     return snap.docs
       .map((d) => ({ id: d.id, ...(d.data() as any) }))
@@ -2437,13 +2822,11 @@ export class DataService {
       description,
       unit,
       priceUSD,
-      minStock,
+      prices: [priceUSD],
+      min: minStock,
       conversionRatio,
       baseUnit,
-      stock: 0,
-      reserved: 0,
-      available: 0,
-      status: 'ACTIVE'
+      lotes: []
     };
 
     this.products.push(createdProduct);
@@ -2572,6 +2955,47 @@ export class DataService {
       };
     });
 
+    const purchaseOrderId = String(input?.purchaseOrderId ?? '').trim();
+    let purchaseOrderLineIds: string[] = [];
+
+    if (purchaseOrderId) {
+      if (!this.hasPermission('INVENTORY_WRITE') && !this.hasPermission('ALL')) {
+        throw new Error('Sin permiso para registrar recepción contra orden de compra.');
+      }
+      const poSnap = await getDoc(doc(db, 'purchase_orders', purchaseOrderId));
+      if (!poSnap.exists()) throw new Error('La orden de compra no existe o fue eliminada.');
+      const po = this.mapFirestorePurchaseOrder(purchaseOrderId, poSnap.data());
+      if (po.status !== 'APPROVED') {
+        throw new Error('La OC debe estar aprobada para registrar mercancía contra ella.');
+      }
+      const supPo = po.supplier.trim().toLowerCase();
+      const supIn = supplier.trim().toLowerCase();
+      if (supPo && supIn && supPo !== supIn) {
+        throw new Error('El proveedor de la factura no coincide con la orden de compra.');
+      }
+      purchaseOrderLineIds = [];
+      for (let i = 0; i < normalizedItems.length; i++) {
+        const item = normalizedItems[i] as PurchaseRegistrationItemInput & { sku?: string };
+        if (item?.newProduct && !String(item?.sku ?? '').trim()) {
+          throw new Error('Recepción contra OC: no se permiten productos nuevos; use SKUs del catálogo.');
+        }
+        const sku = String(item?.sku ?? '').trim().toUpperCase();
+        const wh = String(item?.warehouse || warehouse).trim().toLowerCase();
+        const qty = item.qty;
+        const line = po.lines.find(
+          (l) => l.sku === sku && String(l.warehouse ?? '').trim().toLowerCase() === wh
+        );
+        if (!line) {
+          throw new Error(`El producto ${sku} no está en la OC para el almacén indicado (o el almacén no coincide).`);
+        }
+        const rem = roundQtyValue(line.qtyOrdered - line.qtyReceived);
+        if (qty > rem + 0.0001) {
+          throw new Error(`Para ${sku} solo quedan ${rem} pendientes en la OC (factura pide ${qty}).`);
+        }
+        purchaseOrderLineIds.push(line.id);
+      }
+    }
+
     const computedInvoiceTotalUSD = roundMoney(normalizedItems.reduce((acc, item) => acc + item.totalLineUSD, 0));
     const totalInvoiceUSD = roundMoney(Number(input?.totalInvoiceUSD ?? 0) || computedInvoiceTotalUSD);
 
@@ -2697,7 +3121,7 @@ export class DataService {
 
       console.log(`Lote creado exitosamente: Producto=${sku}, Lote=${item.batch}, ID=${newBatch.id}, Cantidad=${item.qty}`);
 
-      await supabase.from('movements').insert({
+      await this.insertMovementWithFallback({
         product_code: sku,
         type: 'IN',
         quantity: item.qty,
@@ -2748,6 +3172,8 @@ export class DataService {
           storageBucket: upload.storageBucket ?? '',
           supportsUploadError: upload.supportsUploadError ?? '',
           batchId: String(newBatch?.id ?? ''),
+          purchaseOrderId: purchaseOrderId || '',
+          purchaseOrderLineId: purchaseOrderLineIds[index] ?? '',
           actor: this.currentUser?.name ?? '',
           createdAt: new Date().toISOString()
         } as any);
@@ -2830,6 +3256,16 @@ export class DataService {
       'VARIABLE'
     );
 
+    if (purchaseOrderId && purchaseOrderLineIds.length === normalizedItems.length) {
+      await this.applyPurchaseOrderReceipt(
+        purchaseOrderId,
+        normalizedItems.map((it, idx) => ({
+          lineId: purchaseOrderLineIds[idx],
+          qty: it.qty
+        }))
+      );
+    }
+
     await this.init();
     return {
       items: itemsResult,
@@ -2878,6 +3314,7 @@ export class DataService {
 
     for (const row of rows) {
       try {
+        await this.revertPurchaseOrderReceiptFromRow(row);
         // 1. Marcar purchase entry como VOID en Firebase con auditoría completa
         await setDoc(doc(db, 'purchase_entries', row.id), {
           status: 'VOID',
@@ -2907,7 +3344,7 @@ export class DataService {
         const sku = String(row.sku ?? '').trim();
         const qty = Number(row.qty ?? 0);
         if (sku && qty > 0) {
-          await supabase.from('movements').insert({
+          await this.insertMovementWithFallback({
             product_code: sku,
             type: 'OUT',
             quantity: qty,
@@ -3094,6 +3531,39 @@ export class DataService {
       .eq('id', batchId);
 
     if (error) throw new Error(String(error?.message ?? 'No se pudo ajustar el lote.'));
+
+    const unitCost = Number(batch.costUSD ?? 0) || 0;
+    const accountingAmount = Math.round(Math.abs(unitCost * qty) * 100) / 100;
+    if (accountingAmount > 0.005) {
+      try {
+        await this.createLedgerFromAmount({
+          operationType: input.adjustType === 'INCREASE' ? 'INVENTORY_ADJUST_INCREASE' : 'INVENTORY_ADJUST_DECREASE',
+          amountUSD: accountingAmount,
+          originOperationId: batchId,
+          operationDate: new Date().toISOString(),
+          description: `Ajuste inventario ${input.adjustType} ${sku} lote ${batchId}`,
+          currency: 'USD',
+          metadata: {
+            module: 'INVENTORY',
+            sku,
+            batchId,
+            warehouse,
+            qty,
+            reason
+          }
+        });
+      } catch (ledgerError: any) {
+        // Rollback de inventario si no se pudo crear asiento.
+        await supabase.from('inventory_batches').update({ quantity: currentQty }).eq('id', batchId);
+        await this.postLedgerAlert('Fallo al generar asiento de ajuste de inventario', {
+          sku,
+          batchId,
+          adjustType: input.adjustType,
+          message: String(ledgerError?.message ?? ledgerError ?? '')
+        });
+        throw ledgerError;
+      }
+    }
 
     const movQty = input.adjustType === 'DECREASE' ? -qty : qty;
     const reasonText = `Ajuste ${input.adjustType === 'DECREASE' ? 'negativo' : 'positivo'}: ${reason}${reference ? ` [${reference}]` : ''}`;
@@ -3318,7 +3788,9 @@ export class DataService {
     const price = Math.max(0, Number(newPriceUSD) || 0);
     if (!Number.isFinite(price) || price <= 0) throw new Error('El precio de venta debe ser mayor a cero.');
 
-    const product = this.products.find(p => String(p.code).trim().toUpperCase() === code);
+    const product =
+      this.products.find(p => String(p.code).trim().toUpperCase() === code)
+      ?? this.allProducts.find(p => String(p.code).trim().toUpperCase() === code);
     if (!product) throw new Error('El producto no existe en el catálogo.');
 
     const previousPrice = Number(product.priceUSD ?? 0);
@@ -3342,9 +3814,12 @@ export class DataService {
     await this.addAuditEntry('INVENTORY', 'PRODUCT_PRICE_CHANGE',
       `Cambio precio venta: ${code} | Anterior: $${previousPrice.toFixed(3)} → Nuevo: $${price.toFixed(3)} | Usuario: ${this.currentUser?.name || 'Sistema'}`);
 
-    this.products = this.products.map(p =>
-      p.code === code ? { ...p, priceUSD: price, prices } : p
-    );
+    const applyPricePatch = (p: ProductStock) =>
+      String(p.code ?? '').trim().toUpperCase() === code
+        ? { ...p, priceUSD: price, prices }
+        : p;
+    this.products = this.products.map(applyPricePatch);
+    this.allProducts = this.allProducts.map(applyPricePatch);
     this.notify();
   }
 
@@ -3394,7 +3869,7 @@ export class DataService {
       throw new Error(String(error?.message ?? 'No se pudo descontar el lote devuelto.'));
     }
 
-    await supabase.from('movements').insert({
+    await this.insertMovementWithFallback({
       product_code: sku,
       type: 'PURCHASE_RETURN',
       quantity: qty, // CORRECCIÓN: Devolución usa cantidad positiva
@@ -3573,7 +4048,7 @@ export class DataService {
       }
     }
 
-    await supabase.from('movements').insert({
+    await this.insertMovementWithFallback({
       product_code: relatedPurchaseId || adjustedAPEntryId || createdAPEntryId || supplier.toUpperCase(),
       type: type === 'CREDIT' ? 'PURCHASE_CREDIT_NOTE' : 'PURCHASE_DEBIT_NOTE',
       quantity: 0,
@@ -3849,23 +4324,29 @@ export class DataService {
     bankName?: string;
     take?: number;
   }): Promise<Array<BankTransactionRecord & { id: string }>> {
+    this.ensureOperationalRealtimeSync();
     const requestedTake = Number(input?.take ?? 0) || 0;
     const take = requestedTake > 0 ? Math.max(1, Math.min(1000, requestedTake)) : 0;
     const bankId = String(input?.bankId ?? '').trim();
     const bankName = String(input?.bankName ?? '').trim();
-    const constraints: any[] = [];
+    let rows = Array.isArray(this.bankTransactionsCache) ? [...this.bankTransactionsCache] : [];
+    if (rows.length === 0) {
+      const constraints: any[] = [];
+      if (bankId) constraints.unshift(where('bankId', '==', bankId));
+      else if (bankName) constraints.unshift(where('bankName', '==', bankName));
+      const q = query(collection(db, 'bank_transactions'), ...constraints);
+      const snap = await getDocs(q);
+      rows = snap.docs
+        .map(d => ({
+          id: d.id,
+          ...(d.data() as any)
+        }))
+        .sort((a, b) => String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')));
+      if (!bankId && !bankName) this.bankTransactionsCache = rows;
+    }
 
-    if (bankId) constraints.unshift(where('bankId', '==', bankId));
-    else if (bankName) constraints.unshift(where('bankName', '==', bankName));
-
-    const q = query(collection(db, 'bank_transactions'), ...constraints);
-    const snap = await getDocs(q);
-    const rows = snap.docs
-      .map(d => ({
-        id: d.id,
-        ...(d.data() as any)
-      }))
-      .sort((a, b) => String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')));
+    if (bankId) rows = rows.filter((r: any) => String(r?.bankId ?? '').trim() === bankId);
+    else if (bankName) rows = rows.filter((r: any) => String(r?.bankName ?? '').trim() === bankName);
 
     const purchaseSourceIds = Array.from(new Set(
       rows
@@ -3911,10 +4392,51 @@ export class DataService {
     return found?.id;
   }
 
+  private ensureOperationalRealtimeSync() {
+    if (!this.bankTransactionsUnsubscribe) {
+      const qBankTx = query(collection(db, 'bank_transactions'), orderBy('createdAt', 'desc'), limit(1500));
+      this.bankTransactionsUnsubscribe = onSnapshot(
+        qBankTx,
+        (snap) => {
+          this.bankTransactionsCache = snap.docs
+            .map((d) => ({ id: d.id, ...(d.data() as any) }))
+            .sort((a, b) => String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')));
+          this.notify();
+        },
+        (error) => {
+          console.error('Error sincronizando bank_transactions:', error);
+        }
+      );
+    }
+
+    if (!this.purchaseEntriesUnsubscribe) {
+      const qPurch = query(collection(db, 'purchase_entries'), orderBy('createdAt', 'desc'), limit(5000));
+      this.purchaseEntriesUnsubscribe = onSnapshot(
+        qPurch,
+        (snap) => {
+          this.purchaseEntriesCache = snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) }));
+          this.notify();
+        },
+        (error) => {
+          console.error('Error sincronizando purchase_entries:', error);
+        }
+      );
+    }
+  }
+
   private async init(force: boolean = false): Promise<void> {
     // BUG-06 FIX: Evitar recargas muy frecuentes con debounce
     const now = Date.now();
     if (!force && (now - this.lastInitTime) < this.INIT_DEBOUNCE_MS) {
+      // CONC-FIX-02: programar trailing reload para no perder cambios entrantes
+      // bajo alta concurrencia (30 usuarios). Solo se programa una vez.
+      if (!this.pendingInitReload) {
+        const remaining = this.INIT_DEBOUNCE_MS - (now - this.lastInitTime);
+        this.pendingInitReload = setTimeout(() => {
+          this.pendingInitReload = null;
+          void this.init(true);
+        }, Math.max(remaining, 100));
+      }
       // Solo notificar a listeners sin recargar desde BD
       this.notify();
       return;
@@ -3923,6 +4445,12 @@ export class DataService {
     // Si ya hay una inicialización en progreso, esperarla
     if (this.initPromise) {
       return this.initPromise;
+    }
+
+    // Si había un trailing reload pendiente, cancelarlo (vamos a recargar ahora)
+    if (this.pendingInitReload) {
+      clearTimeout(this.pendingInitReload);
+      this.pendingInitReload = null;
     }
     
     this.initPromise = this._doInit();
@@ -3935,12 +4463,14 @@ export class DataService {
   }
 
   private async _doInit(): Promise<void> {
+    this.ensureOperationalRealtimeSync();
     let purchaseEntriesByBatchId = new Map<string, any>();
     try {
-      const purchaseSnap = await getDocs(collection(db, 'purchase_entries'));
+      const sourceRows = this.purchaseEntriesCache.length > 0
+        ? this.purchaseEntriesCache
+        : (await getDocs(collection(db, 'purchase_entries'))).docs.map((d) => ({ id: d.id, ...(d.data() as any) }));
       purchaseEntriesByBatchId = new Map(
-        purchaseSnap.docs
-          .map((d) => ({ id: d.id, ...(d.data() as any) }))
+        sourceRows
           .filter((row: any) => String(row?.batchId ?? '').trim())
           .map((row: any) => [String(row.batchId).trim(), row])
       );
@@ -4112,32 +4642,70 @@ export class DataService {
 
     // 3b. Kardex / trazabilidad: devoluciones y otros mov. en `inventory_movements` (no están en `movements`)
     this.inventoryLedgerMovements = [];
-    try {
-      const { data: invRows, error: invErr } = await supabase
-        .from('inventory_movements')
-        .select('*')
-        .order('created_at', { ascending: false })
-        .limit(5000);
-      if (!invErr && invRows && invRows.length > 0) {
-        for (const row of invRows as any[]) {
-          const mapped = this.mapSupabaseInventoryMovementRow(row);
-          if (mapped) this.inventoryLedgerMovements.push(mapped);
+    if (this.inventoryMovementsAvailable) {
+      try {
+        const { data: invRows, error: invErr } = await supabase
+          .from('inventory_movements')
+          .select('*')
+          .order('created_at', { ascending: false })
+          .limit(5000);
+
+        if (invErr) {
+          const errText = String((invErr as any)?.message ?? '').toLowerCase();
+          const errCode = String((invErr as any)?.code ?? '').toUpperCase();
+          const tableMissing =
+            errCode === 'PGRST205'
+            || errText.includes('inventory_movements')
+            || errText.includes('relation') && errText.includes('does not exist');
+          if (tableMissing) {
+            this.inventoryMovementsAvailable = false;
+          } else {
+            console.warn('inventory_movements: error no bloqueante al cargar:', invErr);
+          }
+        } else if (invRows && invRows.length > 0) {
+          for (const row of invRows as any[]) {
+            const mapped = this.mapSupabaseInventoryMovementRow(row);
+            if (mapped) this.inventoryLedgerMovements.push(mapped);
+          }
+        }
+      } catch (e) {
+        const errText = String((e as any)?.message ?? '').toLowerCase();
+        if (errText.includes('404') || errText.includes('inventory_movements')) {
+          this.inventoryMovementsAvailable = false;
+        } else {
+          console.warn('inventory_movements: no se pudo cargar (Kardex sin devoluciones detalladas):', e);
         }
       }
-    } catch (e) {
-      console.warn('inventory_movements: no se pudo cargar (Kardex sin devoluciones detalladas):', e);
     }
 
     // 4. Suscribirse a cambios en tiempo real
+    // CONC-FIX-04: Se elimina `force=true` para que el debounce de init() (5s)
+    // coalesce ráfagas de eventos bajo alta concurrencia (30 usuarios). El
+    // trailing reload garantiza que el último estado se procesará al final de
+    // la ventana sin perder cambios.
+    // CONC-FIX-05: Filtros específicos por evento para reducir volumen de
+    // mensajes recibidos por cliente:
+    //   - inventory_batches/movements: '*' (crítico para stock)
+    //   - sales: INSERT y UPDATE (anulaciones)
+    //   - products: INSERT y UPDATE (no DELETE)
+    //   - expenses/ap_entries: solo INSERT (updates rara vez impactan caché global)
     if (!this.supabaseSubscribed) {
-      supabase
+      const channel = supabase
         .channel('db-all-changes')
         .on('postgres_changes', { event: '*', schema: 'public', table: 'movements' }, () => this.init())
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'inventory_movements' }, () => this.init())
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'sales' }, () => this.init())
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'expenses' }, () => this.init())
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'ap_entries' }, () => this.init())
-        .subscribe();
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'inventory_batches' }, () => this.init())
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'products' }, () => this.init())
+        .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'products' }, () => this.init())
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'sales' }, () => this.init())
+        .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'sales' }, () => this.init())
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'expenses' }, () => this.init())
+        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'ap_entries' }, () => this.init())
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'asientos_contables' }, () => this.init())
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'detalles_asiento' }, () => this.init());
+      if (this.inventoryMovementsAvailable) {
+        channel.on('postgres_changes', { event: '*', schema: 'public', table: 'inventory_movements' }, () => this.init());
+      }
+      channel.subscribe();
       this.supabaseSubscribed = true;
     }
 
@@ -4192,6 +4760,61 @@ export class DataService {
       }));
     }
 
+    // 6b. Cargar Libro Mayor contable desde asientos_contables (si existe en Supabase)
+    try {
+      const { data: seatRows, error: seatErr } = await supabase
+        .from('asientos_contables')
+        .select('id,fecha,tipo_operacion,descripcion')
+        .order('fecha', { ascending: false })
+        .limit(500);
+      if (seatErr) {
+        const seatErrText = String((seatErr as any)?.message ?? '').toLowerCase();
+        const tableMissing = seatErrText.includes('asientos_contables') || seatErrText.includes('does not exist');
+        if (!tableMissing) console.warn('No se pudo cargar asientos_contables:', seatErr);
+        this.consolidatedLedgerEntries = [];
+      } else if (Array.isArray(seatRows) && seatRows.length > 0) {
+        const seatIds = seatRows.map((r: any) => String(r.id ?? '')).filter(Boolean);
+        const { data: detailRows, error: detailErr } = await supabase
+          .from('detalles_asiento')
+          .select('asiento_id,debe,haber')
+          .in('asiento_id', seatIds);
+        if (detailErr) {
+          console.warn('No se pudo cargar detalles_asiento para libro mayor:', detailErr);
+          this.consolidatedLedgerEntries = [];
+        } else {
+          const totalsBySeat = new Map<string, { debe: number; haber: number }>();
+          for (const row of (detailRows ?? []) as any[]) {
+            const key = String(row?.asiento_id ?? '').trim();
+            if (!key) continue;
+            const current = totalsBySeat.get(key) ?? { debe: 0, haber: 0 };
+            current.debe += Number(row?.debe ?? 0) || 0;
+            current.haber += Number(row?.haber ?? 0) || 0;
+            totalsBySeat.set(key, current);
+          }
+          this.consolidatedLedgerEntries = seatRows.map((row: any) => {
+            const opType = String(row?.tipo_operacion ?? '').trim().toUpperCase() as LedgerOperationType;
+            const totals = totalsBySeat.get(String(row?.id ?? '')) ?? { debe: 0, haber: 0 };
+            const amountUSD = Math.round(Math.max(totals.debe, totals.haber) * 100) / 100;
+            return {
+              timestamp: row?.fecha ? new Date(row.fecha) : new Date(),
+              type: this.mapLedgerOperationTypeToFlow(opType),
+              category: opType || 'ASIENTO',
+              description: String(row?.descripcion ?? '').trim() || `Asiento ${String(row?.id ?? '').slice(0, 8).toUpperCase()}`,
+              amountUSD
+            };
+          }).sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
+        }
+      } else {
+        this.consolidatedLedgerEntries = [];
+      }
+    } catch (e) {
+      const errText = String((e as any)?.message ?? '').toLowerCase();
+      if (!errText.includes('asientos_contables')) {
+        console.warn('Libro mayor contable no disponible temporalmente:', e);
+      }
+      this.consolidatedLedgerEntries = [];
+    }
+
     // 7b. Cargar Notas de Crédito (devoluciones) desde Firestore
     if (!this.creditNotesUnsubscribe) {
       const qCN = query(collection(db, 'credit_notes'), orderBy('createdAt', 'desc'));
@@ -4240,6 +4863,21 @@ export class DataService {
       );
     }
 
+    // 7a. Órdenes de compra (CMP-03)
+    if (!this.purchaseOrdersUnsubscribe) {
+      const qPO = query(collection(db, 'purchase_orders'), orderBy('createdAt', 'desc'));
+      this.purchaseOrdersUnsubscribe = onSnapshot(
+        qPO,
+        (snap) => {
+          this.purchaseOrders = snap.docs.map((d) => this.mapFirestorePurchaseOrder(d.id, d.data()));
+          this.notify();
+        },
+        (error) => {
+          console.error('Error cargando órdenes de compra:', error);
+        }
+      );
+    }
+
     // 7. Cargar AR desde Firestore
     if (!this.arUnsubscribe) {
       const q = query(collection(db, 'ar_entries'), orderBy('timestamp', 'desc'));
@@ -4260,7 +4898,8 @@ export class DataService {
               status: (ar.status ?? 'PENDING') as any,
               saleCorrelativo: (ar.saleCorrelativo ?? ar.sale_correlativo ?? '') as string,
               lateFeeUSD: Number(ar.lateFeeUSD ?? 0),
-              penaltyAppliedAt: ar.penaltyAppliedAt ?? undefined
+              penaltyAppliedAt: ar.penaltyAppliedAt ?? undefined,
+              meta: (ar.meta ?? undefined) as any
             };
           });
           void this.applyOverduePenalties();
@@ -4268,6 +4907,45 @@ export class DataService {
         },
         (error) => {
           console.error('Error cargando AR desde Firestore:', error);
+        }
+      );
+    }
+
+    if (!this.companyLoansUnsubscribe) {
+      const q = query(collection(db, 'company_loans'), orderBy('issuedAt', 'desc'));
+      this.companyLoansUnsubscribe = onSnapshot(
+        q,
+        (snap) => {
+          this.companyLoans = snap.docs.map((d) => {
+            const loan: any = d.data();
+            return {
+              id: String(loan.id ?? d.id),
+              loanCorrelativo: String(loan.loanCorrelativo ?? ''),
+              arEntryId: String(loan.arEntryId ?? ''),
+              issuedAt: String(loan.issuedAt ?? new Date().toISOString()),
+              dueDate: String(loan.dueDate ?? new Date().toISOString()),
+              beneficiaryType: String(loan.beneficiaryType ?? 'EMPLOYEE').toUpperCase() === 'PARTNER' ? 'PARTNER' : 'EMPLOYEE',
+              beneficiaryId: String(loan.beneficiaryId ?? ''),
+              beneficiaryName: String(loan.beneficiaryName ?? ''),
+              description: String(loan.description ?? ''),
+              principalUSD: Number(loan.principalUSD ?? 0) || 0,
+              balanceUSD: Number(loan.balanceUSD ?? 0) || 0,
+              currency: String(loan.currency ?? 'USD').toUpperCase() === 'VES' ? 'VES' : 'USD',
+              amountVES: Number(loan.amountVES ?? 0) || 0,
+              rateUsed: Number(loan.rateUsed ?? 0) || 0,
+              status: (loan.status ?? 'PENDING') as CompanyLoan['status'],
+              sourceMethod: String(loan.sourceMethod ?? ''),
+              sourceBankName: String(loan.sourceBankName ?? ''),
+              reference: String(loan.reference ?? ''),
+              note: String(loan.note ?? ''),
+              createdBy: String(loan.createdBy ?? ''),
+              updatedAt: String(loan.updatedAt ?? loan.issuedAt ?? new Date().toISOString())
+            } as CompanyLoan;
+          });
+          this.notify();
+        },
+        (error) => {
+          console.error('Error cargando prestamos internos:', error);
         }
       );
     }
@@ -4287,6 +4965,14 @@ export class DataService {
     // ADJUST/AJUSTE/TRANSFER: signo variable, se resuelve con el signo de qty más abajo
     const INV_INGRESO = new Set(['IN', 'PURCHASE', 'SALE_RETURN', 'MANUFACTURING', 'VOID', 'ADJUSTMENT_IN']);
     const INV_EGRESO  = new Set(['OUT', 'SALE', 'WASTE', 'ADJUSTMENT_OUT', 'TRANSFER_OUT', 'PURCHASE_RETURN', 'FRACTION']);
+    const SYS_ACTION_LABELS: Record<string, string> = {
+      AUTH: 'SEGURIDAD',
+      SECURITY: 'SEGURIDAD',
+      CXC: 'CXC',
+      CXP: 'CXP',
+      FINANCE: 'FINANZAS',
+      ACCOUNTING: 'CONTABILIDAD'
+    };
     this.movements.forEach(m => {
       const product = this.products.find(p => p.code === m.sku);
       const description = product ? product.description : m.sku;
@@ -4294,6 +4980,7 @@ export class DataService {
       const label = m.reason ? `${m.reason}` : `${m.type}`;
       const isMovement = Math.abs(m.qty) > 0.0001;
       const mType = String(m.type ?? '').toUpperCase();
+      const isInventoryMovement = INV_INGRESO.has(mType) || INV_EGRESO.has(mType) || mType === 'ADJUST' || mType === 'TRANSFER';
       const invFlowType = INV_INGRESO.has(mType) || m.qty > 0
         ? 'INGRESO'
         : INV_EGRESO.has(mType) || m.qty < 0
@@ -4329,14 +5016,14 @@ export class DataService {
         id: m.id,
         timestamp: m.timestamp,
         actor: m.user,
-        action: 'INVENTARIO',
+        action: isInventoryMovement ? 'INVENTARIO' : (SYS_ACTION_LABELS[mType] ?? mType),
         entity: entityRef,
         details: isMovement
           ? `${label}: ${Math.abs(m.qty)} ${unit} DE ${description} EN ${m.warehouse}`
           : `${label}: ${m.reason || m.sku}`,
         hash: m.id.slice(0, 8).toUpperCase(),
-        flowType: invFlowType,
-        subType
+        flowType: isInventoryMovement ? invFlowType : (mType === 'CXC' ? 'INGRESO' : 'NEUTRO'),
+        subType: isInventoryMovement ? subType : (mType === 'CXC' ? 'Cobro CxC' : mType)
       } as any);
     });
 
@@ -4512,42 +5199,143 @@ export class DataService {
   async getAPPayments(apId: string): Promise<Array<APPaymentRecord & { id: string }>> {
     const id = String(apId || '').trim();
     if (!id) return [];
-    const q = query(collection(db, 'ap_entries', id, 'payments'), orderBy('createdAt', 'desc'));
-    const snap = await getDocs(q);
-    return snap.docs.map(d => ({
+    const [paymentsSnap, adjustmentByApSnap, adjustmentByCreatedApSnap] = await Promise.all([
+      getDocs(query(collection(db, 'ap_entries', id, 'payments'), orderBy('createdAt', 'desc'))),
+      getDocs(query(collection(db, 'purchase_adjustment_notes'), where('apEntryId', '==', id))),
+      getDocs(query(collection(db, 'purchase_adjustment_notes'), where('createdAPEntryId', '==', id)))
+    ]);
+
+    const regularPayments = paymentsSnap.docs.map((d) => ({
       id: d.id,
       ...(d.data() as any)
-    }));
+    })) as Array<APPaymentRecord & { id: string }>;
+
+    const adjustmentDocs = [...adjustmentByApSnap.docs, ...adjustmentByCreatedApSnap.docs];
+    const seenAdjustmentIds = new Set<string>();
+    const adjustmentMovements = adjustmentDocs
+      .filter((d) => {
+        if (seenAdjustmentIds.has(d.id)) return false;
+        seenAdjustmentIds.add(d.id);
+        return true;
+      })
+      .map((d) => {
+        const row = d.data() as any;
+        const noteType = String(row?.type ?? '').trim().toUpperCase();
+        const createdAt = String(row?.createdAt ?? new Date().toISOString());
+        const amountUSD = Number(row?.amountUSD ?? 0) || 0;
+        const isDebit = noteType === 'DEBIT';
+        return {
+          id: `adj-${d.id}`,
+          apId: id,
+          supplier: String(row?.supplier ?? ''),
+          description: String(row?.reason ?? ''),
+          method: isDebit ? 'nota debito' : 'nota credito',
+          currency: 'USD',
+          amountUSD,
+          amountVES: 0,
+          rateUsed: 0,
+          bank: 'AJUSTE CXP',
+          bankId: 'INTERNAL',
+          accountId: 'INTERNAL',
+          accountLabel: 'AJUSTE CXP',
+          reference: String(row?.reference ?? ''),
+          note: `Nota ${isDebit ? 'DEBITO' : 'CREDITO'}${row?.reference ? ` ${String(row.reference)}` : ''}: ${String(row?.reason ?? '').trim() || 'Sin motivo'}`,
+          supports: Array.isArray(row?.supports) ? row.supports : [],
+          actor: String(row?.actor ?? 'SISTEMA'),
+          createdAt
+        } as APPaymentRecord & { id: string };
+      });
+
+    return [...regularPayments, ...adjustmentMovements].sort((a, b) => {
+      const ta = new Date((a as any)?.createdAt ?? 0).getTime();
+      const tb = new Date((b as any)?.createdAt ?? 0).getTime();
+      return tb - ta;
+    });
   }
 
   getUsers() { return this.users; }
 
+  resetRealtimeSubscriptions() {
+    const safeUnsub = (fn: (() => void) | null) => {
+      if (!fn) return;
+      try { fn(); } catch { /* noop */ }
+    };
+    safeUnsub(this.bankTransactionsUnsubscribe); this.bankTransactionsUnsubscribe = null;
+    safeUnsub(this.purchaseEntriesUnsubscribe); this.purchaseEntriesUnsubscribe = null;
+    safeUnsub(this.creditNotesUnsubscribe); this.creditNotesUnsubscribe = null;
+    safeUnsub(this.clientAdvancesUnsubscribe); this.clientAdvancesUnsubscribe = null;
+    safeUnsub(this.purchaseOrdersUnsubscribe); this.purchaseOrdersUnsubscribe = null;
+    safeUnsub(this.arUnsubscribe); this.arUnsubscribe = null;
+    safeUnsub(this.companyLoansUnsubscribe); this.companyLoansUnsubscribe = null;
+    safeUnsub(this.banksUnsubscribe); this.banksUnsubscribe = null;
+    safeUnsub(this.cashBoxSessionsUnsubscribe); this.cashBoxSessionsUnsubscribe = null;
+    safeUnsub(this.posTerminalsUnsubscribe); this.posTerminalsUnsubscribe = null;
+    safeUnsub(this.currentSessionSalesUnsubscribe); this.currentSessionSalesUnsubscribe = null;
+    if (this.usersRealtimeChannel) {
+      try { this.usersRealtimeChannel(); } catch { /* noop */ }
+      this.usersRealtimeChannel = null;
+    }
+  }
+
+  reloadAfterAuth() {
+    this.resetRealtimeSubscriptions();
+    void this.init(true);
+  }
+
   ensureUsersRealtimeSync() {
     if (this.usersRealtimeChannel) return;
-    const mapUser = (id: string, u: any): User => ({
+    const mapUser = (id: string, u: any): User => {
+      let parsedPermissions: Array<string | PermissionKey> | undefined;
+      if (Array.isArray(u.permissions)) {
+        parsedPermissions = u.permissions;
+      } else if (typeof u.permissions === 'string') {
+        try {
+          const parsed = JSON.parse(u.permissions);
+          parsedPermissions = Array.isArray(parsed) ? parsed : undefined;
+        } catch {
+          parsedPermissions = undefined;
+        }
+      } else {
+        parsedPermissions = undefined;
+      }
+      return ({
       id,
       name: u.name ?? '',
       email: u.email ?? undefined,
       role: (u.role ?? 'CAJERO') as UserRole,
       pin: u.pin ?? '',
       permissions: this.normalizePermissions(
-        Array.isArray(u.permissions) ? u.permissions : (typeof u.permissions === 'string' ? JSON.parse(u.permissions) : []),
+        parsedPermissions,
         (u.role ?? 'CAJERO') as UserRole
       ),
       active: u.active ?? true,
       firebaseUid: u.firebaseUid ?? u.firebase_uid ?? undefined
     });
+    };
     const applyUsers = (docs: { id: string; data: () => any }[]) => {
       this.users = docs.map(d => mapUser(d.id, d.data()));
       this.notify();
     };
     // Carga inmediata sin esperar al listener
-    getDocs(collection(db, 'users')).then(snap => applyUsers(snap.docs)).catch(console.error);
+    getDocs(collection(db, 'users'))
+      .then(snap => applyUsers(snap.docs))
+      .catch((error) => {
+        console.error('Error cargando usuarios Firestore:', error);
+        this.users = [];
+        this.notify();
+      });
     // Listener en tiempo real de Firestore (INSERT / UPDATE / DELETE)
     this.usersRealtimeChannel = onSnapshot(
       collection(db, 'users'),
       (snap) => applyUsers(snap.docs),
-      (error) => console.error('Error en listener de usuarios Firestore:', error)
+      (error: any) => {
+        console.error('Error en listener de usuarios Firestore:', error);
+        // Evita dejar usuarios en caché ("fantasma") cuando el backend niega permisos.
+        if (error?.code === 'permission-denied') {
+          this.users = [];
+          this.notify();
+        }
+      }
     );
   }
 
@@ -4692,16 +5480,32 @@ export class DataService {
   }
 
   async addUser(name: string, email: string, role: UserRole, pin: string, permissions?: PermissionKey[]) {
+    const normalizedName = String(name ?? '').trim().toUpperCase();
+    const normalizedEmail = String(email ?? '').trim().toLowerCase();
+    if (!normalizedName) throw new Error('El nombre del operador es obligatorio.');
+    if (!normalizedEmail) throw new Error('El correo del operador es obligatorio.');
+
+    // Validación fuerte contra backend para evitar duplicados por caché/local state desfasado.
+    const existingByEmail = await getDocs(query(collection(db, 'users'), where('email', '==', normalizedEmail), limit(1)));
+    if (!existingByEmail.empty) {
+      throw new Error('Este correo ya existe en el sistema. Edite el operador existente o elimínelo definitivamente.');
+    }
+
     // 1. Crear usuario en Firebase Authentication automáticamente
     let firebaseUserId: string | null = null;
     try {
-      const userCredential = await authService.createUser(email.trim().toLowerCase(), pin);
+      const userCredential = await authService.createUser(normalizedEmail, pin);
       firebaseUserId = userCredential.user.uid;
       console.log('Usuario creado en Firebase:', firebaseUserId);
     } catch (error: any) {
       console.error('Error al crear usuario en Firebase:', error);
       if (error.code === 'auth/email-already-in-use') {
-        throw new Error('Este correo electrónico ya está registrado en Firebase. Use otro correo o elimine el usuario existente.');
+        // El correo existe en Firebase Auth pero no necesariamente en Firestore users.
+        const linked = await getDocs(query(collection(db, 'users'), where('email', '==', normalizedEmail), limit(1)));
+        if (!linked.empty) {
+          throw new Error('Este correo ya existe en el sistema y en Firebase. Edite o elimine ese operador antes de crear otro.');
+        }
+        throw new Error('Este correo existe en Firebase Auth, pero no está vinculado en el sistema. Use "Vincular usuario existente" e ingrese el UID de Firebase.');
       }
       throw new Error(`Error al crear usuario en Firebase: ${error.message}`);
     }
@@ -4709,8 +5513,8 @@ export class DataService {
     // 2. Crear usuario local
     const newUser: User = {
       id: `USR-${Math.random().toString(36).substr(2, 6).toUpperCase()}`,
-      name,
-      email,
+      name: normalizedName,
+      email: normalizedEmail,
       role,
       pin,
       permissions: this.normalizePermissions(permissions, role),
@@ -4741,15 +5545,31 @@ export class DataService {
   }
 
   async registerExistingFirebaseUser(name: string, email: string, role: UserRole, pin: string, firebaseUid: string, permissions?: PermissionKey[]) {
+    const normalizedName = String(name ?? '').trim().toUpperCase();
+    const normalizedEmail = String(email ?? '').trim().toLowerCase();
+    const normalizedUid = String(firebaseUid ?? '').trim();
+    if (!normalizedName) throw new Error('El nombre del operador es obligatorio.');
+    if (!normalizedEmail) throw new Error('El correo del operador es obligatorio.');
+    if (!normalizedUid) throw new Error('Debe indicar el UID de Firebase.');
+
+    const existingByEmail = await getDocs(query(collection(db, 'users'), where('email', '==', normalizedEmail), limit(1)));
+    if (!existingByEmail.empty) {
+      throw new Error('Ya existe un operador con ese correo en el sistema.');
+    }
+    const existingByUid = await getDocs(query(collection(db, 'users'), where('firebaseUid', '==', normalizedUid), limit(1)));
+    if (!existingByUid.empty) {
+      throw new Error('Ese UID de Firebase ya está vinculado a otro operador.');
+    }
+
     const newUser: User = {
       id: `USR-${Math.random().toString(36).substr(2, 6).toUpperCase()}`,
-      name: name.trim().toUpperCase(),
-      email: email.trim().toLowerCase(),
+      name: normalizedName,
+      email: normalizedEmail,
       role,
       pin,
       permissions: this.normalizePermissions(permissions, role),
       active: true,
-      firebaseUid
+      firebaseUid: normalizedUid
     };
     await setDoc(doc(db, 'users', newUser.id), {
       name: newUser.name,
@@ -4758,7 +5578,7 @@ export class DataService {
       pin: newUser.pin,
       permissions: newUser.permissions,
       active: newUser.active,
-      firebaseUid,
+      firebaseUid: normalizedUid,
       createdAt: new Date().toISOString()
     });
     this.addAuditEntry('SECURITY', 'USER_CREATE', `Usuario Firebase registrado en sistema: ${newUser.name} (${role}) - UID: ${firebaseUid}`);
@@ -4845,8 +5665,16 @@ export class DataService {
     const user = this.users.find(u => u.id === id);
     if (!user) throw new Error('Usuario no encontrado');
 
+    const activeSessionsSnap = await getDocs(query(collection(db, 'active_sessions'), where('userId', '==', id)));
+    for (const d of activeSessionsSnap.docs) {
+      await deleteDoc(d.ref);
+    }
+    if (user.email) {
+      const lockDocId = user.email.toLowerCase().replace(/[^a-z0-9]/g, '_');
+      await deleteDoc(doc(db, 'login_lockouts', lockDocId));
+    }
     await deleteDoc(doc(db, 'users', id));
-    this.addAuditEntry('SECURITY', 'USER_DELETE', `Usuario eliminado permanentemente: ${user.name} (${user.role})`);
+    await this.addAuditEntry('SECURITY', 'USER_DELETE', `Usuario eliminado permanentemente: ${user.name} (${user.role})`);
   }
 
   // ─── CONTROL DE INTENTOS DE LOGIN Y BLOQUEO DE CUENTA ─────────────────────
@@ -4891,6 +5719,9 @@ export class DataService {
 
   async recordFailedLoginAttempt(email: string, attempts: number) {
     try {
+      // Con reglas "request.auth != null", en login fallido no hay sesión Firebase activa.
+      // Evitamos escrituras que siempre serán rechazadas y ensucian consola.
+      if (!auth.currentUser) return;
       const docId = email.toLowerCase().replace(/[^a-z0-9]/g, '_');
       await setDoc(doc(db, 'login_lockouts', docId), {
         email: email.toLowerCase(),
@@ -4961,6 +5792,111 @@ export class DataService {
     } catch { /* silencioso */ }
   }
 
+  // ─── CMP-03: ALERTAS DE APROBACIÓN DE OC ──────────────────────────────────
+  async postPurchaseOrderApprovalAlert(payload: {
+    purchaseOrderId: string;
+    purchaseOrderCorrelativo: string;
+    supplier: string;
+    createdBy?: string;
+  }): Promise<void> {
+    try {
+      const poId = String(payload.purchaseOrderId ?? '').trim();
+      if (!poId) return;
+      const existing = await getDocs(query(
+        collection(db, 'purchase_order_approval_alerts'),
+        where('purchaseOrderId', '==', poId),
+        limit(20)
+      ));
+      const hasOpen = existing.docs.some((d) => {
+        const row: any = d.data();
+        return String(row?.type ?? '') === 'PO_SUBMITTED';
+      });
+      if (hasOpen) return;
+
+      await addDoc(collection(db, 'purchase_order_approval_alerts'), {
+        type: 'PO_SUBMITTED',
+        purchaseOrderId: poId,
+        purchaseOrderCorrelativo: String(payload.purchaseOrderCorrelativo ?? '').trim(),
+        supplier: String(payload.supplier ?? '').trim(),
+        createdBy: String(payload.createdBy ?? '').trim(),
+        targetRoles: ['FINANZAS', 'SUPERVISOR', 'ADMIN'],
+        readByUserIds: [],
+        createdAt: new Date().toISOString()
+      } as Record<string, unknown>);
+    } catch (e) {
+      console.warn('No se pudo guardar alerta de aprobación OC:', e);
+    }
+  }
+
+  async getPurchaseOrderApprovalAlerts(onlyUnread = true): Promise<PurchaseOrderApprovalAlert[]> {
+    try {
+      const current = this.getCurrentUser();
+      const role = (current?.role ?? '') as UserRole;
+      const userId = String(current?.id ?? '').trim();
+      const hasAll = this.hasPermission('ALL', current);
+      const canApproveByRole = role === 'FINANZAS' || role === 'SUPERVISOR' || role === 'ADMIN';
+      if (!hasAll && !canApproveByRole) return [];
+
+      const snap = await getDocs(query(
+        collection(db, 'purchase_order_approval_alerts'),
+        orderBy('createdAt', 'desc'),
+        limit(300)
+      ));
+      const rows = snap.docs.map((d) => ({ id: d.id, ...(d.data() as any) })) as PurchaseOrderApprovalAlert[];
+      return rows.filter((a: any) => {
+        const targets = Array.isArray(a?.targetRoles) ? a.targetRoles : [];
+        const targetOk = hasAll || targets.includes(role);
+        if (!targetOk) return false;
+        if (!onlyUnread) return true;
+        const readBy = Array.isArray(a?.readByUserIds) ? a.readByUserIds : [];
+        return !userId || !readBy.includes(userId);
+      });
+    } catch (e) {
+      console.warn('No se pudieron cargar alertas OC:', e);
+      return [];
+    }
+  }
+
+  async markPurchaseOrderApprovalAlertRead(id: string): Promise<void> {
+    try {
+      const docId = String(id ?? '').trim();
+      const userId = String(this.getCurrentUser()?.id ?? '').trim();
+      if (!docId || !userId) return;
+      const ref = doc(db, 'purchase_order_approval_alerts', docId);
+      const snap = await getDoc(ref);
+      if (!snap.exists()) return;
+      const row: any = snap.data();
+      const readBy = Array.isArray(row?.readByUserIds) ? [...row.readByUserIds] : [];
+      if (!readBy.includes(userId)) readBy.push(userId);
+      await updateDoc(ref, { readByUserIds: readBy });
+    } catch (e) {
+      console.warn('No se pudo marcar alerta OC como leída:', e);
+    }
+  }
+
+  async markPurchaseOrderApprovalAlertsReadByOrder(purchaseOrderId: string): Promise<void> {
+    try {
+      const poId = String(purchaseOrderId ?? '').trim();
+      const userId = String(this.getCurrentUser()?.id ?? '').trim();
+      if (!poId || !userId) return;
+      const snap = await getDocs(query(
+        collection(db, 'purchase_order_approval_alerts'),
+        where('purchaseOrderId', '==', poId),
+        limit(100)
+      ));
+      for (const d of snap.docs) {
+        const row: any = d.data();
+        const readBy = Array.isArray(row?.readByUserIds) ? [...row.readByUserIds] : [];
+        if (!readBy.includes(userId)) {
+          readBy.push(userId);
+          await updateDoc(d.ref, { readByUserIds: readBy });
+        }
+      }
+    } catch (e) {
+      console.warn('No se pudo cerrar alerta OC por orden:', e);
+    }
+  }
+
   // ─── SEC-03: REGISTRO DE ACCESOS / IP / DISPOSITIVO ────────────────────────
 
   async recordLoginSession(data: {
@@ -4974,12 +5910,24 @@ export class DataService {
     failReason?: string;
   }) {
     try {
+      // Solo persistir en Firestore cuando existe sesión Firebase autenticada.
+      // Los intentos fallidos previos al login quedan fuera por política de reglas.
+      if (!auth.currentUser) return;
       const now = new Date().toISOString();
-      await addDoc(collection(db, 'login_sessions'), {
-        ...data,
+      // Firestore rechaza valores `undefined`; no expandir opcionales vacíos.
+      const payload: Record<string, unknown> = {
+        email: data.email,
+        ip: data.ip,
+        userAgent: data.userAgent,
+        platform: data.platform,
+        success: data.success,
         timestamp: now,
-        date: now.split('T')[0]
-      });
+        date: now.split('T')[0],
+      };
+      if (data.userId != null && data.userId !== '') payload.userId = data.userId;
+      if (data.userName != null && data.userName !== '') payload.userName = data.userName;
+      if (data.failReason != null && data.failReason !== '') payload.failReason = data.failReason;
+      await addDoc(collection(db, 'login_sessions'), payload as any);
     } catch (e) {
       console.warn('No se pudo registrar sesión de acceso:', e);
     }
@@ -5175,10 +6123,17 @@ export class DataService {
   getPermissionsForRole(role: UserRole): PermissionKey[] {
     switch (role) {
       case 'ADMIN': return ['ALL'];
-      case 'SUPERVISOR': return ['DASHBOARD_VIEW', 'BILLING', 'SALES_READ', 'SALES_VOID', 'INVENTORY_READ', 'CLOSING_VIEW', 'CLOSING_AUDIT', 'FINANCE_VIEW', 'REPORTS_VIEW', 'REPORTS_SALES', 'REPORTS_INVENTORY', 'ACCOUNTING_ALERTS', 'SETTINGS_RATES'];
-      case 'FINANZAS': return ['DASHBOARD_VIEW', 'FINANCE_VIEW', 'SALES_READ', 'REPORTS_VIEW', 'REPORTS_SALES', 'REPORTS_INVENTORY', 'ACCOUNTING_ALERTS', 'CLOSING_AUDIT'];
-      case 'ALMACENISTA': return ['DASHBOARD_VIEW', 'INVENTORY_READ', 'INVENTORY_WRITE', 'FRACTIONATION', 'REPORTS_VIEW', 'REPORTS_INVENTORY'];
-      case 'CAJERO': return ['DASHBOARD_VIEW', 'BILLING', 'SALES_READ', 'CLOSING_VIEW', 'REPORTS_VIEW', 'REPORTS_SALES'];
+      case 'SUPERVISOR': return ['DASHBOARD_VIEW', 'BILLING', 'SALES_READ', 'SALES_VOID', 'INVENTORY_READ', 'CLOSING_VIEW', 'CLOSING_AUDIT', 'FINANCE_VIEW', 'REPORTS_VIEW', 'REPORTS_SALES', 'REPORTS_INVENTORY', 'REPORTS_PROFIT_VIEW', 'REPORTS_PURCHASES_EXPORT', 'REPORTS_SHRINKAGE_EXPORT', 'REPORTS_TREASURY_EXPORT', 'REPORTS_EXPENSES_EXPORT', 'REPORTS_MARGINS_EXPORT', 'REPORTS_ZCLOSURE_EXPORT', 'REPORTS_CASHIER_EXPORT', 'REPORTS_PROFIT_EXPORT', 'ACCOUNTING_ALERTS', 'SETTINGS_RATES'];
+      case 'FINANZAS': return ['DASHBOARD_VIEW', 'FINANCE_VIEW', 'SALES_READ', 'REPORTS_VIEW', 'REPORTS_SALES', 'REPORTS_INVENTORY', 'REPORTS_PROFIT_VIEW', 'REPORTS_PURCHASES_EXPORT', 'REPORTS_TREASURY_EXPORT', 'REPORTS_EXPENSES_EXPORT', 'REPORTS_ZCLOSURE_EXPORT', 'REPORTS_CASHIER_EXPORT', 'REPORTS_PROFIT_EXPORT', 'ACCOUNTING_ALERTS', 'CLOSING_AUDIT'];
+      case 'ALMACENISTA': return ['DASHBOARD_VIEW', 'INVENTORY_READ', 'INVENTORY_WRITE', 'FRACTIONATION', 'REPORTS_VIEW', 'REPORTS_INVENTORY', 'REPORTS_SHRINKAGE_EXPORT', 'REPORTS_MARGINS_EXPORT'];
+      case 'CAJERO': return [
+        'DASHBOARD_VIEW',
+        'BILLING',
+        'SALES_READ',
+        'CLOSING_VIEW',
+        'REPORTS_VIEW',
+        'REPORTS_SALES'
+      ];
       default: return [];
     }
   }
@@ -5379,6 +6334,8 @@ export class DataService {
     const paymentDetails = Array.isArray(record.paymentDetailsSnapshot) ? record.paymentDetailsSnapshot : [];
     const systemBreakdown = this.buildCashBoxOperationalBreakdown(paymentDetails);
     const declaredBreakdown = this.mergeCashBoxBreakdown(Array.isArray(record.declaredBreakdown) ? record.declaredBreakdown : []);
+    // Recompute reconciliation from authoritative snapshots to avoid stale
+    // or mismatched persisted keys in old closure records.
     const reconciliationLines = this.buildCashBoxReconciliationLines(systemBreakdown, declaredBreakdown);
     const systemBreakdownForTotals = systemBreakdown.filter((line) => !this.excludeFromCashBoxOperationalTotals(line));
     const declaredBreakdownForTotals = declaredBreakdown.filter((line) => !this.excludeFromCashBoxOperationalTotals(line));
@@ -5403,12 +6360,12 @@ export class DataService {
       totalSalesUSD: Number(record.totalSalesUSD ?? 0) || 0,
       totalSalesVES: Number(record.totalSalesVES ?? 0) || 0,
       totalItemsSold: Number(record.totalItemsSold ?? 0) || 0,
-      totalSystemUSD,
-      totalSystemVES,
-      totalDeclaredUSD,
-      totalDeclaredVES,
-      differenceUSD: roundMoney(totalDeclaredUSD - totalSystemUSD),
-      differenceVES: roundMoney(totalDeclaredVES - totalSystemVES),
+      totalSystemUSD: Number((record as any).totalSystemUSD ?? totalSystemUSD) || 0,
+      totalSystemVES: Number((record as any).totalSystemVES ?? totalSystemVES) || 0,
+      totalDeclaredUSD: Number((record as any).totalDeclaredUSD ?? totalDeclaredUSD) || 0,
+      totalDeclaredVES: Number((record as any).totalDeclaredVES ?? totalDeclaredVES) || 0,
+      differenceUSD: Number((record as any).differenceUSD ?? roundMoney(totalDeclaredUSD - totalSystemUSD)) || 0,
+      differenceVES: Number((record as any).differenceVES ?? roundMoney(totalDeclaredVES - totalSystemVES)) || 0,
       denominationReport: (record as any).denominationReport ?? undefined
     };
   }
@@ -5465,8 +6422,29 @@ export class DataService {
   }
 
   private buildCashBoxReconciliationLines(systemBreakdown: CashBoxBreakdownLine[], declaredBreakdown: CashBoxBreakdownLine[]): CashBoxReconciliationLine[] {
+    const normalizeBankForReconciliation = (line: CashBoxBreakdownLine) => {
+      const method = String(line.method ?? '').trim().toLowerCase();
+      const raw = String(line.bank ?? '').trim() || String(line.accountLabel ?? '').trim();
+      if (method === 'others' && raw.toUpperCase() === 'CXP') return 'CxP';
+      const normalized = raw
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .toUpperCase()
+        .replace(/[^A-Z0-9 ]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (!normalized) return '';
+      if (normalized.includes('BANESCO')) return 'BANESCO';
+      if (normalized.includes('VENEZUELA')) return 'VENEZUELA';
+      if (normalized.includes('MERCANTIL')) return 'MERCANTIL';
+      if (normalized.includes('PROVINCIAL') || normalized.includes('BBVA')) return 'PROVINCIAL';
+      if (normalized.includes('BNC')) return 'BNC';
+      if (normalized.includes('BOD')) return 'BOD';
+      if (normalized.includes('BICENTENARIO')) return 'BICENTENARIO';
+      return normalized;
+    };
     const reconciliationKey = (line: CashBoxBreakdownLine) =>
-      `${String(line.method ?? '').trim()}|${String(line.bank ?? '').trim()}|${String(line.currency ?? '').trim()}`;
+      `${String(line.method ?? '').trim()}|${normalizeBankForReconciliation(line)}|${String(line.currency ?? '').trim()}`;
 
     const systemByRecKey = new Map<string, CashBoxBreakdownLine>();
     for (const line of systemBreakdown) {
@@ -5504,7 +6482,7 @@ export class DataService {
           method: String(systemLine?.method ?? declaredLine?.method ?? '').trim(),
           label: String(systemLine?.label ?? declaredLine?.label ?? ''),
           currency,
-          bank: String(systemLine?.bank ?? declaredLine?.bank ?? '').trim(),
+          bank: normalizeBankForReconciliation((systemLine ?? declaredLine) as CashBoxBreakdownLine),
           accountId: String(systemLine?.accountId ?? declaredLine?.accountId ?? '').trim(),
           accountLabel: String(systemLine?.accountLabel ?? declaredLine?.accountLabel ?? '').trim(),
           posTerminalId: String(systemLine?.posTerminalId ?? declaredLine?.posTerminalId ?? '').trim(),
@@ -5584,6 +6562,67 @@ export class DataService {
     return this.currentSession;
   }
 
+  private async syncOpenCashBoxSessionForCurrentUser(): Promise<CashBoxSession | null> {
+    const userId = String(this.currentUser?.id ?? '').trim();
+    if (!userId) return null;
+    this.ensureCashBoxSessionsSubscription();
+
+    const existingOpenMemory = this.cashBoxSessions.find(s => s.status === 'OPEN' && String(s.userId ?? '') === userId);
+    if (existingOpenMemory) {
+      this.currentSession = existingOpenMemory;
+      this.notify();
+      return existingOpenMemory;
+    }
+
+    const existingSnap = await getDocs(
+      query(collection(db, 'cashbox_sessions'),
+        where('userId', '==', userId),
+        where('status', '==', 'OPEN'),
+        limit(1)
+      )
+    );
+    if (existingSnap.empty) return null;
+
+    const d: any = existingSnap.docs[0].data();
+    const syncedSession: CashBoxSession = {
+      id: String(d.id ?? existingSnap.docs[0].id),
+      userId: String(d.userId ?? ''),
+      userName: String(d.userName ?? ''),
+      openDate: String(d.openDate ?? ''),
+      openTime: String(d.openTime ?? ''),
+      stationName: d.stationName ? String(d.stationName) : '',
+      openRateBCV: Number(d.openRateBCV ?? 0),
+      openRateParallel: Number(d.openRateParallel ?? 0),
+      openRateInternal: Number(d.openRateInternal ?? 0),
+      initialAmountUSD: Number(d.initialAmountUSD ?? 0),
+      initialAmountVES: Number(d.initialAmountVES ?? 0),
+      openingBreakdown: Array.isArray(d.openingBreakdown) ? d.openingBreakdown : [],
+      closingDeclaredBreakdown: Array.isArray(d.closingDeclaredBreakdown) ? d.closingDeclaredBreakdown : [],
+      closingNote: String(d.closingNote ?? ''),
+      status: 'OPEN',
+      closeDate: String(d.closeDate ?? ''),
+      closeTime: String(d.closeTime ?? ''),
+      closeRateBCV: Number(d.closeRateBCV ?? 0),
+      closeRateParallel: Number(d.closeRateParallel ?? 0),
+      closeRateInternal: Number(d.closeRateInternal ?? 0),
+      finalAmountUSD: Number(d.finalAmountUSD ?? 0),
+      finalAmountVES: Number(d.finalAmountVES ?? 0),
+      systemClosureUSD: Number(d.systemClosureUSD ?? 0),
+      systemClosureVES: Number(d.systemClosureVES ?? 0),
+      differenceUSD: Number(d.differenceUSD ?? 0),
+      differenceVES: Number(d.differenceVES ?? 0),
+      createdAt: String(d.createdAt ?? ''),
+      updatedAt: String(d.updatedAt ?? '')
+    };
+
+    const idx = this.cashBoxSessions.findIndex(s => s.id === syncedSession.id);
+    if (idx >= 0) this.cashBoxSessions[idx] = syncedSession;
+    else this.cashBoxSessions.push(syncedSession);
+    this.currentSession = syncedSession;
+    this.notify();
+    return syncedSession;
+  }
+
   async openCashBox(input: {
     userId: string;
     userName: string;
@@ -5602,6 +6641,36 @@ export class DataService {
 
     const { userId, userName, stationName } = input;
 
+    // CONC-FIX-03: Lock distribuido por usuario para prevenir doble apertura concurrente
+    // (doble-click, múltiples pestañas o dispositivos). TTL: 30 segundos.
+    const openLockRef = doc(db, 'cashbox_open_locks', String(userId).trim());
+    let openLockAcquired = false;
+    try {
+      await runTransaction(db, async (tx) => {
+        const snap = await tx.get(openLockRef);
+        const now = Date.now();
+        const ttlMs = 30 * 1000;
+        if (snap.exists()) {
+          const data: any = snap.data();
+          const acquiredAt = Number(data?.acquiredAt ?? 0);
+          if (acquiredAt && (now - acquiredAt) < ttlMs) {
+            throw new Error('CONC-FIX-03: Otra apertura de caja está en proceso para este usuario. Intente nuevamente en unos segundos.');
+          }
+        }
+        tx.set(openLockRef, {
+          userId,
+          acquiredAt: now,
+          actor: this.currentUser?.name || 'SISTEMA'
+        });
+      });
+      openLockAcquired = true;
+    } catch (e: any) {
+      if (String(e?.message ?? '').includes('CONC-FIX-03')) throw e;
+      // Si el lock falla por otra razón (ej: red), continuar sin él para no bloquear operaciones
+      console.warn('[CONC-FIX-03] No se pudo adquirir lock de apertura (continuando):', e);
+    }
+
+    try {
     // Check in-memory first (fast path)
     const existingOpenMemory = this.cashBoxSessions.find(s => s.status === 'OPEN' && s.userId === userId);
     if (existingOpenMemory) {
@@ -5727,11 +6796,51 @@ export class DataService {
     }
     this.notify();
     return session;
+    } finally {
+      // CONC-FIX-03: liberar lock de apertura
+      if (openLockAcquired) {
+        try { await deleteDoc(openLockRef); } catch (e) { console.warn('[CONC-FIX-03] No se pudo liberar lock de apertura:', e); }
+      }
+    }
   }
 
   async closeCashBoxSession(input: number | { finalAmountUSD?: number; finalAmountVES?: number; declaredBreakdown?: CashBoxBreakdownLine[]; note?: string; rateBCV?: number; rateParallel?: number; rateInternal?: number } = 0, finalAmountVESArg: number = 0): Promise<CashBoxSession> {
     this.ensureCashBoxSessionsSubscription();
 
+    // CONC-FIX-03: Lock distribuido por sesión para prevenir cierre concurrente
+    // (cajero + supervisor cerrando simultáneamente). TTL: 60 segundos.
+    const closeLockUserId = String(this.currentUser?.id ?? '').trim();
+    const closeLockRef = closeLockUserId
+      ? doc(db, 'cashbox_close_locks', closeLockUserId)
+      : null;
+    let closeLockAcquired = false;
+    if (closeLockRef) {
+      try {
+        await runTransaction(db, async (tx) => {
+          const snap = await tx.get(closeLockRef);
+          const now = Date.now();
+          const ttlMs = 60 * 1000;
+          if (snap.exists()) {
+            const data: any = snap.data();
+            const acquiredAt = Number(data?.acquiredAt ?? 0);
+            if (acquiredAt && (now - acquiredAt) < ttlMs) {
+              throw new Error('CONC-FIX-03: Otro cierre de caja está en proceso. Intente nuevamente en unos segundos.');
+            }
+          }
+          tx.set(closeLockRef, {
+            userId: closeLockUserId,
+            acquiredAt: now,
+            actor: this.currentUser?.name || 'SISTEMA'
+          });
+        });
+        closeLockAcquired = true;
+      } catch (e: any) {
+        if (String(e?.message ?? '').includes('CONC-FIX-03')) throw e;
+        console.warn('[CONC-FIX-03] No se pudo adquirir lock de cierre (continuando):', e);
+      }
+    }
+
+    try {
     // Recovery: if Firestore already closed the session but memory hasn't synced yet
     if (!this.currentSession || this.currentSession.status !== 'OPEN') {
       // Check Firestore directly for the user's session
@@ -5879,16 +6988,7 @@ export class DataService {
           totalDeclaredVES,
           differenceUSD,
           differenceVES,
-          reconciliationLines: summary.reconciliationLines.map((line) => {
-            const declaredLine = declaredBreakdown.find((entry) => entry.key === line.key);
-            return {
-              ...line,
-              declaredAmountUSD: Number(declaredLine?.amountUSD ?? 0) || 0,
-              declaredAmountVES: Number(declaredLine?.amountVES ?? 0) || 0,
-              differenceUSD: roundMoney((Number(declaredLine?.amountUSD ?? 0) || 0) - (Number(line.systemAmountUSD ?? 0) || 0)),
-              differenceVES: roundMoney((Number(declaredLine?.amountVES ?? 0) || 0) - (Number(line.systemAmountVES ?? 0) || 0))
-            };
-          })
+          reconciliationLines: this.buildCashBoxReconciliationLines(summary.systemBreakdown, declaredBreakdown)
         },
         {
           declaredBreakdown,
@@ -5904,6 +7004,12 @@ export class DataService {
     }
 
     return closedSession;
+    } finally {
+      // CONC-FIX-03: liberar lock de cierre
+      if (closeLockAcquired && closeLockRef) {
+        try { await deleteDoc(closeLockRef); } catch (e) { console.warn('[CONC-FIX-03] No se pudo liberar lock de cierre:', e); }
+      }
+    }
   }
 
   async getCashBoxSessionSummary(sessionId: string): Promise<CashBoxSessionSummary> {
@@ -6008,7 +7114,37 @@ export class DataService {
     // Conciliación operativa: usar solo movimientos de facturación/pagos de la sesión.
     // La apertura de caja se mantiene auditada en la sesión, pero no altera la varianza
     // operativa por método de cobro en este resumen.
-    const systemBreakdown = this.buildCashBoxOperationalBreakdown(paymentDetails);
+    const creditSystemLine = saleAudits.reduce((acc, sale) => {
+      const creditPayments = Array.isArray((sale as any).payments)
+        ? (sale as any).payments.filter((p: any) => String(p?.method ?? '').trim() === 'credit')
+        : [];
+      const amountUSD = creditPayments.reduce((sum: number, p: any) => sum + (Number(p?.amountUSD ?? 0) || 0), 0);
+      if (amountUSD > 0.000001) {
+        acc.amountUSD = roundMoney(acc.amountUSD + amountUSD);
+        acc.count += 1;
+      }
+      return acc;
+    }, { amountUSD: 0, count: 0 });
+    const systemBreakdownBase = this.buildCashBoxOperationalBreakdown(paymentDetails);
+    const systemBreakdown = creditSystemLine.amountUSD > 0.000001
+      ? this.mergeCashBoxBreakdown([
+          ...systemBreakdownBase,
+          {
+            method: 'credit',
+            label: this.getCashBoxMethodLabel('credit'),
+            currency: 'USD',
+            bank: '',
+            accountId: '',
+            accountLabel: '',
+            posTerminalId: '',
+            posTerminalName: '',
+            amountUSD: creditSystemLine.amountUSD,
+            amountVES: 0,
+            count: creditSystemLine.count,
+            note: 'Ventas a crédito emitidas'
+          }
+        ])
+      : systemBreakdownBase;
     const declaredBreakdown = this.mergeCashBoxBreakdown(session.closingDeclaredBreakdown ?? []);
     const reconciliationLines = this.buildCashBoxReconciliationLines(systemBreakdown, declaredBreakdown);
 
@@ -6591,7 +7727,7 @@ export class DataService {
   }
 
   public async addAuditEntry(action: string, entity: string, details: string) {
-    await supabase.from('movements').insert({
+    await this.insertMovementWithFallback({
       type: action,
       product_code: entity,
       reason: details,
@@ -6696,6 +7832,12 @@ export class DataService {
         product = {
           code: dbProduct.code,
           description: dbProduct.description,
+          unit: 'UND',
+          priceUSD: 0,
+          prices: [0],
+          min: 0,
+          conversionRatio: 1,
+          baseUnit: 'UND',
           lotes: []
         };
       }
@@ -6797,6 +7939,12 @@ export class DataService {
         product = {
           code: dbProduct.code,
           description: dbProduct.description,
+          unit: 'UND',
+          priceUSD: 0,
+          prices: [0],
+          min: 0,
+          conversionRatio: 1,
+          baseUnit: 'UND',
           lotes: []
         };
       }
@@ -6855,7 +8003,8 @@ export class DataService {
   // FUNCIÓN SUPERUSUARIO: Eliminar productos con errores de compra (solo superUsuario/Master)
   async superUsuario(productCode: string): Promise<string> {
     // Verificar permisos
-    if (!this.hasPermission('superUsuario') && !this.hasPermission('Master')) {
+    const isAdmin = String(this.currentUser?.role ?? '').toUpperCase() === 'ADMIN';
+    if (!this.hasPermission('ALL') && !isAdmin) {
       throw new Error('❌ ACCESO DENEGADO: Solo usuarios superUsuario o Master pueden usar esta función.');
     }
 
@@ -6889,6 +8038,7 @@ export class DataService {
   // --- MÉTODOS COMPATIBLES CON LA UI ---
 
   getAllStocks() {
+    this.ensureStockRecovery();
     const source = this.allProducts.length > 0 ? this.allProducts : this.products;
     return source.map(p => {
       const aggregates = { d3: 0, d2: 0, a1: 0 };
@@ -6903,6 +8053,7 @@ export class DataService {
   }
 
   getStocks() {
+    this.ensureStockRecovery();
     // CORRECCIÓN: Usar la misma lógica que getAllStocks() para consistencia
     const source = this.allProducts.length > 0 ? this.allProducts : this.products;
     return source.map(p => {
@@ -6917,6 +8068,19 @@ export class DataService {
     });
   }
 
+  private ensureStockRecovery() {
+    if (this.stockRecoveryInFlight) return;
+    if (this.allProducts.length > 0 || this.products.length > 0) return;
+    this.stockRecoveryInFlight = true;
+    void this.init(true)
+      .catch((error) => {
+        console.warn('[dataService] Reintento de carga de productos falló:', error);
+      })
+      .finally(() => {
+        this.stockRecoveryInFlight = false;
+      });
+  }
+
   getSales() { return this.sales; }
 
   /**
@@ -6926,6 +8090,39 @@ export class DataService {
   async getSaleForReturn(saleId: string): Promise<SaleHistoryEntry | null> {
     const id = String(saleId ?? '').trim();
     if (!id) return null;
+    const normalizePaymentLines = (list: any[]): any[] =>
+      (Array.isArray(list) ? list : [])
+        .map((p: any) => ({
+          id: String(p?.id ?? p?.sourceId ?? ''),
+          method: String(p?.method ?? p?.paymentMethod ?? '').trim(),
+          bank: String(p?.bank ?? p?.bankName ?? '').trim(),
+          amountUSD: Number(p?.amountUSD ?? 0) || 0,
+          amountVES: Number(p?.amountVES ?? 0) || 0,
+          rateUsed: Number(p?.rateUsed ?? p?.exchangeRate ?? 0) || 0,
+          reference: String(p?.reference ?? '').trim()
+        }))
+        .filter((p: any) =>
+          p.method
+          && (Math.abs(Number(p.amountUSD ?? 0)) > 0.0001 || Math.abs(Number(p.amountVES ?? 0)) > 0.0001)
+        );
+    const shouldHydratePayments = (sale: any) => {
+      const lines = Array.isArray(sale?.payments) ? sale.payments : [];
+      const method = String(sale?.paymentMethod ?? '').trim().toUpperCase();
+      return lines.length === 0 || method === 'MIXTO';
+    };
+    const hydrateSalePaymentsFromAudit = async (sale: SaleHistoryEntry): Promise<SaleHistoryEntry> => {
+      if (!shouldHydratePayments(sale)) return sale;
+      try {
+        const paymentRows = await this.getSalePayments(String(sale.id ?? id));
+        const normalized = normalizePaymentLines(paymentRows);
+        if (normalized.length > 0) {
+          return { ...sale, payments: normalized };
+        }
+      } catch (e) {
+        console.warn('[getSaleForReturn] sale_payments:', e);
+      }
+      return sale;
+    };
 
     let fromSupabase: SaleHistoryEntry | null = null;
     try {
@@ -6936,7 +8133,7 @@ export class DataService {
     }
 
     if (fromSupabase && Array.isArray(fromSupabase.items) && fromSupabase.items.length > 0) {
-      return fromSupabase;
+      return await hydrateSalePaymentsFromAudit(fromSupabase);
     }
 
     try {
@@ -6946,7 +8143,7 @@ export class DataService {
         const fromAudit = parseSaleLineItemsFromDb(d?.items);
         if (fromAudit.length > 0) {
           if (fromSupabase) {
-            return {
+            const merged = {
               ...fromSupabase,
               items: fromAudit,
               payments:
@@ -6954,8 +8151,9 @@ export class DataService {
                   ? d.payments
                   : fromSupabase.payments
             };
+            return await hydrateSalePaymentsFromAudit(merged as SaleHistoryEntry);
           }
-          return {
+          const rebuilt = {
             id: String(d.saleId ?? d.id ?? id),
             correlativo: String(d.correlativo ?? ''),
             client: {
@@ -6976,13 +8174,14 @@ export class DataService {
             operatorName: d.userName,
             userId: d.userId
           } as SaleHistoryEntry;
+          return await hydrateSalePaymentsFromAudit(rebuilt);
         }
       }
     } catch (e) {
       console.warn('[getSaleForReturn] cashbox_sales:', e);
     }
 
-    return fromSupabase;
+    return fromSupabase ? await hydrateSalePaymentsFromAudit(fromSupabase) : null;
   }
 
   getSalesForCurrentSession(): CashBoxSaleAudit[] {
@@ -7105,6 +8304,28 @@ export class DataService {
       });
     }
 
+    // CMP-03: OC enviadas pendientes de aprobación (bandeja Finanzas/Supervisor/Admin)
+    const role = this.currentUser?.role;
+    const canApproveOC = role === 'FINANZAS' || role === 'SUPERVISOR' || role === 'ADMIN' || this.hasPermission('ALL');
+    if (canApproveOC) {
+      for (const po of this.getPurchaseOrders().filter((o) => o.status === 'SUBMITTED')) {
+        alerts.push({
+          id: `fin-po-${po.id}`,
+          saleId: '',
+          correlativo: po.correlativo,
+          clientName: po.supplier,
+          date: String(po.submittedAt ?? po.updatedAt ?? po.createdAt ?? ''),
+          othersType: 'PO_APROBACION',
+          amountUSD: 0,
+          amountVES: 0,
+          note: '',
+          label: `OC pendiente — ${po.correlativo}`,
+          description: `Orden de compra enviada por ${po.supplier}. Requiere aprobación en Finanzas.`,
+          severity: 'warning'
+        });
+      }
+    }
+
     return alerts;
   }
 
@@ -7114,6 +8335,23 @@ export class DataService {
   async getNextCorrelativo(kind: 'STANDARD' | 'CREDIT' = 'STANDARD'): Promise<string> {
     const prefix = kind === 'CREDIT' ? 'C-' : 'G-';
     const padLength = kind === 'CREDIT' ? 6 : 8;
+
+    // CONC-FIX-06: Intento atómico vía PostgreSQL SEQUENCE (RPC next_correlativo).
+    // Si la RPC está instalada, garantiza unicidad 100% bajo cualquier concurrencia.
+    // Si falla o no está instalada, continúa con el flujo original.
+    try {
+      const { data: rpcResult, error: rpcError } = await supabase.rpc('next_correlativo', { kind });
+      if (!rpcError && rpcResult && typeof rpcResult === 'string' && rpcResult.startsWith(prefix)) {
+        const numPart = parseInt(rpcResult.substring(prefix.length), 10);
+        if (Number.isFinite(numPart)) {
+          if (kind === 'CREDIT') this.nextCreditCorrelativo = numPart + 1;
+          else this.nextCorrelativo = numPart + 1;
+        }
+        return rpcResult;
+      }
+    } catch (rpcErr) {
+      console.warn('[CONC-FIX-06] RPC next_correlativo no disponible, usando fallback:', rpcErr);
+    }
 
     try {
       // Query the last sale with this prefix to find max correlativo
@@ -7167,6 +8405,34 @@ export class DataService {
     }
   }
 
+  /**
+   * CONC-FIX-07: Generar correlativo con sharding por estación (OPCIONAL).
+   * Solo usar si el sistema escala a 100+ usuarios concurrentes y se desea
+   * eliminar la contención mínima de la SEQUENCE global.
+   *
+   * Para activarse: ejecutar primero el SQL `Sharding por estacion (opcional).sql`
+   * en Supabase, y luego llamar a este método en lugar de `getNextCorrelativo`.
+   *
+   * Si la RPC no está instalada o no se provee estación, hace fallback al
+   * comportamiento estándar (`getNextCorrelativo`).
+   */
+  async getNextCorrelativoSharded(
+    kind: 'STANDARD' | 'CREDIT' = 'STANDARD',
+    stationCode?: string
+  ): Promise<string> {
+    const station = String(stationCode ?? this.currentSession?.stationName ?? '').trim();
+    if (!station) {
+      return this.getNextCorrelativo(kind);
+    }
+    try {
+      const { data, error } = await supabase.rpc('next_correlativo_sharded', { kind, station });
+      if (!error && data && typeof data === 'string') return data;
+    } catch (e) {
+      console.warn('[CONC-FIX-07] RPC sharded no disponible, fallback a global:', e);
+    }
+    return this.getNextCorrelativo(kind);
+  }
+
   // Deprecated: use getNextCorrelativo instead
   getCorrelativoString(kind: 'STANDARD' | 'CREDIT' = 'STANDARD') {
     if (kind === 'CREDIT') {
@@ -7201,7 +8467,7 @@ export class DataService {
     }
 
     // 2. Record movement
-    await supabase.from('movements').insert({
+    await this.insertMovementWithFallback({
       product_code: sku,
       type: type,
       quantity: -qty,
@@ -7285,6 +8551,29 @@ export class DataService {
       });
     } catch (e) {
       console.warn('[insertMovementsTableSaleReturnLine] Kardex movements:', e);
+    }
+  }
+
+  private async insertInventoryMovementWithFallback(payload: Record<string, any>): Promise<void> {
+    if (!this.inventoryMovementsAvailable) return;
+    try {
+      const { error } = await supabase.from('inventory_movements').insert(payload as any);
+      if (!error) return;
+      const errText = String((error as any)?.message ?? (error as any)?.details ?? error ?? '').toLowerCase();
+      if (errText.includes('404') || errText.includes('inventory_movements') || errText.includes('relation') || errText.includes('does not exist')) {
+        this.inventoryMovementsAvailable = false;
+        console.warn('inventory_movements no disponible; se omite insercion de trazabilidad detallada.');
+        return;
+      }
+      console.warn('inventory_movements: error no bloqueante al insertar:', error);
+    } catch (e: any) {
+      const errText = String(e?.message ?? e ?? '').toLowerCase();
+      if (errText.includes('404') || errText.includes('inventory_movements') || errText.includes('relation') || errText.includes('does not exist')) {
+        this.inventoryMovementsAvailable = false;
+        console.warn('inventory_movements no disponible; se omite insercion de trazabilidad detallada.');
+        return;
+      }
+      console.warn('inventory_movements: excepcion no bloqueante al insertar:', e);
     }
   }
 
@@ -7522,6 +8811,286 @@ export class DataService {
 
   getAPEntries() { return this.apEntries; }
 
+  private mapFirestorePurchaseOrder(id: string, data: Record<string, unknown> | undefined): PurchaseOrder {
+    const raw = data ?? {};
+    const linesRaw = Array.isArray(raw.lines) ? (raw.lines as Record<string, unknown>[]) : [];
+    const lines: PurchaseOrderLine[] = linesRaw.map((L, i) => ({
+      id: String(L?.id ?? `L${i}`),
+      sku: String(L?.sku ?? '').trim().toUpperCase(),
+      productDescription: String(L?.productDescription ?? L?.product_description ?? '').trim(),
+      unit: String(L?.unit ?? 'KG').trim() || 'KG',
+      qtyOrdered: roundQtyValue(Number(L?.qtyOrdered ?? L?.qty_ordered ?? 0) || 0),
+      qtyReceived: roundQtyValue(Number(L?.qtyReceived ?? L?.qty_received ?? 0) || 0),
+      warehouse: String(L?.warehouse ?? 'Galpon D3').trim() || 'Galpon D3'
+    }));
+    const st = String(raw.status ?? 'DRAFT').toUpperCase();
+    const status: PurchaseOrderStatus =
+      st === 'SUBMITTED' || st === 'APPROVED' || st === 'CLOSED' || st === 'CANCELLED' || st === 'DRAFT' ? (st as PurchaseOrderStatus) : 'DRAFT';
+    return {
+      id,
+      correlativo: String(raw.correlativo ?? id),
+      supplier: String(raw.supplier ?? '').trim(),
+      supplierDocument: String(raw.supplierDocument ?? raw.supplier_document ?? '').trim() || undefined,
+      supplierPhone: String(raw.supplierPhone ?? raw.supplier_phone ?? '').trim() || undefined,
+      supplierAddress: String(raw.supplierAddress ?? raw.supplier_address ?? '').trim() || undefined,
+      status,
+      lines,
+      note: String(raw.note ?? '').trim() || undefined,
+      createdAt: String(raw.createdAt ?? raw.created_at ?? new Date().toISOString()),
+      createdBy: String(raw.createdBy ?? raw.created_by ?? '').trim() || undefined,
+      submittedAt: String(raw.submittedAt ?? '').trim() || undefined,
+      approvedAt: String(raw.approvedAt ?? '').trim() || undefined,
+      approvedBy: String(raw.approvedBy ?? '').trim() || undefined,
+      cancelledAt: String(raw.cancelledAt ?? '').trim() || undefined,
+      cancelReason: String(raw.cancelReason ?? '').trim() || undefined,
+      closedAt: String(raw.closedAt ?? '').trim() || undefined,
+      updatedAt: String(raw.updatedAt ?? '').trim() || undefined
+    };
+  }
+
+  getPurchaseOrders(): PurchaseOrder[] {
+    return [...this.purchaseOrders].sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    );
+  }
+
+  private async allocatePurchaseOrderCorrelativo(): Promise<string> {
+    const year = new Date().getFullYear();
+    const ref = doc(db, 'system_counters', `purchase_orders_${year}`);
+    const next = await runTransaction(db, async (tx) => {
+      const s = await tx.get(ref);
+      const n = (s.exists() ? Number((s.data() as Record<string, unknown>)?.seq ?? 0) : 0) + 1;
+      tx.set(
+        ref,
+        { seq: n, updatedAt: new Date().toISOString() } as Record<string, unknown>,
+        { merge: true }
+      );
+      return n;
+    });
+    return `OC-${year}-${String(next).padStart(5, '0')}`;
+  }
+
+  private async applyPurchaseOrderReceipt(
+    purchaseOrderId: string,
+    deltas: Array<{ lineId: string; qty: number }>
+  ): Promise<void> {
+    const poRef = doc(db, 'purchase_orders', purchaseOrderId);
+    await runTransaction(db, async (tx) => {
+      const poSnap = await tx.get(poRef);
+      if (!poSnap.exists()) throw new Error('La orden de compra no existe al registrar recepción.');
+      const po = this.mapFirestorePurchaseOrder(purchaseOrderId, poSnap.data() as Record<string, unknown>);
+      const lineMap = new Map(po.lines.map((l) => [l.id, { ...l }]));
+      for (const d of deltas) {
+        const cur = lineMap.get(d.lineId);
+        if (!cur) throw new Error(`Línea de OC inválida (${d.lineId}).`);
+        const nextRecv = roundQtyValue(cur.qtyReceived + d.qty);
+        if (nextRecv > cur.qtyOrdered + 0.0001) {
+          throw new Error('La OC fue modificada: cantidad pendiente insuficiente. Revise e intente de nuevo.');
+        }
+        cur.qtyReceived = nextRecv;
+      }
+      const newLines = po.lines.map((l) => lineMap.get(l.id) ?? l);
+      const allDone = newLines.every((l) => l.qtyReceived >= l.qtyOrdered - 0.0001);
+      tx.update(poRef, {
+        lines: newLines,
+        status: allDone ? 'CLOSED' : 'APPROVED',
+        ...(allDone ? { closedAt: new Date().toISOString() } : {}),
+        updatedAt: new Date().toISOString()
+      } as Record<string, unknown>);
+    });
+  }
+
+  private async revertPurchaseOrderReceiptFromRow(row: Record<string, unknown>): Promise<void> {
+    const poid = String(row?.purchaseOrderId ?? '').trim();
+    const polid = String(row?.purchaseOrderLineId ?? '').trim();
+    if (!poid || !polid) return;
+    const poRef = doc(db, 'purchase_orders', poid);
+    await runTransaction(db, async (tx) => {
+      const poSnap = await tx.get(poRef);
+      if (!poSnap.exists()) return;
+      const po = this.mapFirestorePurchaseOrder(poid, poSnap.data() as Record<string, unknown>);
+      const qty = roundQtyValue(Number(row?.qty ?? 0) || 0);
+      if (!(qty > 0)) return;
+      const newLines = po.lines.map((l) =>
+        l.id === polid ? { ...l, qtyReceived: Math.max(0, roundQtyValue(l.qtyReceived - qty)) } : l
+      );
+      const allDone = newLines.every((l) => l.qtyReceived >= l.qtyOrdered - 0.0001);
+      tx.update(poRef, {
+        lines: newLines,
+        status: allDone ? 'CLOSED' : 'APPROVED',
+        updatedAt: new Date().toISOString()
+      } as Record<string, unknown>);
+    });
+  }
+
+  async createPurchaseOrderDraft(input: {
+    supplier: string;
+    supplierDocument?: string;
+    supplierPhone?: string;
+    supplierAddress?: string;
+    note?: string;
+    lines: Array<{ sku: string; productDescription: string; unit: string; qtyOrdered: number; warehouse: string }>;
+  }): Promise<{ id: string; correlativo: string }> {
+    if (!this.hasPermission('INVENTORY_WRITE') && !this.hasPermission('ALL')) {
+      throw new Error('Sin permiso para crear órdenes de compra.');
+    }
+    const supplier = String(input?.supplier ?? '').trim();
+    if (!supplier) throw new Error('Debe indicar el proveedor.');
+    const rawLines = Array.isArray(input?.lines) ? input.lines : [];
+    if (rawLines.length === 0) throw new Error('Debe agregar al menos un renglón.');
+    const seen = new Set<string>();
+    const lines: PurchaseOrderLine[] = [];
+    for (let i = 0; i < rawLines.length; i++) {
+      const row = rawLines[i];
+      const sku = String(row?.sku ?? '').trim().toUpperCase();
+      if (!sku) throw new Error(`SKU vacío en renglón ${i + 1}.`);
+      if (seen.has(sku)) throw new Error(`SKU duplicado en la OC: ${sku}.`);
+      seen.add(sku);
+      const qtyOrdered = roundQtyValue(Number(row?.qtyOrdered ?? 0) || 0);
+      if (!(qtyOrdered > 0)) throw new Error(`Cantidad inválida para ${sku}.`);
+      lines.push({
+        id: `L-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 7)}`,
+        sku,
+        productDescription: String(row?.productDescription ?? sku).trim(),
+        unit: String(row?.unit ?? 'KG').trim() || 'KG',
+        qtyOrdered,
+        qtyReceived: 0,
+        warehouse: String(row?.warehouse ?? 'Galpon D3').trim() || 'Galpon D3'
+      });
+    }
+    const correlativo = await this.allocatePurchaseOrderCorrelativo();
+    const now = new Date().toISOString();
+    const docRef = await addDoc(collection(db, 'purchase_orders'), {
+      correlativo,
+      supplier,
+      supplierDocument: String(input.supplierDocument ?? '').trim(),
+      supplierPhone: String(input.supplierPhone ?? '').trim(),
+      supplierAddress: String(input.supplierAddress ?? '').trim(),
+      note: String(input.note ?? '').trim(),
+      status: 'DRAFT',
+      lines,
+      createdAt: now,
+      updatedAt: now,
+      createdBy: this.currentUser?.name ?? ''
+    } as Record<string, unknown>);
+    return { id: docRef.id, correlativo };
+  }
+
+  async updatePurchaseOrderDraft(
+    id: string,
+    patch: {
+      supplier?: string;
+      supplierDocument?: string;
+      supplierPhone?: string;
+      supplierAddress?: string;
+      note?: string;
+      lines?: Array<{ sku: string; productDescription: string; unit: string; qtyOrdered: number; warehouse: string }>;
+    }
+  ): Promise<void> {
+    if (!this.hasPermission('INVENTORY_WRITE') && !this.hasPermission('ALL')) throw new Error('Sin permiso.');
+    const oid = String(id ?? '').trim();
+    if (!oid) throw new Error('ID inválido.');
+    const snap = await getDoc(doc(db, 'purchase_orders', oid));
+    if (!snap.exists()) throw new Error('La orden no existe.');
+    const cur = this.mapFirestorePurchaseOrder(oid, snap.data() as Record<string, unknown>);
+    if (cur.status !== 'DRAFT') throw new Error('Solo se editan OC en borrador.');
+    const updates: Record<string, unknown> = { updatedAt: new Date().toISOString() };
+    if (patch.supplier !== undefined) updates.supplier = String(patch.supplier ?? '').trim();
+    if (patch.supplierDocument !== undefined) updates.supplierDocument = String(patch.supplierDocument ?? '').trim();
+    if (patch.supplierPhone !== undefined) updates.supplierPhone = String(patch.supplierPhone ?? '').trim();
+    if (patch.supplierAddress !== undefined) updates.supplierAddress = String(patch.supplierAddress ?? '').trim();
+    if (patch.note !== undefined) updates.note = String(patch.note ?? '').trim();
+    if (patch.lines) {
+      const rawLines = patch.lines;
+      const seen = new Set<string>();
+      const lines: PurchaseOrderLine[] = [];
+      for (let i = 0; i < rawLines.length; i++) {
+        const row = rawLines[i];
+        const sku = String(row?.sku ?? '').trim().toUpperCase();
+        if (!sku) throw new Error(`SKU vacío en renglón ${i + 1}.`);
+        if (seen.has(sku)) throw new Error(`SKU duplicado en la OC: ${sku}.`);
+        seen.add(sku);
+        const qtyOrdered = roundQtyValue(Number(row?.qtyOrdered ?? 0) || 0);
+        if (!(qtyOrdered > 0)) throw new Error(`Cantidad inválida para ${sku}.`);
+        lines.push({
+          id: `L-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 7)}`,
+          sku,
+          productDescription: String(row?.productDescription ?? sku).trim(),
+          unit: String(row?.unit ?? 'KG').trim() || 'KG',
+          qtyOrdered,
+          qtyReceived: 0,
+          warehouse: String(row?.warehouse ?? 'Galpon D3').trim() || 'Galpon D3'
+        });
+      }
+      if (lines.length === 0) throw new Error('La OC debe tener al menos un renglón.');
+      updates.lines = lines;
+    }
+    await updateDoc(doc(db, 'purchase_orders', oid), updates as Record<string, unknown>);
+  }
+
+  async submitPurchaseOrder(id: string): Promise<void> {
+    if (!this.hasPermission('INVENTORY_WRITE') && !this.hasPermission('ALL')) throw new Error('Sin permiso.');
+    const oid = String(id ?? '').trim();
+    if (!oid) throw new Error('ID inválido.');
+    const snap = await getDoc(doc(db, 'purchase_orders', oid));
+    if (!snap.exists()) throw new Error('La orden no existe.');
+    const cur = this.mapFirestorePurchaseOrder(oid, snap.data() as Record<string, unknown>);
+    if (cur.status !== 'DRAFT') throw new Error('Solo se envían OC en borrador.');
+    if (!cur.lines.length) throw new Error('La OC no tiene renglones.');
+    const now = new Date().toISOString();
+    await updateDoc(doc(db, 'purchase_orders', oid), {
+      status: 'SUBMITTED',
+      submittedAt: now,
+      updatedAt: now
+    } as Record<string, unknown>);
+    await this.postPurchaseOrderApprovalAlert({
+      purchaseOrderId: cur.id,
+      purchaseOrderCorrelativo: cur.correlativo,
+      supplier: cur.supplier,
+      createdBy: this.currentUser?.name ?? ''
+    });
+  }
+
+  async approvePurchaseOrder(id: string): Promise<void> {
+    if (!this.hasPermission('FINANCE_VIEW') && !this.hasPermission('ALL')) {
+      throw new Error('Solo finanzas o supervisor puede aprobar órdenes de compra.');
+    }
+    const oid = String(id ?? '').trim();
+    if (!oid) throw new Error('ID inválido.');
+    const snap = await getDoc(doc(db, 'purchase_orders', oid));
+    if (!snap.exists()) throw new Error('La orden no existe.');
+    const cur = this.mapFirestorePurchaseOrder(oid, snap.data() as Record<string, unknown>);
+    if (cur.status !== 'SUBMITTED') throw new Error('Solo se aprueban OC enviadas (pendientes de aprobación).');
+    const now = new Date().toISOString();
+    await updateDoc(doc(db, 'purchase_orders', oid), {
+      status: 'APPROVED',
+      approvedAt: now,
+      approvedBy: this.currentUser?.name ?? '',
+      updatedAt: now
+    } as Record<string, unknown>);
+    await this.markPurchaseOrderApprovalAlertsReadByOrder(oid);
+  }
+
+  async cancelPurchaseOrder(id: string, reason?: string): Promise<void> {
+    if (!this.hasPermission('INVENTORY_WRITE') && !this.hasPermission('ALL')) throw new Error('Sin permiso.');
+    const oid = String(id ?? '').trim();
+    if (!oid) throw new Error('ID inválido.');
+    const snap = await getDoc(doc(db, 'purchase_orders', oid));
+    if (!snap.exists()) throw new Error('La orden no existe.');
+    const cur = this.mapFirestorePurchaseOrder(oid, snap.data() as Record<string, unknown>);
+    if (cur.status === 'CANCELLED' || cur.status === 'CLOSED') throw new Error('La OC ya está cerrada o cancelada.');
+    if (cur.status === 'APPROVED' && cur.lines.some((l) => l.qtyReceived > 0.0001)) {
+      throw new Error('No se puede cancelar: ya hay mercancía recepcionada contra esta OC.');
+    }
+    const now = new Date().toISOString();
+    await updateDoc(doc(db, 'purchase_orders', oid), {
+      status: 'CANCELLED',
+      cancelledAt: now,
+      cancelReason: String(reason ?? '').trim(),
+      updatedAt: now
+    } as Record<string, unknown>);
+  }
+
   // CORRECCIÓN: Función para obtener todas las compras (crédito y contado) para el historial
   async getAllPurchaseEntries(): Promise<any[]> {
     try {
@@ -7588,6 +9157,164 @@ export class DataService {
       console.error('Error al obtener todas las compras:', error);
       return [];
     }
+  }
+
+  async getPurchaseInvoiceHistory(): Promise<PurchaseInvoiceHistoryEntry[]> {
+    this.ensureOperationalRealtimeSync();
+    const sourceRows = this.purchaseEntriesCache.length > 0
+      ? this.purchaseEntriesCache
+      : (await getDocs(collection(db, 'purchase_entries'))).docs.map((d) => ({ id: d.id, ...(d.data() as any) }));
+
+    type Group = {
+      id: string;
+      invoiceGroupId: string;
+      invoiceNumber: string;
+      supplier: string;
+      supplierDocument?: string;
+      invoiceDate?: string;
+      invoiceDueDate?: string;
+      createdAt?: string;
+      operatorName?: string;
+      paymentTypes: Set<'CASH' | 'CREDIT' | 'UNKNOWN'>;
+      rows: any[];
+      apEntryId?: string;
+      supports: ARPaymentSupport[];
+      lineTotalUSD: number;
+      explicitTotalUSD: number;
+      hasExplicitTotalUSD: boolean;
+      hasNonVoidLine: boolean;
+    };
+
+    const groups = new Map<string, Group>();
+    for (const row of sourceRows) {
+      const groupKey = String(row?.invoiceGroupId ?? row?.id ?? '').trim();
+      if (!groupKey) continue;
+      const normalizedPayment = String(row?.paymentType ?? '').trim().toUpperCase();
+      const paymentType: 'CASH' | 'CREDIT' | 'UNKNOWN' =
+        normalizedPayment === 'CASH' ? 'CASH' : normalizedPayment === 'CREDIT' ? 'CREDIT' : 'UNKNOWN';
+      const rowStatus = String(row?.status ?? '').trim().toUpperCase();
+      const explicitTotal = Number(row?.totalInvoiceUSD ?? row?.invoiceTotalUSD ?? 0) || 0;
+      const totalLine = Number(row?.totalLineUSD ?? 0) || 0;
+
+      if (!groups.has(groupKey)) {
+        groups.set(groupKey, {
+          id: groupKey,
+          invoiceGroupId: groupKey,
+          invoiceNumber: String(row?.invoiceNumber ?? '').trim(),
+          supplier: String(row?.supplier ?? '').trim(),
+          supplierDocument: String(row?.supplierDocument ?? '').trim() || undefined,
+          invoiceDate: String(row?.invoiceDate ?? '').trim() || undefined,
+          invoiceDueDate: String(row?.invoiceDueDate ?? '').trim() || undefined,
+          createdAt: String(row?.createdAt ?? '').trim() || undefined,
+          operatorName: String(row?.actor ?? row?.createdBy ?? row?.createdByName ?? '').trim() || undefined,
+          paymentTypes: new Set([paymentType]),
+          rows: [],
+          apEntryId: String(row?.apEntryId ?? '').trim() || undefined,
+          supports: [],
+          lineTotalUSD: 0,
+          explicitTotalUSD: explicitTotal,
+          hasExplicitTotalUSD: explicitTotal > 0,
+          hasNonVoidLine: rowStatus !== 'VOID'
+        });
+      }
+
+      const group = groups.get(groupKey)!;
+      group.rows.push(row);
+      group.paymentTypes.add(paymentType);
+      if (!group.invoiceNumber) group.invoiceNumber = String(row?.invoiceNumber ?? '').trim();
+      if (!group.supplier) group.supplier = String(row?.supplier ?? '').trim();
+      if (!group.supplierDocument) group.supplierDocument = String(row?.supplierDocument ?? '').trim() || undefined;
+      if (!group.invoiceDate) group.invoiceDate = String(row?.invoiceDate ?? '').trim() || undefined;
+      if (!group.invoiceDueDate) group.invoiceDueDate = String(row?.invoiceDueDate ?? '').trim() || undefined;
+      if (!group.createdAt) group.createdAt = String(row?.createdAt ?? '').trim() || undefined;
+      if (!group.operatorName) {
+        group.operatorName = String(row?.actor ?? row?.createdBy ?? row?.createdByName ?? '').trim() || undefined;
+      }
+      if (!group.apEntryId) group.apEntryId = String(row?.apEntryId ?? '').trim() || undefined;
+      if (explicitTotal > 0) {
+        group.explicitTotalUSD = explicitTotal;
+        group.hasExplicitTotalUSD = true;
+      }
+      if (rowStatus !== 'VOID') group.hasNonVoidLine = true;
+      group.lineTotalUSD += totalLine;
+
+      const supports = Array.isArray(row?.supports) ? row.supports : [];
+      for (const support of supports) {
+        const url = String((support as any)?.url ?? '').trim();
+        if (!url) continue;
+        if (!group.supports.some((s) => String((s as any)?.url ?? '').trim() === url)) {
+          group.supports.push(support as ARPaymentSupport);
+        }
+      }
+    }
+
+    const apIds = Array.from(new Set(Array.from(groups.values()).map((g) => String(g.apEntryId ?? '').trim()).filter(Boolean)));
+    const apPaymentsMap = new Map<string, Array<APPaymentRecord & { id: string }>>();
+    await Promise.all(apIds.map(async (apId) => {
+      try {
+        const payments = await this.getAPPayments(apId);
+        apPaymentsMap.set(apId, payments);
+      } catch {
+        apPaymentsMap.set(apId, []);
+      }
+    }));
+
+    const history = Array.from(groups.values()).map((group) => {
+      const paymentKinds = Array.from(group.paymentTypes).filter((t) => t !== 'UNKNOWN');
+      const paymentType: PurchaseInvoiceHistoryEntry['paymentType'] =
+        paymentKinds.length === 0 ? 'UNKNOWN' : paymentKinds.length > 1 ? 'MIXED' : paymentKinds[0];
+      const apEntry = group.apEntryId ? this.apEntries.find((ap) => ap.id === group.apEntryId) : undefined;
+      const apPayments = group.apEntryId ? (apPaymentsMap.get(group.apEntryId) ?? []) : [];
+      const paidUSD = apPayments.reduce((sum, p: any) => {
+        const amountUSD = Number(p?.amountUSD ?? 0) || 0;
+        return sum + Math.max(0, amountUSD);
+      }, 0);
+      const paymentMethods = Array.from(new Set(apPayments
+        .map((p: any) => String(p?.method ?? '').trim().toUpperCase())
+        .filter(Boolean)));
+
+      const lines: PurchaseInvoiceHistoryLine[] = group.rows
+        .sort((a, b) => (Number(a?.lineNumber ?? 0) || 0) - (Number(b?.lineNumber ?? 0) || 0))
+        .map((row) => ({
+          id: String(row?.id ?? ''),
+          lineNumber: Number(row?.lineNumber ?? 0) || 0,
+          sku: String(row?.sku ?? ''),
+          productDescription: String(row?.productDescription ?? ''),
+          qty: Number(row?.qty ?? 0) || 0,
+          unit: String(row?.unit ?? ''),
+          costUSD: Number(row?.costUSD ?? 0) || 0,
+          totalLineUSD: Number(row?.totalLineUSD ?? 0) || 0,
+          batch: String(row?.batch ?? ''),
+          warehouse: String(row?.warehouse ?? '')
+        }));
+
+      return {
+        id: group.id,
+        invoiceGroupId: group.invoiceGroupId,
+        invoiceNumber: group.invoiceNumber,
+        supplier: group.supplier,
+        supplierDocument: group.supplierDocument,
+        invoiceDate: group.invoiceDate,
+        invoiceDueDate: group.invoiceDueDate,
+        createdAt: group.createdAt,
+        operatorName: group.operatorName,
+        paymentType,
+        status: group.hasNonVoidLine ? 'ACTIVE' : 'VOID',
+        totalInvoiceUSD: group.hasExplicitTotalUSD ? group.explicitTotalUSD : group.lineTotalUSD,
+        apEntryId: group.apEntryId,
+        apBalanceUSD: apEntry ? Number(apEntry.balanceUSD ?? 0) || 0 : undefined,
+        paidUSD,
+        paymentMethods,
+        supports: group.supports,
+        lines
+      } as PurchaseInvoiceHistoryEntry;
+    });
+
+    return history.sort((a, b) => {
+      const aTs = new Date(a.invoiceDate || a.createdAt || 0).getTime();
+      const bTs = new Date(b.invoiceDate || b.createdAt || 0).getTime();
+      return bTs - aTs;
+    });
   }
 
   async addAPEntry(supplier: string, description: string, amountUSD: number, daysToPay: number, supplierId?: string) {
@@ -7703,6 +9430,28 @@ export class DataService {
       lines: APPaymentLineInput[];
     }
   ) {
+    const apLockRef = doc(db, 'ap_payment_locks', String(id ?? '').trim());
+    let apLockAcquired = false;
+    await runTransaction(db, async (tx) => {
+      const snap = await tx.get(apLockRef);
+      const now = Date.now();
+      const ttlMs = 5 * 60 * 1000;
+      if (snap.exists()) {
+        const d = snap.data() as any;
+        const createdAtMs = Number(d?.createdAtMs ?? 0) || 0;
+        if (createdAtMs > 0 && (now - createdAtMs) < ttlMs) {
+          throw new Error('Ya existe un pago CxP en curso para esta cuenta. Espere unos segundos e intente nuevamente.');
+        }
+      }
+      tx.set(apLockRef, {
+        apId: String(id ?? ''),
+        actor: this.currentUser?.name ?? 'SISTEMA',
+        createdAtMs: now,
+        createdAt: new Date(now).toISOString()
+      });
+    });
+    apLockAcquired = true;
+    try {
     let entry = this.apEntries.find(e => e.id === id);
     if (!entry) {
       const { data, error } = await supabase.from('ap_entries').select('*').eq('id', id).maybeSingle();
@@ -7717,9 +9466,25 @@ export class DataService {
         dueDate: new Date((data as any)?.due_date ?? (data as any)?.dueDate ?? new Date().toISOString()),
         status: (((data as any)?.status ?? 'PENDING') as any)
       };
+      // Mantener cache en memoria sincronizada aunque la entrada no haya estado cargada.
+      this.apEntries.push(entry);
     }
 
     if (!entry) throw new Error('No se encontró la cuenta por pagar.');
+    // Relectura defensiva de saldo real (source of truth) bajo lock distribuido.
+    try {
+      const { data: latest, error: latestErr } = await supabase
+        .from('ap_entries')
+        .select('balance_usd,status')
+        .eq('id', id)
+        .maybeSingle();
+      if (!latestErr && latest) {
+        entry.balanceUSD = Number((latest as any).balance_usd ?? entry.balanceUSD ?? 0) || 0;
+        entry.status = String((latest as any).status ?? entry.status ?? 'PENDING') as any;
+      }
+    } catch {
+      // Si falla la relectura, conservar snapshot en memoria.
+    }
 
     const normalizedLines = Array.isArray(payload?.lines)
       ? payload.lines.map((line) => {
@@ -7829,6 +9594,40 @@ export class DataService {
       } as any);
 
       try {
+        await this.createLedgerFromAmount({
+          operationType: 'AP_PAYMENT',
+          amountUSD: line.amountUSD,
+          originOperationId: String(paymentRef.id ?? ''),
+          operationDate: new Date().toISOString(),
+          description: `Pago CxP ${entry.supplier} (${entry.id})`,
+          currency: line.currency,
+          exchangeRate: line.currency === 'VES' && line.rateUsed > 0 ? line.rateUsed : undefined,
+          metadata: {
+            module: 'FINANCE',
+            apId: id,
+            supplier: entry.supplier,
+            bankId: line.bankResolution.bankId,
+            bankName: line.bankResolution.bankName,
+            accountId: line.bankResolution.accountId,
+            method: line.method
+          }
+        });
+      } catch (ledgerError: any) {
+        try {
+          await deleteDoc(paymentRef);
+        } catch {
+          // Evitar ocultar el error original de asiento.
+        }
+        await this.postLedgerAlert('Fallo al generar asiento de pago CxP', {
+          apId: id,
+          paymentId: String(paymentRef.id ?? ''),
+          supplier: entry.supplier,
+          message: String(ledgerError?.message ?? ledgerError ?? '')
+        });
+        throw ledgerError;
+      }
+
+      try {
         await this.appendBankTransaction({
           bankId: line.bankResolution.bankId,
           bankName: line.bankResolution.bankName,
@@ -7860,15 +9659,36 @@ export class DataService {
     entry.balanceUSD = nextBalance;
     entry.status = nextBalance <= 0.005 ? 'PAID' : (entry.status === 'OVERDUE' ? 'OVERDUE' : 'PENDING');
 
-    await supabase.from('ap_entries').update({
+    const { error: apUpdateError } = await supabase.from('ap_entries').update({
       balance_usd: entry.balanceUSD,
       status: entry.status
     }).eq('id', id);
+    if (apUpdateError) {
+      throw new Error(`No se pudo actualizar saldo CxP en base de datos: ${String(apUpdateError.message ?? apUpdateError)}`);
+    }
 
     this.notify();
+    } finally {
+      if (apLockAcquired) {
+        try {
+          await deleteDoc(apLockRef);
+        } catch {
+          // Evitar romper el flujo por error al liberar lock.
+        }
+      }
+    }
   }
 
   getAREntries() { return this.arEntries; }
+  getCompanyLoans() { return this.companyLoans; }
+
+  getClientAdvancesSnapshot(includeApplied = false): ClientAdvance[] {
+    const list = Array.isArray(this.clientAdvances) ? this.clientAdvances : [];
+    return list
+      .filter((a) => includeApplied || a.status !== 'APPLIED')
+      .slice()
+      .sort((a, b) => String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')));
+  }
 
   async applyOverduePenalties(): Promise<void> {
     const now = new Date();
@@ -7876,7 +9696,8 @@ export class DataService {
     const toUpdate = this.arEntries.filter(e =>
       e.status !== 'PAID' &&
       e.dueDate < now &&
-      !e.penaltyAppliedAt
+      !e.penaltyAppliedAt &&
+      !e.meta?.skipAutoPenalty
     );
     for (const entry of toUpdate) {
       const fee = roundMoney(entry.amountUSD * LATE_FEE_RATE);
@@ -7918,7 +9739,8 @@ export class DataService {
       dueDate,
       status: 'PENDING',
       saleCorrelativo,
-      lateFeeUSD: 0
+      lateFeeUSD: 0,
+      ...(meta ? { meta } : {})
     };
 
     await setDoc(doc(db, 'ar_entries', deterministicId), {
@@ -7945,6 +9767,217 @@ export class DataService {
     }
     this.notify();
     return deterministicId;
+  }
+
+  async createCompanyLoan(input: {
+    beneficiaryType: 'EMPLOYEE' | 'PARTNER';
+    beneficiaryId?: string;
+    beneficiaryName: string;
+    description: string;
+    amountUSD: number;
+    currency?: 'USD' | 'VES';
+    amountVES?: number;
+    rateUsed?: number;
+    daysToPay?: number;
+    sourceMethod?: string;
+    sourceBankName?: string;
+    reference?: string;
+    note?: string;
+  }): Promise<{ loanId: string; arEntryId: string; loanCorrelativo: string }> {
+    const beneficiaryName = String(input.beneficiaryName ?? '').trim();
+    const description = String(input.description ?? '').trim();
+    const amountUSD = Number(input.amountUSD ?? 0) || 0;
+    if (!beneficiaryName) throw new Error('Debe indicar el beneficiario del préstamo.');
+    if (!description) throw new Error('Debe indicar la descripción del préstamo.');
+    if (!(amountUSD > 0)) throw new Error('El monto del préstamo debe ser mayor a 0.');
+
+    const now = new Date();
+    const daysToPay = Math.max(1, Number(input.daysToPay ?? 30) || 30);
+    const dueDate = new Date(now);
+    dueDate.setDate(dueDate.getDate() + daysToPay);
+
+    const currency = input.currency === 'VES' ? 'VES' : 'USD';
+    const rateUsed = Number(input.rateUsed ?? 0) || 0;
+    const amountVES = currency === 'VES'
+      ? (Number(input.amountVES ?? 0) || roundMoney(amountUSD * (rateUsed > 0 ? rateUsed : 0)))
+      : 0;
+    const beneficiaryIdRaw = String(input.beneficiaryId ?? '').trim();
+    const beneficiaryId = beneficiaryIdRaw || `BEN-${beneficiaryName.toUpperCase().replace(/[^A-Z0-9]+/g, '').slice(0, 20)}`;
+    const beneficiaryType = input.beneficiaryType === 'PARTNER' ? 'PARTNER' : 'EMPLOYEE';
+    const stamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`;
+    const suffix = Math.random().toString(36).slice(2, 6).toUpperCase();
+    const loanCorrelativo = `PREST-${stamp}-${suffix}`;
+    const loanId = `LOAN-${loanCorrelativo}`;
+    const arEntryId = `AR-${loanCorrelativo}`;
+    const issuedAtIso = now.toISOString();
+    const updatedAtIso = issuedAtIso;
+
+    const arEntry: AREntry = {
+      id: arEntryId,
+      timestamp: now,
+      customerName: beneficiaryName,
+      customerId: beneficiaryId,
+      description: `[PRESTAMO ${beneficiaryType}] ${description}`,
+      amountUSD,
+      balanceUSD: amountUSD,
+      dueDate,
+      status: 'PENDING',
+      saleCorrelativo: loanCorrelativo,
+      lateFeeUSD: 0,
+      meta: {
+        kind: 'COMPANY_LOAN',
+        loanId,
+        beneficiaryType,
+        skipAutoPenalty: true
+      }
+    };
+
+    const loanDoc: CompanyLoan = {
+      id: loanId,
+      loanCorrelativo,
+      arEntryId,
+      issuedAt: issuedAtIso,
+      dueDate: dueDate.toISOString(),
+      beneficiaryType,
+      beneficiaryId,
+      beneficiaryName,
+      description,
+      principalUSD: amountUSD,
+      balanceUSD: amountUSD,
+      currency,
+      amountVES,
+      rateUsed,
+      status: 'PENDING',
+      sourceMethod: String(input.sourceMethod ?? '').trim(),
+      sourceBankName: String(input.sourceBankName ?? '').trim(),
+      reference: String(input.reference ?? '').trim(),
+      note: String(input.note ?? '').trim(),
+      createdBy: this.currentUser?.name ?? '',
+      updatedAt: updatedAtIso
+    };
+
+    const loanRef = doc(db, 'company_loans', loanId);
+    const arRef = doc(db, 'ar_entries', arEntryId);
+
+    await runTransaction(db, async (tx) => {
+      tx.set(arRef, {
+        id: arEntry.id,
+        timestamp: arEntry.timestamp.toISOString(),
+        customerName: arEntry.customerName,
+        customerId: arEntry.customerId,
+        description: arEntry.description,
+        amountUSD: arEntry.amountUSD,
+        balanceUSD: arEntry.balanceUSD,
+        dueDate: arEntry.dueDate.toISOString(),
+        status: arEntry.status,
+        saleCorrelativo: arEntry.saleCorrelativo,
+        lateFeeUSD: 0,
+        meta: arEntry.meta ?? {}
+      }, { merge: true });
+
+      tx.set(loanRef, loanDoc as any, { merge: true });
+    });
+
+    const existingAr = this.arEntries.findIndex((e) => e.id === arEntryId);
+    if (existingAr >= 0) this.arEntries[existingAr] = arEntry;
+    else this.arEntries.push(arEntry);
+
+    const existingLoan = this.companyLoans.findIndex((l) => l.id === loanId);
+    if (existingLoan >= 0) this.companyLoans[existingLoan] = loanDoc;
+    else this.companyLoans.push(loanDoc);
+
+    const sourceBankName = String(input.sourceBankName ?? '').trim();
+    if (sourceBankName) {
+      try {
+        await this.appendBankTransaction({
+          bankId: this.resolveBankIdByName(sourceBankName),
+          bankName: sourceBankName,
+          method: String(input.sourceMethod ?? 'LOAN').trim() || 'LOAN',
+          source: 'LOAN_DISBURSEMENT',
+          sourceId: loanId,
+          arId: arEntryId,
+          customerId: beneficiaryId,
+          customerName: beneficiaryName,
+          saleCorrelativo: loanCorrelativo,
+          currency,
+          amountUSD: -Math.abs(amountUSD),
+          amountVES: currency === 'VES' ? -Math.abs(amountVES) : 0,
+          rateUsed,
+          reference: String(input.reference ?? '').trim(),
+          note: `Desembolso préstamo ${loanCorrelativo}. ${description}`.slice(0, 220),
+          actor: this.currentUser?.name ?? '',
+          createdAt: issuedAtIso
+        });
+      } catch (e) {
+        console.warn('No se pudo registrar bank_transaction del préstamo:', e);
+      }
+    }
+
+    this.notify();
+    return { loanId, arEntryId, loanCorrelativo };
+  }
+
+  async registerCompanyLoanPayment(
+    loanId: string,
+    paymentUSD: number,
+    payload?: {
+      note?: string;
+      files?: File[];
+      method?: string;
+      currency?: 'USD' | 'VES';
+      amountVES?: number;
+      rateUsed?: number;
+      bank?: string;
+      reference?: string;
+    }
+  ): Promise<CompanyLoan> {
+    const id = String(loanId ?? '').trim();
+    if (!id) throw new Error('Préstamo inválido.');
+    const payment = Number(paymentUSD ?? 0) || 0;
+    if (!(payment > 0)) throw new Error('Monto de cobro inválido.');
+
+    let loan = this.companyLoans.find((l) => l.id === id);
+    if (!loan) {
+      const snap = await getDoc(doc(db, 'company_loans', id));
+      if (!snap.exists()) throw new Error('Préstamo no encontrado.');
+      loan = snap.data() as CompanyLoan;
+    }
+    if (!loan.arEntryId) throw new Error('Préstamo sin cuenta por cobrar vinculada.');
+    if (loan.status === 'PAID' || Number(loan.balanceUSD ?? 0) <= 0.005) throw new Error('El préstamo ya está liquidado.');
+    if (payment - Number(loan.balanceUSD ?? 0) > 0.005) {
+      throw new Error(`El pago excede el saldo pendiente del préstamo ($${Number(loan.balanceUSD ?? 0).toFixed(2)}).`);
+    }
+
+    const noteParts = [String(payload?.note ?? '').trim(), `Cobro préstamo ${loan.loanCorrelativo}`].filter(Boolean);
+    await this.registerARPaymentWithSupport(loan.arEntryId, payment, {
+      ...payload,
+      method: String(payload?.method ?? 'LOAN_PAYMENT') || 'LOAN_PAYMENT',
+      note: noteParts.join(' · ')
+    });
+
+    const linkedAR = this.arEntries.find((e) => e.id === loan!.arEntryId);
+    const balanceUSD = roundMoney(Math.max(0, Number(linkedAR?.balanceUSD ?? loan.balanceUSD ?? 0)));
+    const nextStatus: CompanyLoan['status'] = balanceUSD <= 0.005 ? 'PAID' : (balanceUSD < Number(loan.principalUSD ?? 0) ? 'PARTIAL' : 'PENDING');
+    const updatedAt = new Date().toISOString();
+
+    const nextLoan: CompanyLoan = {
+      ...loan,
+      balanceUSD: balanceUSD <= 0.005 ? 0 : balanceUSD,
+      status: nextStatus,
+      updatedAt
+    };
+
+    await updateDoc(doc(db, 'company_loans', id), {
+      balanceUSD: nextLoan.balanceUSD,
+      status: nextLoan.status,
+      updatedAt
+    } as any);
+
+    const idx = this.companyLoans.findIndex((l) => l.id === id);
+    if (idx >= 0) this.companyLoans[idx] = nextLoan;
+    else this.companyLoans.push(nextLoan);
+    this.notify();
+    return nextLoan;
   }
 
   async registerARPayment(id: string, paymentUSD: number) {
@@ -8003,8 +10036,15 @@ export class DataService {
     const amountVES = Number(payload?.amountVES ?? 0) || 0;
     const amountUSD = Number(paymentUSD) || 0;
     const method = String(payload?.method ?? 'AR_PAYMENT');
+    if (!(amountUSD > 0)) {
+      throw new Error('Monto de cobro inválido para CxC.');
+    }
 
     const supports: ARPaymentSupport[] = [];
+    const paymentRef = doc(collection(db, 'ar_entries', id, 'payments'));
+    const entryRef = doc(db, 'ar_entries', id);
+    let committedBalanceUSD = Number(entry.balanceUSD ?? 0) || 0;
+    let committedStatus = String(entry.status ?? 'PENDING');
     const paymentDoc: ARPaymentRecord = {
       arId: id,
       customerId: entry.customerId,
@@ -8023,12 +10063,70 @@ export class DataService {
       createdAt: new Date().toISOString()
     };
 
-    const paymentRef = await addDoc(collection(db, 'ar_entries', id, 'payments'), paymentDoc as any);
+    // INT-02: actualización atómica de saldo CxC + alta de pago para evitar doble cobro concurrente.
+    await runTransaction(db, async (tx) => {
+      const snap = await tx.get(entryRef);
+      if (!snap.exists()) {
+        throw new Error('Cuenta por cobrar no encontrada.');
+      }
+      const raw = snap.data() as any;
+      const currentBalance = Number(raw?.balanceUSD ?? raw?.balance_usd ?? 0) || 0;
+      const currentStatus = String(raw?.status ?? 'PENDING');
+      if (currentStatus === 'PAID' || currentBalance <= 0.005) {
+        throw new Error('La cuenta por cobrar ya está saldada.');
+      }
+      if (amountUSD - currentBalance > 0.005) {
+        throw new Error(`El cobro ($${amountUSD.toFixed(2)}) excede el saldo pendiente ($${currentBalance.toFixed(2)}).`);
+      }
+
+      committedBalanceUSD = roundMoney(Math.max(0, currentBalance - amountUSD));
+      if (committedBalanceUSD <= 0.005) committedBalanceUSD = 0;
+      committedStatus = committedBalanceUSD <= 0 ? 'PAID' : currentStatus;
+
+      tx.set(paymentRef, paymentDoc as any);
+      tx.update(entryRef, {
+        balanceUSD: committedBalanceUSD,
+        status: committedStatus,
+        lastPaymentAt: new Date().toISOString()
+      } as any);
+    });
+
+    try {
+      await this.createLedgerFromAmount({
+        operationType: 'AR_PAYMENT',
+        amountUSD,
+        originOperationId: String(paymentRef.id ?? ''),
+        operationDate: new Date().toISOString(),
+        description: `Cobro CxC ${entry.saleCorrelativo} - ${entry.customerName}`,
+        currency,
+        exchangeRate: rateUsed > 0 ? rateUsed : undefined,
+        metadata: {
+          module: 'FINANCE',
+          arId: id,
+          customerId: entry.customerId,
+          customerName: entry.customerName,
+          method,
+          bank: String(payload?.bank ?? '')
+        }
+      });
+    } catch (ledgerError: any) {
+      await this.postLedgerAlert('Fallo al generar asiento de cobro CxC', {
+        arId: id,
+        paymentId: String(paymentRef.id ?? ''),
+        saleCorrelativo: entry.saleCorrelativo,
+        message: String(ledgerError?.message ?? ledgerError ?? '')
+      });
+      throw ledgerError;
+    }
 
     // Alimentar módulo Bancos (solo append): registrar transacción por banco+método.
     try {
       const bankName = String(payload?.bank ?? '').trim();
-      if (bankName && bankName.toUpperCase() !== 'OTRO') {
+      const skipBankLedger =
+        !bankName ||
+        bankName.toUpperCase() === 'OTRO' ||
+        bankName === 'Ant. Cliente';
+      if (!skipBankLedger) {
         const bankTx: BankTransactionRecord = {
           bankId: this.resolveBankIdByName(bankName),
           bankName,
@@ -8052,6 +10150,32 @@ export class DataService {
       }
     } catch (e: any) {
       console.warn('No se pudo registrar bank_transaction:', e?.message ?? e);
+    }
+
+    // Cruce CxP en cobro CxC:
+    // cuando el cobro AR se registra como "others/CxP" o nota de reconciliación,
+    // también debe descontar la deuda del proveedor/cliente en AP.
+    const methodUpper = String(method ?? '').trim().toUpperCase();
+    const bankUpper = String(payload?.bank ?? '').trim().toUpperCase();
+    const noteUpper = String(payload?.note ?? '').trim().toUpperCase();
+    const isGenericOther = methodUpper === 'OTHERS' || methodUpper === 'OTRO';
+    const isExplicitCxp = methodUpper.includes('CXP') || bankUpper.includes('CXP') || noteUpper.includes('CXP') || noteUpper.includes('RECONCILIACION');
+    const apBalance = this.getAPBalanceForClient(entry.customerName, entry.customerId);
+    const shouldApplyCxpOffset = isExplicitCxp || (isGenericOther && apBalance > 0);
+
+    if (shouldApplyCxpOffset) {
+      if (apBalance <= 0.005) {
+        throw new Error(`No hay CxP pendiente para ${entry.customerName}.`);
+      }
+      if (amountUSD - apBalance > 0.005) {
+        throw new Error(`El cobro por CxP ($${amountUSD.toFixed(2)}) excede el saldo CxP disponible ($${apBalance.toFixed(2)}).`);
+      }
+      await this.applyAPOffsetBySale(
+        entry.customerName,
+        amountUSD,
+        String(entry.saleCorrelativo ?? id),
+        entry.customerId
+      );
     }
 
     if (payload?.files && payload.files.length > 0) {
@@ -8142,14 +10266,14 @@ export class DataService {
       }
     }
 
-    entry.balanceUSD = Math.max(0, entry.balanceUSD - paymentUSD);
-    if (entry.balanceUSD === 0) entry.status = 'PAID';
+    entry.balanceUSD = committedBalanceUSD;
+    entry.status = committedStatus as any;
 
-    await updateDoc(doc(db, 'ar_entries', id), {
-      balanceUSD: entry.balanceUSD,
-      status: entry.status,
-      lastPaymentAt: new Date().toISOString()
-    } as any);
+    await this.addAuditEntry(
+      'CXC',
+      String(entry.saleCorrelativo || id),
+      `Cobro CxC: ${entry.customerName} | Monto: $${amountUSD.toFixed(2)} | Metodo: ${method}${payload?.bank ? ` | Banco: ${String(payload.bank)}` : ''}${payload?.reference ? ` | Ref: ${String(payload.reference)}` : ''}`
+    );
 
     this.notify();
   }
@@ -8163,6 +10287,7 @@ export class DataService {
       amountVES?: number;
       bank?: string;
       reference?: string;
+      note?: string;
       currency?: 'USD' | 'VES';
       rateUsed?: number;
     }>;
@@ -8221,7 +10346,7 @@ export class DataService {
         rateUsed: payment.rateUsed,
         bank: payment.bank,
         reference: payment.reference,
-        note: `Cobro en Caja${sessionId ? ` (Sesión: ${sessionId.slice(0, 8)})` : ''}`
+        note: String(payment.note ?? '').trim() || `Cobro en Caja${sessionId ? ` (Sesión: ${sessionId.slice(0, 8)})` : ''}`
       });
     }
 
@@ -8627,6 +10752,9 @@ export class DataService {
   }
 
   getConsolidatedLedger() {
+    if (Array.isArray(this.consolidatedLedgerEntries) && this.consolidatedLedgerEntries.length > 0) {
+      return [...this.consolidatedLedgerEntries];
+    }
     const entries: { timestamp: Date, type: 'INCOME' | 'EXPENSE', category: string, description: string, amountUSD: number }[] = [];
 
     // Sales (Cash/Bank) — excluir ventas anuladas
@@ -8672,6 +10800,71 @@ export class DataService {
     return entries.sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
   }
 
+  /**
+   * Mayor analítico por cuenta (Supabase RPC `mayor_por_cuenta_saldo`): líneas con debe, haber y saldo acumulado.
+   * Fechas en formato YYYY-MM-DD; null = sin filtro en ese extremo.
+   */
+  async fetchMayorCuentaSaldo(params: {
+    fechaDesde: string | null;
+    fechaHasta: string | null;
+    cuentaCodigo: string | null;
+    limite?: number;
+  }): Promise<MayorCuentaMovimientoRow[]> {
+    const lim = Math.min(50000, Math.max(100, Number(params.limite) || 8000));
+    try {
+      const { data, error } = await supabase.rpc('mayor_por_cuenta_saldo', {
+        p_fecha_desde: params.fechaDesde && String(params.fechaDesde).trim() ? String(params.fechaDesde).trim() : null,
+        p_fecha_hasta: params.fechaHasta && String(params.fechaHasta).trim() ? String(params.fechaHasta).trim() : null,
+        p_cuenta_codigo: params.cuentaCodigo && String(params.cuentaCodigo).trim() ? String(params.cuentaCodigo).trim() : null,
+        p_limite: lim
+      });
+      if (error) {
+        const msg = String((error as any)?.message ?? error ?? '');
+        if (!msg.toLowerCase().includes('does not exist') && !msg.toLowerCase().includes('function')) {
+          console.warn('mayor_por_cuenta_saldo:', error);
+        }
+        return [];
+      }
+      if (!Array.isArray(data)) return [];
+      return data.map((row: any) => ({
+        cuentaContableCodigo: String(row?.cuenta_contable_codigo ?? '').trim(),
+        cuentaContableNombre: String(row?.cuenta_contable_nombre ?? '').trim(),
+        asientoId: String(row?.asiento_id ?? ''),
+        lineNumber: Number(row?.line_number ?? 0) || 0,
+        fecha: row?.fecha ? new Date(row.fecha) : new Date(),
+        tipoOperacion: String(row?.tipo_operacion ?? '').trim(),
+        descripcionAsiento: String(row?.descripcion_asiento ?? '').trim(),
+        debe: Math.round((Number(row?.debe ?? 0) + Number.EPSILON) * 100) / 100,
+        haber: Math.round((Number(row?.haber ?? 0) + Number.EPSILON) * 100) / 100,
+        saldoAcumulado: Math.round((Number(row?.saldo_acumulado ?? 0) + Number.EPSILON) * 100) / 100
+      }));
+    } catch (e) {
+      console.warn('fetchMayorCuentaSaldo:', e);
+      return [];
+    }
+  }
+
+  /** Códigos de cuenta presentes en `detalles_asiento` (selectores del mayor). */
+  async listCuentasContablesMayor(): Promise<Array<{ codigo: string; nombre: string }>> {
+    try {
+      const { data, error } = await supabase
+        .from('detalles_asiento')
+        .select('cuenta_contable_codigo, cuenta_contable_nombre')
+        .order('cuenta_contable_codigo', { ascending: true })
+        .limit(12000);
+      if (error || !Array.isArray(data)) return [];
+      const map = new Map<string, string>();
+      for (const r of data as any[]) {
+        const c = String(r?.cuenta_contable_codigo ?? '').trim();
+        if (!c || map.has(c)) continue;
+        map.set(c, String(r?.cuenta_contable_nombre ?? '').trim() || c);
+      }
+      return Array.from(map.entries()).map(([codigo, nombre]) => ({ codigo, nombre }));
+    } catch {
+      return [];
+    }
+  }
+
   async addStock(sku: string, qtyUnits: number, costUSD: number, expiry: Date, warehouse: string = 'Galpon D3', supplier?: string, paymentType?: 'CASH' | 'CREDIT', invoiceImage?: string) {
     const { error } = await supabase.from('inventory_batches').insert({
       product_code: sku,
@@ -8687,7 +10880,7 @@ export class DataService {
       console.error('Error agregando stock:', error);
     }
 
-    await supabase.from('movements').insert({
+    await this.insertMovementWithFallback({
       product_code: sku,
       type: 'IN',
       quantity: qtyUnits,
@@ -8728,6 +10921,26 @@ export class DataService {
   private async generateUniqueCorrelativo(kind: 'STANDARD' | 'CREDIT', maxRetries = 5): Promise<string> {
     const prefix = kind === 'CREDIT' ? 'C-' : 'G-';
     const padLength = kind === 'CREDIT' ? 6 : 8;
+
+    // CONC-FIX-06: Intento atómico vía PostgreSQL SEQUENCE (RPC next_correlativo).
+    // Si la RPC está instalada en Supabase (ver SQL en Comandos Base de datos),
+    // garantiza unicidad 100% bajo cualquier nivel de concurrencia. Si falla
+    // (RPC no instalada o error de red), continúa con la lógica de retry abajo.
+    try {
+      const { data: rpcResult, error: rpcError } = await supabase.rpc('next_correlativo', { kind });
+      if (!rpcError && rpcResult && typeof rpcResult === 'string' && rpcResult.startsWith(prefix)) {
+        // Sincronizar contadores en memoria
+        const numPart = parseInt(rpcResult.substring(prefix.length), 10);
+        if (Number.isFinite(numPart)) {
+          if (kind === 'CREDIT') this.nextCreditCorrelativo = numPart + 1;
+          else this.nextCorrelativo = numPart + 1;
+        }
+        return rpcResult;
+      }
+      // Si no disponible (RPC no creada aún), seguir con fallback silenciosamente
+    } catch (rpcErr) {
+      console.warn('[CONC-FIX-06] RPC next_correlativo no disponible, usando fallback:', rpcErr);
+    }
 
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       // Get current max from DB
@@ -8779,14 +10992,30 @@ export class DataService {
   }
 
   async registerSale(sale: Omit<SaleHistoryEntry, 'timestamp'>): Promise<SaleHistoryEntry | null> {
-    // Validate cash box session is open for cashier role
-    if (this.currentUser.role === 'CAJERO' && (!this.currentSession || this.currentSession.status !== 'OPEN')) {
+    const clientRequestId = String((sale as any).clientRequestId ?? '').trim();
+    if (clientRequestId) {
+      const existingSale = await this.findSaleByClientRequestId(clientRequestId);
+      if (existingSale) {
+        return existingSale;
+      }
+    }
+
+    const hasOpenCashSessionForUser = this.currentSession?.status === 'OPEN' && String(this.currentSession?.userId ?? '') === String(this.currentUser?.id ?? '');
+    if (this.currentUser.role === 'CAJERO' && !hasOpenCashSessionForUser) {
+      await this.syncOpenCashBoxSessionForCurrentUser();
+    }
+
+    const hasSyncedOpenCashSessionForUser = this.currentSession?.status === 'OPEN' && String(this.currentSession?.userId ?? '') === String(this.currentUser?.id ?? '');
+    if (this.currentUser.role === 'CAJERO' && !hasSyncedOpenCashSessionForUser) {
       throw new Error('Debe abrir una sesión de caja antes de registrar ventas');
     }
 
     // Stamp the operator who registered this sale
     (sale as any).operatorName = String(this.currentUser?.name ?? '').trim() || 'SISTEMA';
     (sale as any).userId = String(this.currentUser?.id ?? '').trim();
+
+    // BILL-SEC-01: validar Ant. Cliente vs saldo en Firestore ANTES de factura e inventario
+    await this.assertAntClienteCoveredByAdvances(sale);
 
     const timestamp = new Date();
     const normalizedPaymentMethod = String(sale.paymentMethod ?? '').trim().toUpperCase();
@@ -8803,41 +11032,107 @@ export class DataService {
 
     // exchange_rate debe ser siempre la tasa BCV real, no totalVES/totalUSD
     const bcvRate = Number(sale.exchangeRate) || (sale.totalUSD > 0 ? sale.totalVES / sale.totalUSD : 1);
-    const { data: newSale, error: sError } = await this.insertSaleWithFallback({
-      correlativo: finalCorrelativo,
-      customer_name: sale.client.name,
-      customer_id: sale.client.id,
-      total_usd: sale.totalUSD,
-      total_ves: sale.totalVES,
-      nominal_usd: (sale as any).nominalUSD ?? sale.totalUSD,
-      exchange_rate: bcvRate,
-      status: 'COMPLETED',
-      operator: this.currentUser.name,
-      user_id: this.currentUser.id ?? '',
-      date: new Date().toISOString()
-    });
+
+    // CONC-FIX-01: Retry loop por si el INSERT colisiona con UNIQUE constraint
+    // (race condition entre 30 usuarios simultáneos).
+    let newSale: any = null;
+    let sError: any = null;
+    const MAX_CORRELATIVO_RETRIES = 3;
+    for (let attempt = 0; attempt < MAX_CORRELATIVO_RETRIES; attempt++) {
+      const result = await this.insertSaleWithFallback({
+        client_request_id: clientRequestId || undefined,
+        correlativo: finalCorrelativo,
+        customer_name: sale.client.name,
+        customer_id: sale.client.id,
+        total_usd: sale.totalUSD,
+        total_ves: sale.totalVES,
+        nominal_usd: (sale as any).nominalUSD ?? sale.totalUSD,
+        exchange_rate: bcvRate,
+        status: 'COMPLETED',
+        operator: this.currentUser.name,
+        user_id: this.currentUser.id ?? '',
+        date: new Date().toISOString()
+      });
+      newSale = result.data;
+      sError = result.error;
+
+      if (!sError) break; // éxito
+
+      const errMsgLower = String((sError as any)?.message ?? '').toLowerCase();
+      // Detección específica de violación de UNIQUE en correlativo
+      const isCorrelativoCollision =
+        (errMsgLower.includes('sales_correlativo_unique') ||
+         errMsgLower.includes('correlativo') && errMsgLower.includes('duplicate')) &&
+        !errMsgLower.includes('client_request_id');
+
+      if (isCorrelativoCollision && attempt < MAX_CORRELATIVO_RETRIES - 1) {
+        console.warn(`[CONC-FIX-01] Colisión de correlativo ${finalCorrelativo} (intento ${attempt + 1}). Regenerando...`);
+        finalCorrelativo = await this.generateUniqueCorrelativo(isCreditSale ? 'CREDIT' : 'STANDARD');
+        sError = null; // limpiar para reintentar
+        continue;
+      }
+
+      break; // otro tipo de error, salir del loop
+    }
 
     if (sError) {
-      console.warn('Modo Local Activo: Error guardando en Supabase, procesando venta solo en memoria local.', sError);
-      const mockSale: SaleHistoryEntry = {
-        id: Math.random().toString(36).substr(2, 9),
-        ...sale,
+      const sErrMsg = String((sError as any)?.message ?? '').toLowerCase();
+      const duplicateClientRequest =
+        clientRequestId
+        && (sErrMsg.includes('client_request_id') || sErrMsg.includes('duplicate key'));
+      if (duplicateClientRequest) {
+        const existingSale = await this.findSaleByClientRequestId(clientRequestId);
+        if (existingSale) return existingSale;
+      }
+      // BILL-FIX-02: Modo local seguro - NO registrar pagos/bancos/AR/CxP si falla Supabase
+      // para evitar inconsistencias financieras. Solo loguear y retornar error.
+      console.error('BILL-FIX-02: Error crítico guardando venta en Supabase. Venta NO procesada para evitar inconsistencias.', sError);
+      throw new Error(`Error de base de datos al registrar venta: ${String((sError as any)?.message ?? 'Error desconocido')}. La venta no fue procesada. Intente nuevamente.`);
+    }
+
+    // CONT-AUTO: generar asiento contable de venta inmediatamente despues de persistir la factura.
+    // Si falla, se revierte la factura para no dejar movimientos sin asiento.
+    try {
+      await this.createLedgerFromAmount({
+        operationType: isCreditSale ? 'SALE_CREDIT' : 'SALE_CASH',
+        amountUSD: Number(sale.totalUSD ?? 0) || 0,
+        originOperationId: String(newSale?.id ?? ''),
+        operationDate: new Date().toISOString(),
+        description: `Factura ${finalCorrelativo} - ${sale.client.name}`,
+        currency: 'USD',
+        exchangeRate: bcvRate,
+        metadata: {
+          module: 'BILLING',
+          correlativo: finalCorrelativo,
+          customerId: String(sale?.client?.id ?? ''),
+          customerName: String(sale?.client?.name ?? '')
+        }
+      });
+    } catch (ledgerError: any) {
+      try {
+        const insertedId = String(newSale?.id ?? '').trim();
+        if (insertedId) await supabase.from('sales').delete().eq('id', insertedId);
+      } catch (rollbackErr) {
+        console.error('No se pudo revertir factura tras fallo de asiento:', rollbackErr);
+      }
+      await this.postLedgerAlert('Fallo al generar asiento de venta', {
         correlativo: finalCorrelativo,
-        timestamp
-      };
-      const paymentsPreparedRaw = await this.normalizeSalePayments(((sale as any).payments ?? []) as any[]);
-      const paymentsPrepared = Array.isArray(paymentsPreparedRaw) ? paymentsPreparedRaw : [];
-      mockSale.payments = paymentsPrepared.map((p: any) => ({ ...p, files: undefined }));
-      this.sales.unshift(mockSale);
-      await this.persistCashBoxSaleAudit(mockSale);
-      await this.persistSalePayments(sale, String(mockSale.id), paymentsPrepared.map((p: any) => ({ ...p, files: undefined })));
-      await this.appendSaleBankTransactions(sale, String(mockSale.id), paymentsPrepared.map((p: any) => ({ ...p, files: undefined })));
-      void this.syncSalePaymentSupportsAsync(sale, String(mockSale.id), paymentsPrepared);
-      // CRITICAL FIX: Procesar AR, CxP y Anticipos también en modo offline/mock
-      await this.processPostSaleEffects(sale, mockSale, finalCorrelativo);
-      // CORRELATIVO FIX: El contador ya se actualizó en getNextCorrelativo
-      await this.init();
-      return mockSale;
+        saleId: String(newSale?.id ?? ''),
+        message: String(ledgerError?.message ?? ledgerError ?? '')
+      });
+      if (ledgerError instanceof MissingLedgerRuleError) {
+        throw ledgerError;
+      }
+      throw new Error(`No se pudo generar asiento contable para la venta ${finalCorrelativo}. La factura fue revertida.`);
+    }
+
+    // BILL-SEC-02: Validar stock disponible antes de descontar (previene sobreventa)
+    const stockValidation = await this.validateStockAvailability(sale.items);
+    if (!stockValidation.valid && stockValidation.errors) {
+      const errorDetails = stockValidation.errors.map(e => 
+        `${e.code}: solicitado ${e.requested.toFixed(4)}, disponible ${e.available.toFixed(4)}`
+      ).join('; ');
+      throw new Error(`Stock insuficiente: ${errorDetails}`);
     }
 
     // FEFO Discount Logic
@@ -8854,36 +11149,64 @@ export class DataService {
       const sortedLotes = [...product.lotes].sort((a, b) => a.expiry.getTime() - b.expiry.getTime());
       const dispatchLotes: { warehouse: string; batchId: string; qty: number }[] = [];
 
-      for (const lote of sortedLotes) {
-        if (remaining <= 0) break;
-        const discount = Math.min(lote.qty, remaining);
-
-        if (discount > 0) {
-          await supabase.from('inventory_batches')
-            .update({ quantity: lote.qty - discount })
-            .eq('id', lote.id);
-
-          try {
-            await this.insertMovementWithFallback({
-              product_code: item.code,
-              type: 'SALE',
-              quantity: -discount,
-              warehouse: lote.warehouse,
-              reason: `Venta ${finalCorrelativo}`,
-              operator: this.currentUser.name,
-              date: new Date().toISOString()
+      // BILL-SEC-02: Intentar reserva atómica primero, fallback a lógica original
+      let atomicSuccess = false;
+      try {
+        const atomicResult = await this.reserveStockAtomic(item, sortedLotes.map(l => ({ 
+          id: l.id, 
+          qty: l.qty, 
+          expiry: l.expiry, 
+          warehouse: l.warehouse 
+        })), finalCorrelativo);
+        
+        if (atomicResult.success && atomicResult.reserved) {
+          for (const reserved of atomicResult.reserved) {
+            dispatchLotes.push({
+              warehouse: reserved.warehouse,
+              batchId: reserved.batchId,
+              qty: reserved.qty
             });
-          } catch (e) {
-            console.warn('No se pudo registrar movimiento de venta en Supabase:', e);
+            remaining -= reserved.qty;
           }
+          atomicSuccess = true;
+        }
+      } catch (atomicErr) {
+        console.warn('[registerSale] Error en reserva atómica, fallback a lógica original:', atomicErr);
+      }
 
-          dispatchLotes.push({
-            warehouse: lote.warehouse,
-            batchId: String(lote.id || 'N/A'),
-            qty: discount
-          });
+      // Fallback a lógica original si la atómica falló o no está disponible
+      if (!atomicSuccess) {
+        for (const lote of sortedLotes) {
+          if (remaining <= 0) break;
+          const discount = Math.min(lote.qty, remaining);
 
-          remaining -= discount;
+          if (discount > 0) {
+            await supabase.from('inventory_batches')
+              .update({ quantity: lote.qty - discount })
+              .eq('id', lote.id);
+
+            try {
+              await this.insertMovementWithFallback({
+                product_code: item.code,
+                type: 'SALE',
+                quantity: -discount,
+                warehouse: lote.warehouse,
+                reason: `Venta ${finalCorrelativo}`,
+                operator: this.currentUser.name,
+                date: new Date().toISOString()
+              });
+            } catch (e) {
+              console.warn('No se pudo registrar movimiento de venta en Supabase:', e);
+            }
+
+            dispatchLotes.push({
+              warehouse: lote.warehouse,
+              batchId: String(lote.id || 'N/A'),
+              qty: discount
+            });
+
+            remaining -= discount;
+          }
         }
       }
 
@@ -8896,6 +11219,7 @@ export class DataService {
     const finalSale: SaleHistoryEntry = {
       ...sale,
       id: newSale?.id || Math.random().toString(36).substr(2, 9),
+      clientRequestId: clientRequestId || undefined,
       correlativo: finalCorrelativo,
       items: itemsWithDispatch,
       timestamp
@@ -9072,6 +11396,85 @@ export class DataService {
     return finalSale;
   }
 
+  /**
+   * BILL-SEC-01: Rechaza la venta antes de persistir factura e inventario si renglones
+   * Ant. Cliente exceden el saldo real por reserva (USD / VES) en `client_advances`.
+   * Lectura estricta: error de red/Firestore no se interpreta como saldo 0.
+   */
+  private async assertAntClienteCoveredByAdvances(sale: Omit<SaleHistoryEntry, 'timestamp'>): Promise<void> {
+    const customerId = String(sale?.client?.id ?? '').trim();
+    if (!customerId) return;
+
+    const payments = ((sale as any).payments ?? []) as any[];
+    const antClientePayments = payments.filter((p: any) => {
+      const bank = String(p?.bank ?? '').trim();
+      const noteUpper = String(p?.note ?? '').trim().toUpperCase();
+      const isAnticipoPayment = bank === 'Ant. Cliente' || noteUpper.includes('ANT. CLIENTE') || noteUpper.includes('ANTICIPO CLIENTE');
+      const isAdvanceCreationOnly = noteUpper.includes('VUELTO DEJADO COMO ANTICIPO') || noteUpper.includes('EXCEDENTE DE PAGO');
+      return isAnticipoPayment && !isAdvanceCreationOnly;
+    });
+    if (antClientePayments.length === 0) return;
+
+    const antPool = (p: any): 'USD' | 'VES' => {
+      const u = String(p?.note ?? '').toUpperCase();
+      return u.includes('[VES]') ? 'VES' : 'USD';
+    };
+    const byPool: Record<'USD' | 'VES', number> = { USD: 0, VES: 0 };
+    for (const p of antClientePayments) {
+      byPool[antPool(p)] += Number(p?.amountUSD ?? 0) || 0;
+    }
+    const TOL = 0.05;
+    let advances: ClientAdvance[];
+    try {
+      const snap = await getDocs(
+        query(
+          collection(db, 'client_advances'),
+          where('customerId', '==', customerId),
+          where('status', 'in', ['AVAILABLE', 'PARTIAL'])
+        )
+      );
+      advances = snap.docs.map((d) => {
+        const data = d.data() as any;
+        return {
+          id: d.id,
+          customerId: String(data.customerId ?? ''),
+          customerName: String(data.customerName ?? ''),
+          amountUSD: Number(data.amountUSD ?? 0),
+          balanceUSD: Number(data.balanceUSD ?? 0),
+          currency: (data.currency ?? 'USD') as 'USD' | 'VES',
+          originalAmountVES: data.originalAmountVES ? Number(data.originalAmountVES) : undefined,
+          rateAtCreation: data.rateAtCreation ? Number(data.rateAtCreation) : undefined,
+          status: (data.status ?? 'AVAILABLE') as ClientAdvance['status'],
+          originInvoiceId: String(data.originInvoiceId ?? ''),
+          originCorrelativo: String(data.originCorrelativo ?? ''),
+          createdAt: String(data.createdAt ?? ''),
+          updatedAt: String(data.updatedAt ?? ''),
+          note: data.note ? String(data.note) : undefined
+        };
+      });
+    } catch (e) {
+      throw new Error(
+        'BILL-SEC-01: No se pudo verificar el saldo de anticipo (conexión o Firestore). Intente de nuevo. ' +
+          (e instanceof Error ? e.message : String(e))
+      );
+    }
+    for (const cur of ['USD', 'VES'] as const) {
+      const need = roundMoney(byPool[cur]);
+      if (need <= 0.005) continue;
+      const avail = roundMoney(
+        advances
+          .filter((a) => (cur === 'USD' ? (a.currency ?? 'USD') === 'USD' : a.currency === 'VES'))
+          .reduce((s, a) => s + a.balanceUSD, 0)
+      );
+      if (need > avail + TOL) {
+        throw new Error(
+          `BILL-SEC-01: Ant. Cliente [${cur}] pide $${need.toFixed(2)} y el saldo disponible es $${avail.toFixed(2)}. ` +
+            'Ajuste renglones o use Finanzas → Anticipos.'
+        );
+      }
+    }
+  }
+
   // ─── PROCESAMIENTO POST-VENTA (AR, CxP, Anticipos) ──────────────────────────
   // Extraído para que funcione tanto en path Supabase como en path Mock/Offline
   private async processPostSaleEffects(
@@ -9120,7 +11523,7 @@ export class DataService {
     }
 
     // ── CxP OFFSET (cruce de cuentas) ───────────────────────────────────────
-    const apPayments = payments.filter((p: any) => {
+    const apPaymentsRaw = payments.filter((p: any) => {
       const meth = String(p.method || '').trim().toUpperCase();
       const bank = String(p.bank || '').trim().toUpperCase();
       const note = String(p.note || '').trim().toUpperCase();
@@ -9128,6 +11531,24 @@ export class DataService {
       const isGenericOther = meth === 'OTHERS' || meth === 'OTRO';
       const currentAPBal = this.getAPBalanceBySupplier(sale.client.name);
       return isExplicitCXP || (isGenericOther && currentAPBal > 0);
+    });
+    // Idempotencia: evitar procesar dos veces la misma línea CxP
+    // (puede ocurrir por dobles disparos UI/reintentos con payload repetido).
+    const seenAPKeys = new Set<string>();
+    const apPayments = apPaymentsRaw.filter((p: any) => {
+      const meth = String(p?.method ?? '').trim().toUpperCase();
+      const bank = String(p?.bank ?? '').trim().toUpperCase();
+      const note = String(p?.note ?? '').trim().toUpperCase();
+      const ref = String(p?.reference ?? '').trim().toUpperCase();
+      const usd = roundMoney(Number(p?.amountUSD ?? 0) || 0).toFixed(2);
+      const ves = roundMoney(Number(p?.amountVES ?? 0) || 0).toFixed(2);
+      const key = `${meth}|${bank}|${note}|${ref}|${usd}|${ves}`;
+      if (seenAPKeys.has(key)) {
+        console.warn('[CXP] Línea duplicada detectada en pagos de venta; se omite para evitar doble descuento:', key);
+        return false;
+      }
+      seenAPKeys.add(key);
+      return true;
     });
 
     if (apPayments.length > 0) {
@@ -9169,19 +11590,44 @@ export class DataService {
     });
 
     if (antClientePayments.length > 0 && sale.client?.id) {
-      const totalApplied = antClientePayments.reduce((a: number, p: any) => a + (Number(p?.amountUSD ?? 0) || 0), 0);
-      if (totalApplied > 0.005) {
+      // BILL-SEC-01: cruzar por reserva [USD] / [VES] (mismo criterio que el panel) y validar cierre al centavo.
+      const antPool = (p: any): 'USD' | 'VES' => {
+        const u = String(p?.note ?? '').toUpperCase();
+        return u.includes('[VES]') ? 'VES' : 'USD';
+      };
+      const byPool: Record<'USD' | 'VES', number> = { USD: 0, VES: 0 };
+      for (const p of antClientePayments) {
+        byPool[antPool(p)] += Number(p?.amountUSD ?? 0) || 0;
+      }
+      const TOL = 0.05;
+      for (const cur of ['USD', 'VES'] as const) {
+        const need = roundMoney(byPool[cur]);
+        if (need <= 0.005) continue;
+        let applied = 0;
         try {
-          await this.applyClientAdvance({
+          applied = await this.applyClientAdvance({
             customerId: sale.client.id,
-            amountToApplyUSD: totalApplied,
+            amountToApplyUSD: need,
             appliedInCorrelativo: finalCorrelativo,
-            appliedInSaleId: String(finalSale.id ?? '')
+            appliedInSaleId: String(finalSale.id ?? ''),
+            advanceCurrency: cur
           });
-          console.log(`[ANTICIPO] Aplicado anticipo: $${totalApplied.toFixed(2)} en factura ${finalCorrelativo}`);
         } catch (e) {
-          console.warn('No se pudo aplicar anticipo de cliente:', e);
+          console.error('[ANTICIPO] Error aplicando anticipo de cliente (' + cur + '):', e);
+          throw new Error(
+            `BILL-SEC-01: No se pudo cruzar el anticipo ${cur} (error al guardar). ` +
+              `Solicitado: $${need.toFixed(2)}. No continúe hasta revisar Finanzas → Anticipos. ` +
+              (e instanceof Error ? e.message : '')
+          );
         }
+        if (applied + TOL < need) {
+          throw new Error(
+            `BILL-SEC-01: El anticipo ${cur} en la factura ($${need.toFixed(2)}) excede el saldo cruzable ` +
+              `(aplicado: $${applied.toFixed(2)}). Ajuste los renglones o verifique anticipos. Nota: la venta pudo quedar ` +
+              `registrada en inventario: revise el correlativo ${finalCorrelativo}.`
+          );
+        }
+        console.log(`[ANTICIPO] Aplicado anticipo [${cur}]: $${applied.toFixed(2)} / $${need.toFixed(2)} en factura ${finalCorrelativo}`);
       }
     }
 
@@ -9223,6 +11669,157 @@ export class DataService {
     }
   }
 
+  // ─── VALIDACIÓN ATÓMICA DE STOCK (BILL-SEC-02) ───────────────────────────────
+  /**
+   * Valida disponibilidad real de stock en Supabase antes de descontar.
+   * Consulta el estado actual de los lotes y verifica que haya suficiente cantidad.
+   * @returns { valid: true } si hay stock suficiente, o { valid: false, errors: [...] } con detalles de faltantes
+   */
+  async validateStockAvailability(items: BillingItem[]): Promise<{ valid: boolean; errors?: Array<{ code: string; requested: number; available: number; batchId?: string }> }> {
+    const errors: Array<{ code: string; requested: number; available: number; batchId?: string }> = [];
+    
+    for (const item of items) {
+      const product = this.products.find(p => p.code === item.code);
+      if (!product) continue; // Producto no encontrado en caché, se maneja en el flujo principal
+      
+      // Consultar lotes actuales en Supabase (no usar caché local para validación crítica)
+      const { data: currentBatches, error } = await supabase
+        .from('inventory_batches')
+        .select('id, quantity')
+        .eq('product_code', item.code)
+        .gt('quantity', 0)
+        .order('expiry_date', { ascending: true });
+      
+      if (error) {
+        console.error(`[validateStockAvailability] Error consultando lotes para ${item.code}:`, error);
+        // En caso de error de red, rechazar la validación para evitar sobreventa
+        errors.push({ code: item.code, requested: item.qty, available: 0, batchId: 'DB_ERROR' });
+        continue;
+      }
+      
+      const totalAvailable = (currentBatches || []).reduce((sum, b) => sum + (Number(b.quantity) || 0), 0);
+      
+      if (totalAvailable < item.qty - 0.0001) { // tolerancia 0.0001 para decimales
+        errors.push({ 
+          code: item.code, 
+          requested: item.qty, 
+          available: totalAvailable 
+        });
+      }
+    }
+    
+    return { valid: errors.length === 0, errors: errors.length > 0 ? errors : undefined };
+  }
+
+  /**
+   * Reserva stock de manera atómica usando UPDATE con condición WHERE quantity >= needed.
+   * Si no puede reservar todo el lote, retorna false sin modificar nada.
+   * @returns { success: true, reserved: [...] } o { success: false, code: string, available: number }
+   */
+  async reserveStockAtomic(item: BillingItem, sortedLotes: Array<{ id: string; qty: number; expiry: Date; warehouse: string }>, correlativo: string): Promise<{ 
+    success: boolean; 
+    reserved?: Array<{ warehouse: string; batchId: string; qty: number }>;
+    error?: { code: string; requested: number; available: number; batchId: string };
+  }> {
+    const reserved: Array<{ warehouse: string; batchId: string; qty: number }> = [];
+    let remaining = item.qty;
+    
+    for (const lote of sortedLotes) {
+      if (remaining <= 0.0001) break;
+      
+      const toReserve = Math.min(lote.qty, remaining);
+      if (toReserve <= 0.0001) continue;
+      
+      // Optimistic locking con retry: leer valor actual, intentar update condicional
+      // basado en valor exacto. Si otro proceso modificó el lote, reintentar.
+      const MAX_OPT_RETRIES = 3;
+      let attemptOk = false;
+      let lastAvailable = 0;
+      for (let optAttempt = 0; optAttempt < MAX_OPT_RETRIES; optAttempt++) {
+        const { data: current, error: readErr } = await supabase
+          .from('inventory_batches')
+          .select('quantity, warehouse')
+          .eq('id', lote.id)
+          .single();
+        if (readErr || !current) {
+          return {
+            success: false,
+            error: { code: item.code, requested: toReserve, available: 0, batchId: lote.id }
+          };
+        }
+        const currentQty = Number(current.quantity ?? 0);
+        lastAvailable = currentQty;
+        if (currentQty + 0.0001 < toReserve) {
+          // No hay suficiente stock realmente
+          return {
+            success: false,
+            error: { code: item.code, requested: toReserve, available: currentQty, batchId: lote.id }
+          };
+        }
+        const newQty = currentQty - toReserve;
+        // Update condicional sólo si la cantidad sigue siendo la leída (optimistic lock)
+        const { data: updated, error: updErr } = await supabase
+          .from('inventory_batches')
+          .update({ quantity: newQty })
+          .eq('id', lote.id)
+          .eq('quantity', currentQty)
+          .select('id')
+          .maybeSingle();
+        if (!updErr && updated) {
+          attemptOk = true;
+          break;
+        }
+        // colisión: otro proceso modificó el valor; reintentar tras pequeño backoff
+        await new Promise(resolve => setTimeout(resolve, 50 * (optAttempt + 1)));
+      }
+      if (!attemptOk) {
+        return {
+          success: false,
+          error: { code: item.code, requested: toReserve, available: lastAvailable, batchId: lote.id }
+        };
+      }
+      
+      // Éxito: registrar movimiento de inventario
+      try {
+        await this.insertMovementWithFallback({
+          product_code: item.code,
+          type: 'SALE',
+          quantity: -toReserve,
+          warehouse: lote.warehouse,
+          reason: `Venta ${correlativo} (reserva atómica)`,
+          operator: this.currentUser?.name || 'SISTEMA',
+          date: new Date().toISOString()
+        });
+      } catch (e) {
+        console.warn('[reserveStockAtomic] No se pudo registrar movimiento:', e);
+        // Continuar aunque falle el movimiento, el stock ya se descontó
+      }
+      
+      reserved.push({
+        warehouse: lote.warehouse,
+        batchId: lote.id,
+        qty: toReserve
+      });
+      
+      remaining -= toReserve;
+    }
+    
+    // Si quedó pendiente por falta de lotes, reportar error
+    if (remaining > 0.0001) {
+      return { 
+        success: false, 
+        error: { 
+          code: item.code, 
+          requested: item.qty, 
+          available: item.qty - remaining,
+          batchId: 'INSUFFICIENT_BATCHES'
+        } 
+      };
+    }
+    
+    return { success: true, reserved };
+  }
+
   // ─── ANULACIÓN DE VENTA (VOID SALE) ─────────────────────────────────────────
 
   async voidSale(saleId: string, reason: string, authorizedBy: string): Promise<{ success: boolean; error?: string }> {
@@ -9231,7 +11828,30 @@ export class DataService {
       return { success: false, error: 'Permiso denegado: Se requiere autorización para anular ventas' };
     }
 
+    const lockRef = doc(db, 'sale_void_locks', String(saleId ?? '').trim());
+    let lockAcquired = false;
     try {
+      // INT-05: lock distribuido para evitar doble anulación concurrente entre pestañas/dispositivos.
+      await runTransaction(db, async (tx) => {
+        const snap = await tx.get(lockRef);
+        const now = Date.now();
+        const ttlMs = 5 * 60 * 1000;
+        if (snap.exists()) {
+          const d = snap.data() as any;
+          const createdAtMs = Number(d?.createdAtMs ?? 0) || 0;
+          if (createdAtMs > 0 && (now - createdAtMs) < ttlMs) {
+            throw new Error('Esta venta ya está siendo anulada por otra sesión. Intente nuevamente en unos segundos.');
+          }
+        }
+        tx.set(lockRef, {
+          saleId: String(saleId ?? ''),
+          actor: this.currentUser?.name ?? authorizedBy ?? 'SISTEMA',
+          createdAtMs: now,
+          createdAt: new Date(now).toISOString()
+        });
+      });
+      lockAcquired = true;
+
       // Buscar la venta en memoria o en Supabase
       let saleToVoid = this.sales.find(s => s.id === saleId);
       
@@ -9265,6 +11885,7 @@ export class DataService {
 
       const voidTimestamp = new Date().toISOString();
       const voidCorrelativo = `VOID-${saleToVoid.correlativo}`;
+      const voidAmountUSD = Math.round((Number((saleToVoid as any)?.totalUSD ?? 0) || 0) * 100) / 100;
 
       // 1. Revertir el stock si la venta tenía items con lotes (BILL-FIX-02: UPDATE directo, sin RPC)
       if (saleToVoid.items && saleToVoid.items.length > 0) {
@@ -9334,15 +11955,49 @@ export class DataService {
         return { success: false, error: 'Error al actualizar el estado de la venta' };
       }
 
-      // 3. Revertir sale_payments en Firestore.
+      if (voidAmountUSD > 0.005) {
+        try {
+          await this.createLedgerFromAmount({
+            operationType: 'SALE_VOID',
+            amountUSD: voidAmountUSD,
+            originOperationId: String(saleId ?? ''),
+            operationDate: voidTimestamp,
+            description: `Anulación de venta ${saleToVoid.correlativo}`,
+            currency: 'USD',
+            metadata: {
+              module: 'BILLING',
+              saleId: String(saleId ?? ''),
+              correlativoOriginal: String(saleToVoid.correlativo ?? ''),
+              correlativoVoid: voidCorrelativo,
+              reason,
+              authorizedBy
+            }
+          });
+        } catch (ledgerError: any) {
+          await this.postLedgerAlert('Fallo al generar asiento de anulación de venta', {
+            saleId: String(saleId ?? ''),
+            correlativo: String(saleToVoid.correlativo ?? ''),
+            message: String(ledgerError?.message ?? ledgerError ?? '')
+          });
+          return { success: false, error: `Venta anulada, pero falló el asiento contable: ${String(ledgerError?.message ?? ledgerError ?? '')}` };
+        }
+      }
+
+      // 3. Revertir sale_payments en Firestore (marcar como VOID, no eliminar - auditoría).
       // Importante: NO eliminar bank_transactions originales (auditoría append-only).
       try {
         const salePaySnap = await getDocs(query(collection(db, 'sale_payments'), where('saleId', '==', saleId)));
         for (const d of salePaySnap.docs) {
-          await deleteDoc(d.ref);
+          await updateDoc(d.ref, {
+            status: 'VOID',
+            voidedAt: voidTimestamp,
+            voidedBy: this.currentUser?.name || authorizedBy,
+            voidReason: `Venta anulada: ${reason}`,
+            updatedAt: voidTimestamp
+          });
         }
       } catch (e) {
-        console.warn('VOID: no se pudieron eliminar sale_payments:', e);
+        console.warn('VOID: no se pudieron marcar sale_payments como anulados:', e);
       }
 
       try {
@@ -9389,18 +12044,19 @@ export class DataService {
         `Venta anulada: ${saleToVoid.correlativo} | Cliente: ${saleToVoid.client?.name || 'N/A'} | Total: $${saleToVoid.totalUSD?.toFixed(2) || 0} | Motivo: ${reason} | Autorizado por: ${authorizedBy}`
       );
 
-      // 5. Si es venta a crédito, actualizar la entrada en AR como anulada
+      // 5. Si es venta a crédito, actualizar la entrada en AR como anulada (Firestore)
       if (saleToVoid.paymentMethod === 'CREDIT' || saleToVoid.paymentMethod === 'credit') {
         const arEntries = this.getAREntries();
         const arEntry = arEntries.find(ar => ar.saleCorrelativo === saleToVoid.correlativo);
         if (arEntry) {
-          await supabase.from('ar_entries').update({
+          await updateDoc(doc(db, 'ar_entries', arEntry.id), {
             status: 'VOID',
             balanceUSD: 0,
-            void_reason: `Venta anulada: ${reason}`,
-            voided_by: this.currentUser?.name || authorizedBy,
-            voided_at: voidTimestamp
-          }).eq('id', arEntry.id);
+            voidReason: `Venta anulada: ${reason}`,
+            voidedBy: this.currentUser?.name || authorizedBy,
+            voidedAt: voidTimestamp,
+            updatedAt: voidTimestamp
+          });
         }
       }
 
@@ -9420,7 +12076,16 @@ export class DataService {
       return { success: true };
     } catch (error) {
       console.error('Error anulando venta:', error);
-      return { success: false, error: 'Error interno al procesar la anulación' };
+      const msg = error instanceof Error ? error.message : 'Error interno al procesar la anulación';
+      return { success: false, error: msg };
+    } finally {
+      if (lockAcquired) {
+        try {
+          await deleteDoc(lockRef);
+        } catch {
+          // Evitar romper el flujo por error de liberación de lock.
+        }
+      }
     }
   }
 
@@ -9504,11 +12169,38 @@ export class DataService {
       (String(params.saleId ?? '').trim() && `id:${String(params.saleId).trim()}`) ||
       (String(params.saleCorrelativo ?? '').trim() && `c:${String(params.saleCorrelativo).trim()}`) ||
       'return-unknown';
+    const returnLockId =
+      (String(params.saleId ?? '').trim() && `id-${String(params.saleId).trim()}`) ||
+      (String(params.saleCorrelativo ?? '').trim() && `c-${String(params.saleCorrelativo).trim()}`) ||
+      'unknown';
+    const returnLockRef = doc(db, 'sale_return_locks', returnLockId);
+    let returnLockAcquired = false;
     if (this.partialReturnSaleFlight.has(returnFlightKey)) {
       return { success: false, error: 'Ya se está procesando una devolución de esta factura. Espere a que finalice.' };
     }
     this.partialReturnSaleFlight.add(returnFlightKey);
     try {
+      await runTransaction(db, async (tx) => {
+        const snap = await tx.get(returnLockRef);
+        const now = Date.now();
+        const ttlMs = 5 * 60 * 1000;
+        if (snap.exists()) {
+          const d = snap.data() as any;
+          const createdAtMs = Number(d?.createdAtMs ?? 0) || 0;
+          if (createdAtMs > 0 && (now - createdAtMs) < ttlMs) {
+            throw new Error('Ya se está procesando una devolución parcial para esta factura desde otra sesión.');
+          }
+        }
+        tx.set(returnLockRef, {
+          saleId: String(params.saleId ?? ''),
+          saleCorrelativo: String(params.saleCorrelativo ?? ''),
+          actor: this.currentUser?.name ?? params.authorizedBy ?? 'SISTEMA',
+          createdAtMs: now,
+          createdAt: new Date(now).toISOString()
+        });
+      });
+      returnLockAcquired = true;
+
       let saleForValidation: SaleHistoryEntry | null =
         (this.sales.find(
           (s: any) =>
@@ -9652,7 +12344,7 @@ export class DataService {
               userReason: params.reason,
               batchLabel: `Lote: ${String(dispatch.batchId)} · ${dispatch.warehouse}`
             });
-            await supabase.from('inventory_movements').insert({
+            await this.insertInventoryMovementWithFallback({
               type: 'SALE_RETURN',
               sku: item.code,
               quantity: revertQty,
@@ -9706,7 +12398,7 @@ export class DataService {
                 userReason: params.reason,
                 batchLabel: `Lote: ${String(batch.id)} (FIFO) · ${String(batch.warehouse ?? 'Galpon D3')}`
               });
-              await supabase.from('inventory_movements').insert({
+              await this.insertInventoryMovementWithFallback({
                 type: 'SALE_RETURN',
                 sku: item.code,
                 quantity: revertQty,
@@ -9752,7 +12444,7 @@ export class DataService {
                 userReason: params.reason,
                 batchLabel: `Lote nuevo: ${String((newBatch as any).id)} · ${warehouse}`
               });
-              await supabase.from('inventory_movements').insert({
+              await this.insertInventoryMovementWithFallback({
                 type: 'SALE_RETURN',
                 sku: item.code,
                 quantity: item.qty,
@@ -9956,6 +12648,13 @@ export class DataService {
       console.error('Error en devolución parcial:', error);
       return { success: false, error: error?.message || 'Error interno al procesar la devolución' };
     } finally {
+      if (returnLockAcquired) {
+        try {
+          await deleteDoc(returnLockRef);
+        } catch {
+          // Evitar error funcional por falla al liberar lock.
+        }
+      }
       this.partialReturnSaleFlight.delete(returnFlightKey);
     }
   }
@@ -10004,7 +12703,7 @@ export class DataService {
     }
 
     // Registrar movimiento de traslado
-    await supabase.from('movements').insert({
+    await this.insertMovementWithFallback({
       product_code: sku,
       type: 'TRANSFER',
       quantity: qty,
@@ -10065,14 +12764,40 @@ export class DataService {
     return roundMoney(entries.reduce((acc, e) => acc + (Number(e.balanceUSD) || 0), 0));
   }
 
+  getAPBalanceForClient(name: string, id: string = ''): number {
+    const entries = this.findAPEntriesForClient(name, id);
+    return roundMoney(entries.reduce((acc, e) => acc + (Number(e.balanceUSD) || 0), 0));
+  }
+
   private async applyAPOffsetBySale(clientName: string, amountUSD: number, saleCorrelativo: string, clientId?: string) {
     if (amountUSD <= 0) return;
     const pending = this.findAPEntriesForClient(clientName, clientId || '')
       .sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
+    if (pending.length === 0) return;
 
     let remaining = amountUSD;
+    let hasLocalChanges = false;
     for (const entry of pending) {
       if (remaining <= 0) break;
+
+      // Candado idempotente por AP + correlativo de venta:
+      // si el pago ya fue registrado antes, no volver a descontar saldo.
+      try {
+        const existingByReference = await getDocs(
+          query(
+            collection(db, 'ap_entries', entry.id, 'payments'),
+            where('reference', '==', saleCorrelativo),
+            where('method', '==', 'venta'),
+            limit(1)
+          )
+        );
+        if (!existingByReference.empty) {
+          console.warn(`[CXP] Duplicado evitado: ya existe abono para AP ${entry.id} con referencia ${saleCorrelativo}.`);
+          continue;
+        }
+      } catch (dupCheckError) {
+        console.warn('[CXP] No se pudo validar duplicado en historial AP, se continúa con flujo normal:', dupCheckError);
+      }
 
       const discount = Math.min(remaining, entry.balanceUSD);
       const newBalance = roundMoney(entry.balanceUSD - discount);
@@ -10109,6 +12834,15 @@ export class DataService {
         throw new Error(`No se pudo actualizar el saldo en la base de datos: ${updateError.message}`);
       }
 
+      // Reflejar inmediatamente en memoria para que el saldo CxP visible
+      // se actualice sin requerir recarga/manual init.
+      entry.balanceUSD = newBalance;
+      if (newBalance <= 0.005) {
+        entry.balanceUSD = 0;
+        entry.status = 'PAID';
+      }
+      hasLocalChanges = true;
+
       // 2. Registrar Auditoría en Feed
       await this.addExpense(
         `[OFICIAL] CxP ACTUALIZADO: ${entry.supplier} - Nuevo Saldo $${newBalance.toFixed(2)} (vía ${saleCorrelativo})`,
@@ -10125,6 +12859,8 @@ export class DataService {
 
       remaining = roundMoney(remaining - discount);
     }
+
+    if (hasLocalChanges) this.notify();
 
     // Si queda saldo restante después de agotar AP, el sistema lo ignora o podría reportarlo
     // En este caso lo dejamos así para no complicar el flujo
@@ -10212,40 +12948,65 @@ export class DataService {
     amountToApplyUSD: number;
     appliedInCorrelativo: string;
     appliedInSaleId: string;
+    /** Coherente con renglones [USD]/[VES] en facturación. Si se omite, FIFO sobre todo el saldo (p. ej. CxC Finanzas). */
+    advanceCurrency?: 'USD' | 'VES';
   }): Promise<number> {
     const advances = await this.getClientAdvances(params.customerId);
-    const sorted = advances.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    const ac = params.advanceCurrency;
+    const inPool = (adv: ClientAdvance) => {
+      if (!ac) return true;
+      if (ac === 'USD') return (adv.currency ?? 'USD') === 'USD';
+      return adv.currency === 'VES';
+    };
+    const sorted = advances.filter(inPool).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     let remaining = roundMoney(params.amountToApplyUSD);
 
     for (const adv of sorted) {
       if (remaining <= 0.005) break;
-      const discount = roundMoney(Math.min(adv.balanceUSD, remaining));
-      if (discount <= 0) continue;
-
-      const newBalance = roundMoney(adv.balanceUSD - discount);
-      const newStatus: ClientAdvance['status'] = newBalance <= 0.005 ? 'APPLIED' : 'PARTIAL';
-
+      let appliedNow = 0;
       try {
-        await updateDoc(doc(db, 'client_advances', adv.id), {
-          balanceUSD: newBalance,
-          status: newStatus,
-          updatedAt: new Date().toISOString(),
-          lastAppliedInCorrelativo: params.appliedInCorrelativo,
-          lastAppliedInSaleId: params.appliedInSaleId
-        });
-        await addDoc(collection(db, 'client_advances', adv.id, 'applications'), {
-          appliedUSD: discount,
-          remainingAfter: newBalance,
-          appliedInCorrelativo: params.appliedInCorrelativo,
-          appliedInSaleId: params.appliedInSaleId,
-          appliedAt: new Date().toISOString(),
-          actor: this.currentUser?.name ?? ''
+        const advRef = doc(db, 'client_advances', adv.id);
+        const appRef = doc(collection(db, 'client_advances', adv.id, 'applications'));
+        await runTransaction(db, async (tx) => {
+          const snap = await tx.get(advRef);
+          if (!snap.exists()) return;
+          const data = snap.data() as any;
+          const currentBalance = roundMoney(Number(data?.balanceUSD ?? 0) || 0);
+          if (currentBalance <= 0.005) return;
+
+          appliedNow = roundMoney(Math.min(currentBalance, remaining));
+          if (appliedNow <= 0.005) {
+            appliedNow = 0;
+            return;
+          }
+
+          let newBalance = roundMoney(currentBalance - appliedNow);
+          if (newBalance <= 0.005) newBalance = 0;
+          const newStatus: ClientAdvance['status'] = newBalance <= 0 ? 'APPLIED' : 'PARTIAL';
+          const nowIso = new Date().toISOString();
+
+          tx.update(advRef, {
+            balanceUSD: newBalance,
+            status: newStatus,
+            updatedAt: nowIso,
+            lastAppliedInCorrelativo: params.appliedInCorrelativo,
+            lastAppliedInSaleId: params.appliedInSaleId
+          });
+          tx.set(appRef, {
+            appliedUSD: appliedNow,
+            remainingAfter: newBalance,
+            appliedInCorrelativo: params.appliedInCorrelativo,
+            appliedInSaleId: params.appliedInSaleId,
+            appliedAt: nowIso,
+            actor: this.currentUser?.name ?? ''
+          });
         });
       } catch (e) {
         console.warn('Error aplicando anticipo de cliente:', e);
       }
-
-      remaining = roundMoney(remaining - discount);
+      if (appliedNow > 0.005) {
+        remaining = roundMoney(remaining - appliedNow);
+      }
     }
 
     return roundMoney(params.amountToApplyUSD - remaining);
@@ -10307,24 +13068,34 @@ export class DataService {
     ));
     const advance = snap.docs.find(d => d.id === params.advanceId);
     if (!advance) throw new Error('Anticipo no encontrado');
-    const data = advance.data() as any;
-    const currentBalance = Number(data.balanceUSD ?? 0);
-    const toApply = Math.min(currentBalance, params.amountToApplyUSD);
-    if (toApply <= 0.005) throw new Error('Monto a aplicar inválido o saldo insuficiente');
-    const newBalance = roundMoney(currentBalance - toApply);
-    const newStatus: ClientAdvance['status'] = newBalance <= 0.005 ? 'APPLIED' : 'PARTIAL';
-    await updateDoc(advance.ref, {
-      balanceUSD: newBalance,
-      status: newStatus,
-      updatedAt: new Date().toISOString()
-    });
-    await addDoc(collection(db, 'client_advances', params.advanceId, 'applications'), {
-      appliedUSD: toApply,
-      remainingAfter: newBalance,
-      appliedInCorrelativo: params.referenceNote,
-      appliedInSaleId: 'MANUAL',
-      appliedAt: new Date().toISOString(),
-      actor: params.actor
+    let toApply = 0;
+    await runTransaction(db, async (tx) => {
+      const currentSnap = await tx.get(advance.ref);
+      if (!currentSnap.exists()) throw new Error('Anticipo no encontrado');
+      const data = currentSnap.data() as any;
+      const currentBalance = roundMoney(Number(data?.balanceUSD ?? 0) || 0);
+      toApply = roundMoney(Math.min(currentBalance, params.amountToApplyUSD));
+      if (toApply <= 0.005) throw new Error('Monto a aplicar inválido o saldo insuficiente');
+
+      let newBalance = roundMoney(currentBalance - toApply);
+      if (newBalance <= 0.005) newBalance = 0;
+      const newStatus: ClientAdvance['status'] = newBalance <= 0 ? 'APPLIED' : 'PARTIAL';
+      const nowIso = new Date().toISOString();
+      const appRef = doc(collection(db, 'client_advances', params.advanceId, 'applications'));
+
+      tx.update(advance.ref, {
+        balanceUSD: newBalance,
+        status: newStatus,
+        updatedAt: nowIso
+      });
+      tx.set(appRef, {
+        appliedUSD: toApply,
+        remainingAfter: newBalance,
+        appliedInCorrelativo: params.referenceNote,
+        appliedInSaleId: 'MANUAL',
+        appliedAt: nowIso,
+        actor: params.actor
+      });
     });
     this.addAuditEntry('FINANCE', 'ADVANCE_MANUAL_APPLY',
       `Anticipo ${params.advanceId} aplicado manualmente: $${toApply.toFixed(2)} · ${params.referenceNote}`);
@@ -10458,31 +13229,49 @@ export class DataService {
 
     for (const adv of sorted) {
       if (remaining <= 0.005) break;
-      const discount = roundMoney(Math.min(adv.balanceUSD, remaining));
-      if (discount <= 0) continue;
-
-      const newBalance = roundMoney(adv.balanceUSD - discount);
-      const newStatus: SupplierAdvance['status'] = newBalance <= 0.005 ? 'APPLIED' : 'PARTIAL';
-
+      let appliedNow = 0;
       try {
-        await updateDoc(doc(db, 'supplier_advances', adv.id), {
-          balanceUSD: newBalance,
-          status: newStatus,
-          updatedAt: new Date().toISOString(),
-          apEntryApplied: params.apEntryId
-        });
-        await addDoc(collection(db, 'supplier_advances', adv.id, 'applications'), {
-          appliedUSD: discount,
-          remainingAfter: newBalance,
-          apEntryId: params.apEntryId,
-          appliedAt: new Date().toISOString(),
-          actor: this.currentUser?.name ?? ''
+        const advRef = doc(db, 'supplier_advances', adv.id);
+        const appRef = doc(collection(db, 'supplier_advances', adv.id, 'applications'));
+        await runTransaction(db, async (tx) => {
+          const snap = await tx.get(advRef);
+          if (!snap.exists()) return;
+          const data = snap.data() as any;
+          const currentBalance = roundMoney(Number(data?.balanceUSD ?? 0) || 0);
+          if (currentBalance <= 0.005) return;
+
+          appliedNow = roundMoney(Math.min(currentBalance, remaining));
+          if (appliedNow <= 0.005) {
+            appliedNow = 0;
+            return;
+          }
+
+          let newBalance = roundMoney(currentBalance - appliedNow);
+          if (newBalance <= 0.005) newBalance = 0;
+          const newStatus: SupplierAdvance['status'] = newBalance <= 0 ? 'APPLIED' : 'PARTIAL';
+          const nowIso = new Date().toISOString();
+
+          tx.update(advRef, {
+            balanceUSD: newBalance,
+            status: newStatus,
+            updatedAt: nowIso,
+            apEntryApplied: params.apEntryId
+          });
+          tx.set(appRef, {
+            appliedUSD: appliedNow,
+            remainingAfter: newBalance,
+            apEntryId: params.apEntryId,
+            appliedAt: nowIso,
+            actor: this.currentUser?.name ?? ''
+          });
         });
       } catch (e) {
         console.warn('Error aplicando anticipo de proveedor:', e);
       }
 
-      remaining = roundMoney(remaining - discount);
+      if (appliedNow > 0.005) {
+        remaining = roundMoney(remaining - appliedNow);
+      }
     }
 
     const applied = roundMoney(params.amountToApplyUSD - remaining);
@@ -10512,26 +13301,35 @@ export class DataService {
     ));
     const advance = snap.docs.find(d => d.id === params.advanceId);
     if (!advance) throw new Error('Anticipo de proveedor no encontrado');
-    const data = advance.data() as any;
-    const currentBalance = Number(data.balanceUSD ?? 0);
-    const toApply = roundMoney(Math.min(currentBalance, params.amountToApplyUSD));
-    if (toApply <= 0.005) throw new Error('Monto a aplicar inválido o saldo insuficiente');
-    const newBalance = roundMoney(currentBalance - toApply);
-    const newStatus: SupplierAdvance['status'] = newBalance <= 0.005 ? 'APPLIED' : 'PARTIAL';
+    let toApply = 0;
+    await runTransaction(db, async (tx) => {
+      const currentSnap = await tx.get(advance.ref);
+      if (!currentSnap.exists()) throw new Error('Anticipo de proveedor no encontrado');
+      const data = currentSnap.data() as any;
+      const currentBalance = roundMoney(Number(data?.balanceUSD ?? 0) || 0);
+      toApply = roundMoney(Math.min(currentBalance, params.amountToApplyUSD));
+      if (toApply <= 0.005) throw new Error('Monto a aplicar inválido o saldo insuficiente');
 
-    await updateDoc(advance.ref, {
-      balanceUSD: newBalance,
-      status: newStatus,
-      updatedAt: new Date().toISOString(),
-      ...(params.apEntryId ? { apEntryApplied: params.apEntryId } : {})
-    });
-    await addDoc(collection(db, 'supplier_advances', params.advanceId, 'applications'), {
-      appliedUSD: toApply,
-      remainingAfter: newBalance,
-      referenceNote: params.referenceNote,
-      apEntryId: params.apEntryId ?? 'MANUAL',
-      appliedAt: new Date().toISOString(),
-      actor: params.actor
+      let newBalance = roundMoney(currentBalance - toApply);
+      if (newBalance <= 0.005) newBalance = 0;
+      const newStatus: SupplierAdvance['status'] = newBalance <= 0 ? 'APPLIED' : 'PARTIAL';
+      const nowIso = new Date().toISOString();
+      const appRef = doc(collection(db, 'supplier_advances', params.advanceId, 'applications'));
+
+      tx.update(advance.ref, {
+        balanceUSD: newBalance,
+        status: newStatus,
+        updatedAt: nowIso,
+        ...(params.apEntryId ? { apEntryApplied: params.apEntryId } : {})
+      });
+      tx.set(appRef, {
+        appliedUSD: toApply,
+        remainingAfter: newBalance,
+        referenceNote: params.referenceNote,
+        apEntryId: params.apEntryId ?? 'MANUAL',
+        appliedAt: nowIso,
+        actor: params.actor
+      });
     });
 
     if (params.apEntryId) {

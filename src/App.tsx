@@ -54,33 +54,22 @@ import { CashBoxBreakdownLine, dataService, PermissionKey } from './services/dat
 import { alertService, InventoryAlert } from './services/alertService';
 import { sessionService } from './services/sessionService';
 import { AccountingAlert } from './services/dataService';
+import { formatDateVE, getVenezuelaDateKey, isSameDayVE } from './utils/dateTimeVE';
 
 type EBProps = { children: React.ReactNode };
 type EBState = { hasError: boolean; error: string };
-class ErrorBoundary extends React.Component<EBProps, EBState> {
-  state: EBState = { hasError: false, error: '' };
-  static getDerivedStateFromError(e: any): EBState { return { hasError: true, error: String(e?.message ?? e) }; }
-  componentDidCatch(e: any) { console.error('[ErrorBoundary]', e); }
-  render() {
-    if (this.state.hasError) {
-      return (
-        <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
-          <AlertCircle className="w-12 h-12 text-red-500" />
-          <p className="text-lg font-black text-slate-800">Error en este módulo</p>
-          <p className="text-sm text-slate-500 font-mono max-w-lg text-center">{this.state.error}</p>
-          <button onClick={() => this.setState({ hasError: false, error: '' })} className="px-6 py-2 bg-slate-900 text-white rounded-xl text-sm font-black uppercase tracking-widest hover:bg-slate-700 transition-all">Reintentar</button>
-        </div>
-      );
-    }
-    return this.props.children;
-  }
+function ErrorBoundary({ children }: EBProps) {
+  // Fallback no destructivo mientras se corrige el tipado del boundary de clase.
+  return <>{children}</>;
 }
 
 export default function App() {
   const [firebaseUser, setFirebaseUser] = useState<FirebaseUser | null | 'loading'>('loading');
+  const [internalUserReady, setInternalUserReady] = useState(false);
   const [isFirstTimeSetup, setIsFirstTimeSetup] = useState(false);
   const [hasExistingUsers, setHasExistingUsers] = useState<boolean | null>(null);
   const [loadingTimedOut, setLoadingTimedOut] = useState(false);
+  const [authLinkError, setAuthLinkError] = useState<string | null>(null);
   const sessionUidRef = React.useRef<string | null>(null);
 
   // Timeout de seguridad: máximo 5 segundos en pantalla de carga
@@ -108,31 +97,59 @@ export default function App() {
       if (user && loadingTimedOut) {
         setLoadingTimedOut(false);
       }
+      if (user) {
+        setAuthLinkError(null);
+      }
       // Limpiar sessionUidRef cuando el usuario cierra sesión
       if (!user) {
         sessionUidRef.current = null;
         sessionService.clearSession();
         dataService.switchUser(''); // Reset user in dataService
+        setInternalUserReady(false);
       }
       if (user) {
+        setInternalUserReady(false);
         // Si ya hay una sesión activa en esta pestaña y el UID es distinto,
         // es un cambio de auth de otra pestaña — ignorar para no pisar al usuario actual.
         if (sessionUidRef.current && sessionUidRef.current !== user.uid) return;
         // Esperar a que los usuarios estén cargados desde Firestore y buscar por firebaseUid o email
         dataService.ensureUsersRealtimeSync();
+        const activateInternalUser = (internalUserId: string): boolean => {
+          const targetId = String(internalUserId ?? '').trim();
+          if (!targetId) return false;
+          dataService.switchUser(targetId);
+          const switched = dataService.getCurrentUser();
+          if (String(switched?.id ?? '').trim() !== targetId) return false;
+          sessionUidRef.current = user.uid;
+          setAuthLinkError(null);
+          setInternalUserReady(true);
+          sessionService.startSession();
+          try {
+            dataService.reloadAfterAuth();
+          } catch (e) {
+            console.warn('No se pudo re-inicializar dataService tras login:', e);
+          }
+          dataService.getCashBoxSessions();
+          return true;
+        };
         // Intentar hasta 3 segundos para que el listener de Firestore cargue
         let attempts = 0;
         const tryMatch = async () => {
+          const authEmail = String(user.email ?? '').trim().toLowerCase();
           const matched = dataService.getUsers().find(
-            u => u.firebaseUid === user.uid || u.email === user.email
+            u =>
+              String(u.firebaseUid ?? '').trim() === String(user.uid ?? '').trim() ||
+              String(u.email ?? '').trim().toLowerCase() === authEmail
           );
           if (matched) {
-            sessionUidRef.current = user.uid;
-            dataService.switchUser(matched.id);
-            // Iniciar servicio de sesión con timeout
-            sessionService.startSession();
-            // Forzar listener de cashbox_sessions con el usuario ya identificado
-            dataService.getCashBoxSessions();
+            const activated = activateInternalUser(String(matched.id ?? ''));
+            if (!activated) {
+              if (attempts < 10) {
+                attempts++;
+                setTimeout(tryMatch, 300);
+              }
+              return;
+            }
             // Aplicar cambio de contraseña pendiente si existe
             try {
               const { doc, getDoc, updateDoc } = await import('firebase/firestore');
@@ -152,6 +169,40 @@ export default function App() {
           } else if (attempts < 6) {
             attempts++;
             setTimeout(tryMatch, 500);
+          } else {
+            // Fallback defensivo: consulta directa a Firestore por si el cache/listener aún no se actualizó.
+            try {
+              const { collection, getDocs } = await import('firebase/firestore');
+              const { db } = await import('./services/firebaseConfig');
+              const usersSnap = await getDocs(collection(db, 'users'));
+              const direct = usersSnap.docs
+                .map((d) => ({ id: d.id, ...(d.data() as any) }))
+                .find((u: any) => {
+                  const uidMatch = String(u?.firebaseUid ?? u?.firebase_uid ?? '').trim() === String(user.uid ?? '').trim();
+                  const emailMatch = String(u?.email ?? '').trim().toLowerCase() === authEmail;
+                  return uidMatch || emailMatch;
+                });
+              if (direct?.id) {
+                const activated = activateInternalUser(String(direct.id));
+                if (!activated && attempts < 10) {
+                  attempts++;
+                  setTimeout(tryMatch, 300);
+                  return;
+                }
+                return;
+              }
+            } catch (fallbackErr) {
+              console.error('Fallback de vinculación Auth->Users falló:', fallbackErr);
+            }
+
+            // Evita abrir el shell con usuario fallback ("SISTEMA"/otro) cuando no hubo mapeo real.
+            console.error('No se pudo vincular usuario Firebase con usuario interno:', { uid: user.uid, email: user.email });
+            setAuthLinkError('No pudimos vincular tu cuenta con un usuario interno activo. Verifica permisos o vínculo en Seguridad.');
+            sessionUidRef.current = null;
+            sessionService.clearSession();
+            dataService.switchUser('');
+            setInternalUserReady(false);
+            await authService.signOut();
           }
         };
         tryMatch();
@@ -191,6 +242,11 @@ export default function App() {
     }
     return (
       <div className="min-h-screen bg-gradient-to-br from-[#022c22] via-[#064e3b] to-[#022c22] flex flex-col items-center justify-center p-4">
+        {authLinkError && (
+          <div className="mb-4 max-w-md w-full rounded-2xl border border-red-300/40 bg-red-500/10 px-4 py-3">
+            <p className="text-[11px] font-black uppercase tracking-wide text-red-200">{authLinkError}</p>
+          </div>
+        )}
         <LoginView onSuccess={() => {}} />
         {hasExistingUsers === false && (
           <button
@@ -200,6 +256,17 @@ export default function App() {
             ¿Primera vez? Configurar usuario Master
           </button>
         )}
+      </div>
+    );
+  }
+
+  if (!internalUserReady) {
+    return (
+      <div className="min-h-screen bg-[#022c22] flex items-center justify-center">
+        <div className="flex flex-col items-center gap-4">
+          <img src="/logo.png" alt="Costal" className="w-16 h-16 object-contain opacity-60 animate-pulse" />
+          <p className="text-emerald-400 text-[10px] font-black uppercase tracking-widest">Inicializando perfil y permisos...</p>
+        </div>
       </div>
     );
   }
@@ -357,7 +424,7 @@ function AppShell() {
   }, [inactivityWarning]);
 
   useEffect(() => {
-    const today = new Date().toISOString().split('T')[0];
+    const today = getVenezuelaDateKey();
     const savedData = localStorage.getItem('internalRateData');
     if (savedData) {
       const parsed = safeJsonParse<{ date?: string; rate?: number }>(savedData, {});
@@ -372,7 +439,7 @@ function AppShell() {
   }, []);
 
   const handleSetInternalRate = (rate: number) => {
-    const today = new Date().toISOString().split('T')[0];
+    const today = getVenezuelaDateKey();
     const oldRate = internalRate;
     localStorage.setItem('internalRateData', JSON.stringify({ date: today, rate: rate }));
     setInternalRate(rate);
@@ -595,7 +662,7 @@ function AppShell() {
           <div className={`w-full overflow-y-auto ${activeTab === 'sales' ? 'flex-1 min-h-0 p-2 md:p-4 lg:p-5 xl:p-6' : 'p-4 xl:p-8 space-y-6 xl:space-y-8 max-w-7xl mx-auto'}`}>
             {activeTab === 'dashboard' && canAccess('DASHBOARD_VIEW') && <DashboardView exchangeRates={exchangeRate} accountingAlerts={accountingAlerts} />}
             {activeTab === 'inventory' && canAccess('INVENTORY_READ') && <InventoryView exchangeRate={exchangeRate.bcv} />}
-            {activeTab === 'sales' && canAccess('BILLING') && <BillingView scaleWeight={mockWeight} exchangeRateBCV={exchangeRate.bcv} exchangeRateInternal={internalRate} arCollectionMode={arCollectionMode} onClearARCollectionMode={() => setArCollectionMode(null)} />}
+            {activeTab === 'sales' && canAccess('BILLING') && <BillingView scaleWeight={mockWeight} exchangeRateBCV={exchangeRate.bcv} exchangeRateInternal={internalRate} arCollectionMode={arCollectionMode} onClearARCollectionMode={() => setArCollectionMode(null)} activeCashSession={currentSession} />}
             {activeTab === 'fractionation' && canAccess('FRACTIONATION') && (
               <FractionationView 
                 scaleWeight={mockWeight}
@@ -607,7 +674,7 @@ function AppShell() {
               />
             )}
             {activeTab === 'closing' && canAccess('CLOSING_VIEW') && <ErrorBoundary><ClosingView exchangeRateBCV={exchangeRate.bcv} exchangeRateParallel={exchangeRate.parallel} exchangeRateInternal={internalRate} /></ErrorBoundary>}
-            {activeTab === 'finance' && canAccess('FINANCE_VIEW') && <FinanceView exchangeRate={exchangeRate.bcv} onStartARCollection={(data) => { setArCollectionMode(data); setActiveTab('sales'); }} />}
+            {activeTab === 'finance' && canAccess('FINANCE_VIEW') && <FinanceView exchangeRate={exchangeRate.bcv} internalRate={internalRate} onStartARCollection={(data) => { setArCollectionMode(data); setActiveTab('sales'); }} />}
             {activeTab === 'reports' && canAccess('REPORTS_VIEW') && <ReportsView />}
             {activeTab === 'security' && canAccess('SECURITY_VIEW') && <SecurityView />}
           </div>
@@ -949,11 +1016,10 @@ function Sidebar({ activeTab, setActiveTab, currentUser }: { activeTab: string, 
               if (saved) {
                 const parsed = JSON.parse(saved);
                 const date = new Date(parsed.date);
-                const today = new Date().toDateString();
-                const isToday = date.toDateString() === today;
+                const isToday = isSameDayVE(date, new Date());
                 return (
                   <span className={`text-[7px] font-bold px-1 py-0.5 rounded ${isToday ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'}`}>
-                    {isToday ? 'HOY' : date.toLocaleDateString('es-VE', { day: 'numeric', month: 'short' })}
+                    {isToday ? 'HOY' : formatDateVE(date, { day: 'numeric', month: 'short' })}
                   </span>
                 );
               }
@@ -974,7 +1040,7 @@ function Sidebar({ activeTab, setActiveTab, currentUser }: { activeTab: string, 
                 Caja: {currentSession ? 'Abierta' : 'Cerrada'}
               </span>
               {currentUser.role === 'ADMIN' && (() => {
-                const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+                const cutoff = getVenezuelaDateKey(Date.now() - 24 * 60 * 60 * 1000);
                 const openCount = dataService.getCashBoxSessions().filter(s => s.status === 'OPEN' && s.openDate >= cutoff).length;
                 return openCount > 1 ? (
                   <span className="px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-700 text-[8px] font-black">

@@ -27,11 +27,12 @@ import { ClientModal } from '../modals/ClientModal';
 import { ItemSearchModal } from '../modals/ItemSearchModal';
 import { CalculatorModal } from '../modals/CalculatorModal';
 import { clientService } from '../../services/clientService';
-import { dataService, ClientAdvance } from '../../services/dataService';
+import { dataService, ClientAdvance, type CashBoxSession } from '../../services/dataService';
 import { printService, LetraOptions } from '../../services/printService';
 import { useToast } from '../../hooks/useToast';
 import { ToastContainer } from '../Toast';
 import { ConfirmModal } from '../ConfirmModal';
+import { formatDateVE, formatTimeVE } from '../../utils/dateTimeVE';
 
 function QuantityInput({ value, onChange, unit, max, onError }: { value: number, onChange: (val: number) => void, unit: string, max: number, onError?: (msg: string) => void }) {
   const [strValue, setStrValue] = React.useState(value.toString().replace('.', ','));
@@ -88,6 +89,8 @@ export interface PaymentEntry {
 
 interface BillingSession {
   id: string;
+  /** Idempotency key por intento de facturación (INT-01). */
+  saleRequestId?: string;
   client: BillingClient | null;
   items: BillingItem[];
   payments: PaymentEntry[];
@@ -116,7 +119,7 @@ const GENERIC_CASH_CLIENT: BillingClient = {
   creditDays: 0
 };
 
-export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRateInternal = 42.50, arCollectionMode, onClearARCollectionMode }: { scaleWeight?: number, exchangeRateBCV?: number, exchangeRateInternal?: number, arCollectionMode?: { active: boolean; arEntryId: string; customerId: string; customerName: string; balanceUSD: number; balanceVES: number; description: string; saleCorrelativo: string; } | null, onClearARCollectionMode?: () => void }) {
+export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRateInternal = 42.50, arCollectionMode, onClearARCollectionMode, activeCashSession }: { scaleWeight?: number, exchangeRateBCV?: number, exchangeRateInternal?: number, arCollectionMode?: { active: boolean; arEntryId: string; customerId: string; customerName: string; balanceUSD: number; balanceVES: number; description: string; saleCorrelativo: string; } | null, onClearARCollectionMode?: () => void, activeCashSession?: CashBoxSession | null }) {
   const { toasts, showToast, removeToast } = useToast();
   
   // Session Management
@@ -172,6 +175,8 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
   const [activeSessionId, setActiveSessionId] = useState(sessions[0].id);
 
   const currentSession = sessions.find(s => s.id === activeSessionId) || sessions[0];
+  const effectiveCashSession = activeCashSession ?? dataService.getCurrentCashBoxSession();
+  const hasCashBoxOpen = !!effectiveCashSession && effectiveCashSession.status === 'OPEN';
   const [realtimeTick, setRealtimeTick] = useState(0);
   const activeClient = React.useMemo(() => {
     if (!currentSession.client) return null;
@@ -348,8 +353,46 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
       others: 'Otros',
       credit: 'Crédito'
     };
-    return map[k] || (k ? k.replace(/_/g, ' ') : 'N/A');
+    if (map[k]) return map[k];
+    if (k.includes('pago_movil') || k === 'movil' || k === 'pmovil') return 'Pago móvil';
+    if (k.includes('transfer')) return 'Transferencia';
+    if (k.includes('efectivo_usd') || k.includes('cash usd')) return 'USD efectivo';
+    if (k.includes('efectivo_bs') || k.includes('efectivo_ves') || k.includes('cash ves')) return 'Bs efectivo';
+    return k ? k.replace(/_/g, ' ') : 'N/A';
   };
+  const paymentMethodVisualIcon = (key: string) => {
+    const k = String(key ?? '').toLowerCase().trim();
+    if (k === 'mobile' || k.includes('pago_movil') || k === 'movil' || k === 'pmovil') return '📱';
+    if (k === 'transfer' || k.includes('transfer')) return '🏦';
+    if (k === 'debit') return '💳';
+    if (k === 'biopago') return '🧬';
+    if (k === 'cash_usd' || k.includes('efectivo_usd')) return '💵';
+    if (k === 'cash_ves' || k.includes('efectivo_ves') || k.includes('efectivo_bs')) return '💶';
+    if (k === 'zelle' || k === 'digital_usd') return '🌐';
+    if (k === 'credit') return '🧾';
+    return '🔹';
+  };
+  const returnOriginalPaymentLines = useMemo(() => {
+    if (!saleToReturn) return [] as Array<{ method: string; bank: string; amountUSD: number; amountVES: number; rateUsed: number }>;
+    const payments = Array.isArray((saleToReturn as any)?.payments) ? (saleToReturn as any).payments : [];
+    const lines = payments
+      .filter((p: any) => !p?.cashChangeGiven && String(p?.method ?? '') !== 'credit')
+      .map((p: any) => ({
+        method: String(p?.method ?? saleToReturn.paymentMethod ?? ''),
+        bank: String(p?.bank ?? p?.bankName ?? ''),
+        amountUSD: Number(p?.amountUSD ?? 0) || 0,
+        amountVES: Number(p?.amountVES ?? 0) || 0,
+        rateUsed: Number(p?.rateUsed ?? p?.exchangeRate ?? saleToReturn?.exchangeRate ?? 0) || 0
+      }));
+    if (lines.length > 0) return lines;
+    return [{
+      method: String(saleToReturn.paymentMethod ?? ''),
+      bank: '',
+      amountUSD: Number(saleToReturn.totalUSD ?? 0) || 0,
+      amountVES: Number(saleToReturn.totalVES ?? 0) || 0,
+      rateUsed: Number((saleToReturn as any)?.exchangeRate ?? 0) || 0
+    }];
+  }, [saleToReturn]);
   const returnAutoPreview = useMemo(() => {
     if (!saleToReturn) return { totalUSD: 0, ratio: 0, lines: [] as Array<{ method: string; bank: string; amountUSD: number; amountVES: number; rateUsed: number }> };
     const rm = (n: number) => Math.round((Number(n || 0) + Number.EPSILON) * 100) / 100;
@@ -359,22 +402,7 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
     }, 0);
     const saleTotalUSD = Number(saleToReturn.totalUSD ?? 0) || 0;
     const ratio = saleTotalUSD > 0 ? Math.max(0, Math.min(1, totalUSD / saleTotalUSD)) : 0;
-    const sourceLines = (Array.isArray((saleToReturn as any)?.payments) ? (saleToReturn as any).payments : [])
-      .filter((p: any) => !p?.cashChangeGiven && String(p?.method ?? '') !== 'credit')
-      .map((p: any) => ({
-        method: String(p?.method ?? saleToReturn.paymentMethod ?? ''),
-        bank: String(p?.bank ?? p?.bankName ?? ''),
-        amountUSD: Number(p?.amountUSD ?? 0) || 0,
-        amountVES: Number(p?.amountVES ?? 0) || 0,
-        rateUsed: Number(p?.rateUsed ?? p?.exchangeRate ?? saleToReturn?.exchangeRate ?? 0) || 0
-      }));
-    const base = sourceLines.length > 0 ? sourceLines : [{
-      method: String(saleToReturn.paymentMethod ?? ''),
-      bank: '',
-      amountUSD: Number(saleToReturn.totalUSD ?? 0) || 0,
-      amountVES: Number(saleToReturn.totalVES ?? 0) || 0,
-      rateUsed: Number((saleToReturn as any)?.exchangeRate ?? 0) || 0
-    }];
+    const base = returnOriginalPaymentLines;
     const lines = base.map((l) => ({
       ...l,
       amountUSD: rm(l.amountUSD * ratio),
@@ -389,7 +417,7 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
       lines[0].amountVES = rm(lines[0].amountVES + (targetVES - currentVES));
     }
     return { totalUSD, ratio, lines };
-  }, [saleToReturn, returnQtys]);
+  }, [saleToReturn, returnQtys, returnOriginalPaymentLines]);
   const [salesHistoryPage, setSalesHistoryPage] = useState(0);
   const SALES_HISTORY_PAGE_SIZE = 20;
   const [confirmModal, setConfirmModal] = useState<{ open: boolean; title: string; message: string; danger?: boolean; onConfirm: () => void }>({ open: false, title: '', message: '', onConfirm: () => {} });
@@ -548,21 +576,21 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
   // Suscribir al historial de ventas del turno activo desde Firestore (cashbox_sales)
   const subscribedSessionIdRef = React.useRef<string>('');
   useEffect(() => {
-    const activeCashSession = dataService.getCurrentCashBoxSession();
-    const sessionId = activeCashSession?.id ?? '';
-    const isOpen = activeCashSession?.status === 'OPEN';
+    const liveCashSession = activeCashSession ?? dataService.getCurrentCashBoxSession();
+    const sessionId = liveCashSession?.id ?? '';
+    const isOpen = liveCashSession?.status === 'OPEN';
 
     if (isOpen && sessionId && subscribedSessionIdRef.current !== sessionId) {
       subscribedSessionIdRef.current = sessionId;
       dataService.subscribeCurrentSessionSales(sessionId);
-    } else if (!isOpen && activeCashSession) {
+    } else if (!isOpen && liveCashSession) {
       // Sesión confirmada como cerrada — limpiar
       if (subscribedSessionIdRef.current) {
         subscribedSessionIdRef.current = '';
         dataService.clearCurrentSessionSales();
       }
     }
-  }, [realtimeTick]);
+  }, [realtimeTick, activeCashSession?.id, activeCashSession?.status]);
   
   useEffect(() => {
     const unsubscribeData = dataService.subscribe(() => setRealtimeTick((t) => t + 1));
@@ -631,6 +659,7 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
     'F3': () => setShowCalculator(true),
     'F4': () => setShowClientModal(true),
     'F10': () => {
+      if (!hasCashBoxOpen) { showToast('No hay sesión de caja abierta. Abra la caja primero.', 'error'); return; }
       if (currentSession.items.length === 0) { showToast('No hay productos en la venta.', 'warning'); return; }
       setShowProcessConfirm(true);
     },
@@ -770,6 +799,27 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
     paymentUSD = roundMoney(paymentUSD);
 
     if (!Number.isFinite(paymentUSD) || paymentUSD <= 0) return;
+
+    const methodUpper = String(arPayMethod ?? '').trim().toUpperCase();
+    const bankUpper = String(arPayBank ?? '').trim().toUpperCase();
+    const noteUpper = String(arPayNote ?? '').trim().toUpperCase();
+    const isCxpCollection =
+      (methodUpper === 'OTHERS' || methodUpper === 'OTRO')
+      && (bankUpper.includes('CXP') || noteUpper.includes('CXP') || noteUpper.includes('RECONCILIACION'));
+    if (isCxpCollection) {
+      const arEntry = dataService.getAREntries().find((e) => String(e.id) === String(arPayTargetId));
+      const customerName = String(arEntry?.customerName ?? '').trim();
+      const customerId = String(arEntry?.customerId ?? '').trim();
+      const apPendingUSD = dataService.getAPBalanceForClient(customerName, customerId);
+      if (apPendingUSD <= 0.005) {
+        showToast('No hay CxP pendiente para este cliente/proveedor. Cambie el método o revise CxP.', 'warning');
+        return;
+      }
+      if (paymentUSD - apPendingUSD > 0.005) {
+        showToast(`Monto CxP excedido: intenta cobrar $${paymentUSD.toFixed(2)} y solo hay $${apPendingUSD.toFixed(2)} en CxP.`, 'warning');
+        return;
+      }
+    }
 
     setArPaySubmitting(true);
     setArPayError('');
@@ -940,7 +990,7 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
   const closeSession = (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
     if (sessions.length === 1) {
-      updateCurrentSession({ items: [], payments: [], client: null, searchClientId: '', captures: [], label: 'Venta 1', selectedIds: [], globalDiscount: undefined, saleNotes: '' });
+      updateCurrentSession({ items: [], payments: [], client: null, searchClientId: '', captures: [], label: 'Venta 1', selectedIds: [], globalDiscount: undefined, saleNotes: '', saleRequestId: undefined });
       return;
     }
     const sessionToClose = sessions.find(s => s.id === id);
@@ -982,11 +1032,8 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
   const isCreditUSDMode = currentPayMethod === 'credit' && creditCurrency === 'USD';
   const isCreditVESMode = currentPayMethod === 'credit' && creditCurrency === 'VES';
   const totalUSD = (usdMethods.has(currentPayMethod) || isCreditUSDMode) ? totalUSDNominal : totalUSDInternalized;
-  const totalVES = usdMethods.has(currentPayMethod)
-    ? roundMoney(totalUSDNominal * exchangeRateBCV)
-    : isCreditVESMode
-      ? roundMoney(totalUSDNominal * internalRateNumber)  // VES usa tasa interna
-      : roundMoney(totalUSDNominal * internalRateNumber);
+  // Facturación en Bs siempre a tasa interna (requisito operativo).
+  const totalVES = roundMoney(totalUSDNominal * internalRateNumber);
 
   // 4. Cálculos de pagos recibidos
   const vesMethodSet = new Set(['cash_ves', 'mobile', 'transfer', 'debit', 'biopago']);
@@ -1005,6 +1052,15 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
     .reduce((acc, p) => acc + (p.amountVES || 0), 0);
   const paymentsExcludingDxV = currentSession.payments.filter(p => !(p.method === 'others' && (String(p.bank ?? '').toUpperCase() === 'DXV' || String(p.bank ?? '') === 'Ant. Cliente')));
 
+  // Ant. Cliente se excluye de `paymentsExcludingDxV` (criterio contable / DxV), pero en vista VES su abono
+  // equivale a Bs a tasa interna y debe descontarse del faltante (evita falso Bs. 65 = 0,1×650, etc.).
+  const antClientePaidAsVES = currentSession.payments
+    .filter(p => p.method === 'others' && String(p.bank ?? '') === 'Ant. Cliente' && p.method !== 'credit')
+    .reduce((a, p) => {
+      if ((p.amountVES || 0) > 0.005) return a + (p.amountVES || 0);
+      return a + (p.amountUSD || 0) * internalRateNumber;
+    }, 0);
+
   // 5. Detección de moneda dominante
   const vesValuePaid = paymentsExcludingDxV.filter(p => vesMethodSet.has(p.method)).reduce((a, p) => a + (p.amountVES || 0), 0);
   const usdValuePaid = paymentsExcludingDxV.filter(p => !vesMethodSet.has(p.method)).reduce((a, p) => a + (p.amountUSD || 0) * internalRateNumber, 0);
@@ -1013,14 +1069,19 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
 
   // 6. Cálculos de vuelto/overpayment
   const hasAnyCreditPayment = currentSession.payments.some(p => p.method === 'credit');
-  const usdPaidAsVESForOverpayment = registeredPaymentsAreVES
+  const usdFromNonVesExclDxV = registeredPaymentsAreVES
+    ? paymentsExcludingDxV.filter(p => !vesMethodSet.has(p.method)).reduce((a, p) => a + (p.amountUSD || 0) * internalRateNumber, 0)
+    : 0;
+  const usdFromNonVesExclDxVNoCredit = registeredPaymentsAreVES
     ? paymentsExcludingDxV.filter(p => !vesMethodSet.has(p.method) && p.method !== 'credit').reduce((a, p) => a + (p.amountUSD || 0) * internalRateNumber, 0)
     : 0;
+  const usdPaidAsVES = usdFromNonVesExclDxV + (registeredPaymentsAreVES ? antClientePaidAsVES : 0);
+  const usdPaidAsVESForOverpayment = usdFromNonVesExclDxVNoCredit + (registeredPaymentsAreVES ? antClientePaidAsVES : 0);
   const nominalTotalForPaid = registeredPaymentsAreVES ? roundMoney(totalUSDNominal * internalRateNumber) : totalUSDNominal;
   const overpaymentUSD = (registeredPaymentsAreVES || hasAnyCreditPayment) ? 0 : roundFX(Math.max(0, currentTotalPaidUSD - totalUSDNominal));
   const overpaymentVES = (!registeredPaymentsAreVES || hasAnyCreditPayment) ? 0 : roundMoney(Math.max(0, currentTotalPaidVES + usdPaidAsVESForOverpayment - nominalTotalForPaid));
   const realRemainingUSD = registeredPaymentsAreVES ? 0 : roundFX(Math.max(0, totalUSDNominal - currentTotalPaidUSD));
-  const realRemainingVES = registeredPaymentsAreVES ? roundMoney(Math.max(0, nominalTotalForPaid - currentTotalPaidVES)) : 0;
+  const realRemainingVES = registeredPaymentsAreVES ? roundMoney(Math.max(0, nominalTotalForPaid - currentTotalPaidVES - usdPaidAsVES)) : 0;
 
   // 7. Flags de selección de banco/método
   const isCxPSelected = String(payBank).toUpperCase() === 'CXP';
@@ -1041,14 +1102,24 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
   const isBsMethod = currentPayMethod === 'cash_ves' || currentPayMethod === 'mobile' || currentPayMethod === 'transfer' || currentPayMethod === 'debit' || currentPayMethod === 'biopago';
   const missingInVES = registeredPaymentsAreVES || isBsMethod || isCxPVESMode;
   const missingLabel = missingInVES ? 'Bs.' : '$';
-  const usdPaidAsVES = registeredPaymentsAreVES
-    ? paymentsExcludingDxV.filter(p => !vesMethodSet.has(p.method)).reduce((a, p) => a + (p.amountUSD || 0) * internalRateNumber, 0)
-    : 0;
+  const settlementVesRate = exchangeRateBCV > 0 ? exchangeRateBCV : internalRateNumber;
+  const toVesEquivalentFromUSD = (p: any) => {
+    const isAntCliente = p.method === 'others' && String(p.bank ?? '') === 'Ant. Cliente';
+    // FIX BILL-ANT-01: Los anticipos del cliente (Ant. Cliente) representan saldo USD
+    // del cliente. Como `totalVES` se calcula con `internalRateNumber`, la equivalencia
+    // de los anticipos en Bs DEBE usar la misma tasa interna (independientemente de si
+    // el anticipo fue registrado como [USD] o [VES]). Si se usa BCV aquí mientras el total
+    // se calcula a tasa interna, se infla artificialmente el faltante en Bs.
+    // En cobros directos USD->Bs (cash_usd, zelle) sí usar BCV (settlementVesRate)
+    // para reflejar el cambio efectivo de divisas en caja.
+    const rate = isAntCliente ? internalRateNumber : settlementVesRate;
+    return (Number(p.amountUSD ?? 0) || 0) * (Number(rate) || 1);
+  };
   // Cuando el método activo es VES y hay pagos USD previos (ej: anticipo USD), descontar su equiv. Bs del total VES pendiente
   const usdAlreadyPaidAsVES = isBsMethod && !registeredPaymentsAreVES
     ? currentSession.payments
         .filter(p => p.method !== 'credit' && !vesMethodSet.has(p.method))
-        .reduce((a, p) => a + (p.amountUSD || 0) * internalRateNumber, 0)
+        .reduce((a, p) => a + toVesEquivalentFromUSD(p), 0)
     : 0;
   const remainingVESAdjusted = Math.max(0, roundMoney(remainingVES - usdAlreadyPaidAsVES));
   const missingValue = registeredPaymentsAreVES
@@ -1057,6 +1128,9 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
     : isCxPVESMode ? Math.max(0, roundMoney(totalVES - currentTotalPaidVES))
     : (isCxPSelected || isDxVSelected) ? Math.max(0, roundFX(totalUSDNominal - currentTotalPaidUSD))
     : missingInVES ? effectiveRemainingVES : effectiveRemainingUSD;
+  const confirmTotalUSD = (hasAnyCreditPayment && creditCurrency === 'VES') || registeredPaymentsAreVES
+    ? totalUSDInternalized
+    : totalUSDNominal;
 
   // 9. Cálculos de crédito
   const pendingCreditUSD = roundMoney(currentSession.payments.filter((p) => p.method === 'credit').reduce((acc, p) => acc + (p.amountUSD || 0), 0));
@@ -1359,7 +1433,9 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
         const hasAnyVesInMix = nonDxVPayments.some(p => isOperationalVESPayment(p));
         if (paymentsAreVES || hasAnyVesInMix) {
           // Comparar en VES: también sumar equiv. Bs de los pagos USD del mix
-          const usdMixAsVES = nonDxVPayments.filter(p => !isOperationalVESPayment(p)).reduce((a,p) => a+(p.amountUSD||0)*internalRateNumber, 0);
+          const usdMixAsVES = nonDxVPayments
+            .filter(p => !isOperationalVESPayment(p))
+            .reduce((a,p) => a + toVesEquivalentFromUSD(p), 0);
           const realMissingVES = roundMoney(Math.max(0, totalVESNominalForCheck - realPaidVES - usdMixAsVES - effectiveDxVDiscountVES));
           if (realMissingVES > allowVesMissing) {
             showToast(`Falta por cobrar: Bs.${realMissingVES.toFixed(2)}`, 'warning');
@@ -1533,31 +1609,50 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
       const _fTotalPaid = _fVesPaid + _fUsdPaid;
       const finalPaymentsAreVES = finalNonDxV.length > 0 && _fTotalPaid > 0 && (_fVesPaid / _fTotalPaid) >= 0.6;
       const hasAnyVesInFinalMix = finalNonDxV.some(p => isOperationalVESFinalPayment(p));
-      if (finalPaymentsAreVES || hasAnyVesInFinalMix || isDxVVESFinal) {
-        // Modo VES: comparar en bolívares, incluir equiv. Bs de pagos USD del mix
-        const paidVESTotal = finalNonDxV
-          .filter(p => isOperationalVESFinalPayment(p))
-          .reduce((acc, p) => acc + (p.amountVES || 0), 0);
-        const usdMixAsVESFinal = finalNonDxV.filter(p => !isOperationalVESFinalPayment(p)).reduce((a,p) => a+(p.amountUSD||0)*internalRateNumber, 0);
-        const requiredVES = roundMoney(totalUSDNominal * internalRateNumber);
-        const missingVES = roundMoney(Math.max(0, requiredVES - paidVESTotal - usdMixAsVESFinal - dxvFinalVES));
-        if (missingVES > 0.5) {
-          showToast(`Pago insuficiente: Faltan Bs.${missingVES.toFixed(2)} por registrar.`, 'warning');
-          return;
-        }
-      } else {
-        // Modo USD: comparar en dólares
-        const payTotal = finalNonDxV.reduce((acc, p) => acc + p.amountUSD, 0);
-        const requiredTotalUSD = (isCxPUSDMethod || isAntClienteUSDMethod) ? totalUSDNominal : totalUSD;
-        const requiredAfterDxV = roundFX(requiredTotalUSD - dxvFinalUSD);
-        // Seguridad: el DxV no puede ser el único cobro (debe haber al menos un pago real)
-        if (dxvFinalUSD > 0 && finalNonDxV.length === 0) {
-          showToast('Pago insuficiente: El DxV es un ajuste contable, debe haber un pago real.', 'warning');
-          return;
-        }
-        if (payTotal < requiredAfterDxV - 0.05) {
-          showToast(`Pago insuficiente: Faltan $${(requiredAfterDxV - payTotal).toFixed(3)} por registrar.`, 'warning');
-          return;
+      // Venta solo con renglón(s) a crédito: no comparar "pago" vs total aquí; el monto se valida al agregar
+      // el crédito. Si no, se mezclaba USD ref. BCV (totalUSD) con amountUSD a veces en base nominal
+      // y aparecía un faltante falso (~nominal×(int/BCV−1)).
+      const isOnlyNonDxVCredit =
+        finalNonDxV.length > 0 && finalNonDxV.every(p => p.method === 'credit');
+      if (!isOnlyNonDxVCredit) {
+        if (finalPaymentsAreVES || hasAnyVesInFinalMix || isDxVVESFinal) {
+          // Modo VES: comparar en bolívares, incluir equiv. Bs de pagos USD del mix
+          // FIX BILL-ANT-02: Los anticipos Ant. Cliente [VES] se almacenan con amountVES=0
+          // (ver addPayment línea ~2108: isAntClienteMode ? 0 : ...). Para validar correctamente
+          // su aporte en Bs, usar amountUSD * internalRateNumber como fallback cuando amountVES=0.
+          const paidVESTotal = finalNonDxV
+            .filter(p => isOperationalVESFinalPayment(p))
+            .reduce((acc, p) => {
+              const isAntClienteVES =
+                p.method === 'others' &&
+                String(p.bank ?? '') === 'Ant. Cliente' &&
+                String(p.note ?? '').includes('[VES]');
+              if (isAntClienteVES && (p.amountVES || 0) < 0.005) {
+                return acc + (p.amountUSD || 0) * internalRateNumber;
+              }
+              return acc + (p.amountVES || 0);
+            }, 0);
+          const usdMixAsVESFinal = finalNonDxV.filter(p => !isOperationalVESFinalPayment(p)).reduce((a, p) => a + (p.amountUSD || 0) * internalRateNumber, 0);
+          const requiredVES = roundMoney(totalUSDNominal * internalRateNumber);
+          const missingVES = roundMoney(Math.max(0, requiredVES - paidVESTotal - usdMixAsVESFinal - dxvFinalVES));
+          if (missingVES > 0.5) {
+            showToast(`Pago insuficiente: Faltan Bs.${missingVES.toFixed(2)} por registrar.`, 'warning');
+            return;
+          }
+        } else {
+          // Modo USD: comparar en dólares
+          const payTotal = finalNonDxV.reduce((acc, p) => acc + p.amountUSD, 0);
+          const requiredTotalUSD = (isCxPUSDMethod || isAntClienteUSDMethod) ? totalUSDNominal : totalUSD;
+          const requiredAfterDxV = roundFX(requiredTotalUSD - dxvFinalUSD);
+          // Seguridad: el DxV no puede ser el único cobro (debe haber al menos un pago real)
+          if (dxvFinalUSD > 0 && finalNonDxV.length === 0) {
+            showToast('Pago insuficiente: El DxV es un ajuste contable, debe haber un pago real.', 'warning');
+            return;
+          }
+          if (payTotal < requiredAfterDxV - 0.05) {
+            showToast(`Pago insuficiente: Faltan $${(requiredAfterDxV - payTotal).toFixed(3)} por registrar.`, 'warning');
+            return;
+          }
         }
       }
 
@@ -1580,6 +1675,7 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
             amountVES: p.amountVES,
             bank: p.bank,
             reference: p.reference,
+            note: p.note,
             currency: p.currency || 'USD',
             rateUsed: p.rateUsed || exchangeRateInternal
           }));
@@ -1620,7 +1716,7 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
             
             // Reset session
             if (sessions.length === 1) {
-              updateCurrentSession({ items: [], payments: [], client: null, searchClientId: '', captures: [], label: 'Venta 1', selectedIds: [], globalDiscount: undefined, saleNotes: '' });
+              updateCurrentSession({ items: [], payments: [], client: null, searchClientId: '', captures: [], label: 'Venta 1', selectedIds: [], globalDiscount: undefined, saleNotes: '', saleRequestId: undefined });
             } else {
               closeSession(activeSessionId, { stopPropagation: () => {} } as any);
             }
@@ -1711,7 +1807,17 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
         }
       }
 
+      const requestId =
+        String(currentSession.saleRequestId ?? '').trim()
+        || (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
+      if (!currentSession.saleRequestId) {
+        updateCurrentSession({ saleRequestId: requestId });
+      }
+
       const processedSale = await dataService.registerSale({
+        clientRequestId: requestId,
         correlativo: finalCorrelativo,
         client,
         items: adjustedItems,
@@ -1838,7 +1944,7 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
         setChangeDeclared(false); setChangeAsAdvance(false); setChangeMethod('cash_ves'); setChangeBank(''); setChangeCustomRate('');
         // Limpiar la sesión ANTES de mostrar el modal para que el usuario no vea la factura vieja
         if (sessions.length === 1) {
-          updateCurrentSession({ items: [], payments: [], captures: [], client: null, searchClientId: '', label: 'Venta 1', selectedIds: [] });
+          updateCurrentSession({ items: [], payments: [], captures: [], client: null, searchClientId: '', label: 'Venta 1', selectedIds: [], saleRequestId: undefined });
         } else {
           const cid = currentSession.id;
           const newSessions = sessions.filter(s => s.id !== cid);
@@ -1930,11 +2036,10 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
       const baseRemainingUSD = creditCurrency === 'USD' ? totalUSDNominal : remainingUSD;
       const downUSD = Math.max(0, Math.min(baseRemainingUSD, creditDownPaymentUSD));
       const baseOutstandingUSD = Math.max(0, roundMoney(baseRemainingUSD - downUSD));
-      // En modo USD: creditUSD = saldo nominal, creditVES = nominal × BCV
-      // En modo VES: creditUSD = saldo internalizado (ya viene inflado), creditVES = saldo × tasa interna
-      const creditUSD = creditCurrency === 'USD'
-        ? Math.max(0, roundMoney(baseOutstandingUSD))
-        : Math.max(0, roundMoney(baseOutstandingUSD * (exchangeRateBCV > 0 ? internalRateNumber / exchangeRateBCV : 1)));
+      // USD: el restante está en precio nominal (lista) → $ en AR y Bs a tasa BCV.
+      // VES: `remainingUSD` / `baseOutstandingUSD` ya vienen de `effectiveTotalUSD` = `totalUSDInternalized`
+      // (no son nominales). No multiplicar otra vez por tasa int/BCV: eso inflaba el crédito (~BCV/USD "duplicado").
+      const creditUSD = Math.max(0, roundMoney(baseOutstandingUSD));
       const creditVES = creditCurrency === 'USD'
         ? roundMoney(baseOutstandingUSD * exchangeRateBCV)
         : roundMoney(baseOutstandingUSD * internalRateNumber);
@@ -2039,6 +2144,31 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
                         : isBsMethod ? amountFloat
                         : isAntClienteMode ? 0
                         : isCxPUSDMode ? (amountFloat * exchangeRateBCV) : (amountFloat * rateForVES);
+
+    // BILL-SEC-01: no registrar renglones Ant. Cliente por encima del saldo (reserva USD vs [VES] en la nota)
+    if (isAntClienteMode) {
+      const advUSDBal = clientAdvances.filter(a => (a.currency ?? 'USD') === 'USD').reduce((s, a) => s + a.balanceUSD, 0);
+      const advVESBal = clientAdvances.filter(a => a.currency === 'VES').reduce((s, a) => s + a.balanceUSD, 0);
+      const noteU = (payNote || '').toUpperCase();
+      const pool: 'USD' | 'VES' = noteU.includes('[VES]') ? 'VES' : (noteU.includes('[USD]') ? 'USD' : antClienteCurrency);
+      const cap = pool === 'VES' ? advVESBal : advUSDBal;
+      const poolForNote = (n: string | undefined) => (String(n ?? '').toUpperCase().includes('[VES]') ? 'VES' as const : 'USD' as const);
+      const samePoolAlready = currentSession.payments
+        .filter(p => p.method === 'others' && String(p.bank ?? '') === 'Ant. Cliente' && poolForNote(p.note) === pool)
+        .reduce((a, p) => a + (Number(p.amountUSD) || 0), 0);
+      const lineUsd = roundFX(Number(amountInUSD) || 0);
+      if (lineUsd > 0.005 && cap <= 0.005) {
+        showToast(`No hay saldo de anticipo ${pool} para aplicar (disponible: $${cap.toFixed(2)}).`, 'error');
+        return;
+      }
+      if (samePoolAlready + lineUsd > cap + 0.02) {
+        showToast(
+          `Monto de Ant. Cliente [${pool}] excede el saldo. Disponible: $${cap.toFixed(2)}; en esta venta: $${samePoolAlready.toFixed(2)}; renglón: $${lineUsd.toFixed(2)}.`,
+          'error'
+        );
+        return;
+      }
+    }
 
     updateCurrentSession({
       payments: [...currentSession.payments, {
@@ -2186,10 +2316,6 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
         : clientAccountStatus.isSolvent
           ? 'rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-[10px] font-black uppercase text-emerald-700'
           : 'rounded-lg border border-sky-200 bg-sky-50 px-3 py-1.5 text-[10px] font-black uppercase text-sky-700';
-
-  const activeCashSession = dataService.getCurrentCashBoxSession();
-  const hasCashBoxOpen = !!activeCashSession && activeCashSession.status === 'OPEN';
-
   return (
     <div className="flex h-full min-h-0 flex-col gap-0.5 animate-in fade-in duration-500 overflow-hidden bg-slate-50 text-[95%]">
       {/* Banner: Caja no abierta */}
@@ -2208,16 +2334,23 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
           <span className="text-[10px] font-black text-slate-500 uppercase tracking-tight">Sesiones</span>
         </div>
         {sessions.map((s, idx) => (
-          <button
+          <div
             key={s.id}
-            onClick={() => setActiveSessionId(s.id)}
-            className={`shrink-0 h-8 px-3 rounded-full text-[9px] font-black uppercase flex items-center gap-2 transition-all ${activeSessionId === s.id ? 'bg-teal-800 text-white' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}
+            className={`shrink-0 h-8 px-1.5 rounded-full flex items-center gap-1 transition-all ${activeSessionId === s.id ? 'bg-teal-800 text-white' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}
           >
-            <span className="truncate max-w-[100px]">{s.label}</span>
-            <button onClick={(e) => closeSession(s.id, e)} className={`p-0.5 rounded-full hover:bg-red-500 hover:text-white transition-all ${activeSessionId === s.id ? 'text-white/40' : 'text-slate-300'}`}>
+            <button
+              onClick={() => setActiveSessionId(s.id)}
+              className="h-7 px-2 text-[9px] font-black uppercase flex items-center"
+            >
+              <span className="truncate max-w-[100px]">{s.label}</span>
+            </button>
+            <button
+              onClick={(e) => closeSession(s.id, e)}
+              className={`p-0.5 rounded-full hover:bg-red-500 hover:text-white transition-all ${activeSessionId === s.id ? 'text-white/40' : 'text-slate-300'}`}
+            >
               <X className="w-3 h-3" />
             </button>
-          </button>
+          </div>
         ))}
         <button onClick={createNewSession} className="shrink-0 h-8 w-8 bg-teal-700 text-white rounded-full flex items-center justify-center hover:bg-teal-800 transition-all">
           <Plus className="w-4 h-4" />
@@ -2941,7 +3074,7 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
                       const handleDxVModeSwitch = (newMode: 'USD' | 'VES') => {
                         setDxvModeOverride(newMode);
                         // Recalcular el monto en la nueva moneda
-                        const usdMixVES = paymentsExcludingDxV.filter(p => !vesMethodSet.has(p.method)).reduce((a,p)=>a+(p.amountUSD||0)*internalRateNumber,0);
+                        const usdMixVES = paymentsExcludingDxV.filter(p => !vesMethodSet.has(p.method)).reduce((a,p)=>a+(p.amountUSD||0)*internalRateNumber,0) + antClientePaidAsVES;
                         if (newMode === 'VES') {
                           const faltanteVES = roundMoney(Math.max(0, totalVESNominal - alreadyPaidVES - usdMixVES));
                           setPayAmount(faltanteVES.toFixed(2));
@@ -4159,7 +4292,7 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
                               <div className="text-[9px] text-slate-400 font-mono truncate">{ar.description} · {ar.id}</div>
                             </td>
                             <td className="px-4 py-3">
-                              <div className={`text-[11px] font-black ${overdue ? 'text-red-600' : 'text-slate-600'}`}>{new Date(ar.dueDate).toLocaleDateString()}</div>
+                              <div className={`text-[11px] font-black ${overdue ? 'text-red-600' : 'text-slate-600'}`}>{formatDateVE(new Date(ar.dueDate))}</div>
                             </td>
                             <td className="px-4 py-3 text-right font-bold text-slate-400">$ {ar.amountUSD.toFixed(2)}</td>
                             <td className="px-4 py-3 text-right font-black text-slate-900">$ {ar.balanceUSD.toFixed(2)}</td>
@@ -4554,7 +4687,7 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
                           <option value="">Seleccionar...</option>
                           {otherAROptions.map(ar => (
                             <option key={ar.id} value={ar.id}>
-                              {ar.saleCorrelativo} — Saldo ${Number(ar.balanceUSD ?? 0).toFixed(2)} — Vence {new Date(ar.dueDate).toLocaleDateString()}
+                              {ar.saleCorrelativo} — Saldo ${Number(ar.balanceUSD ?? 0).toFixed(2)} — Vence {formatDateVE(new Date(ar.dueDate))}
                             </option>
                           ))}
                         </select>
@@ -4615,7 +4748,17 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
             <div className="p-6 space-y-3">
               <p className="text-[11px] font-black text-slate-500 uppercase tracking-widest text-center mb-4">¿En qué moneda imprimir la factura?</p>
               {(() => {
-                const isCredit = (pendingPrintSale as any)?.creditOutstandingUSD > 0 || pendingPrintSale?.paymentMethod?.toUpperCase() === 'CREDIT';
+                const paymentMethodNormalized = String((pendingPrintSale as any)?.paymentMethod ?? '')
+                  .normalize('NFD')
+                  .replace(/[\u0300-\u036f]/g, '')
+                  .toUpperCase()
+                  .trim();
+                const hasCreditPayment = Array.isArray((pendingPrintSale as any)?.payments)
+                  && (pendingPrintSale as any).payments.some((p: any) => String(p?.method ?? '').toLowerCase() === 'credit');
+                const isCredit = Number((pendingPrintSale as any)?.creditOutstandingUSD ?? 0) > 0
+                  || paymentMethodNormalized === 'CREDIT'
+                  || paymentMethodNormalized === 'CREDITO'
+                  || hasCreditPayment;
                 const handlePrint = (cur: 'USD' | 'VES') => {
                   const sale = pendingPrintSale;
                   setPendingPrintSale(null);
@@ -4626,10 +4769,12 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
                       creditDays: clientCreditDays > 0 ? clientCreditDays : 10,
                       domicilioLibrado: (sale?.client as any)?.address || 'BARQUISIMETO, EDO. LARA',
                       condicionesPago: `A ${clientCreditDays > 0 ? clientCreditDays : 10} DÍAS FECHA`,
+                      librador: 'EMPRENDIMIENTO EL COSTAL',
+                      libradorRif: '',
                     });
                     setPendingLetraConfig({ sale, currency: cur });
                   } else {
-                    printService.printInvoice(sale, cur);
+                    printService.printInvoice(sale, cur, undefined, true);
                   }
                 };
                 return (
@@ -4739,8 +4884,8 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
                   filtered = filtered.filter(s =>
                     s.correlativo.toLowerCase().includes(search) ||
                     s.clientName.toLowerCase().includes(search) ||
-                    s.timestamp.toLocaleDateString().includes(search) ||
-                    s.timestamp.toLocaleTimeString().includes(search)
+                    formatDateVE(s.timestamp).includes(search) ||
+                    formatTimeVE(s.timestamp).includes(search)
                   );
                 }
 
@@ -4764,7 +4909,7 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
                               <span className="bg-emerald-100 text-emerald-700 text-[9px] font-black px-2 py-0.5 rounded">
                                 {sale.correlativo}
                               </span>
-                              <span className="text-[9px] text-slate-400">{sale.timestamp.toLocaleTimeString()}</span>
+                              <span className="text-[9px] text-slate-400">{formatTimeVE(sale.timestamp)}</span>
                             </div>
                             <p className="text-[11px] font-black text-slate-800 truncate">{sale.clientName}</p>
                             <div className="flex items-center gap-3 mt-1">
@@ -4871,7 +5016,17 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
             <div className="p-6 space-y-3">
               <p className="text-[11px] font-black text-slate-500 uppercase tracking-widest text-center mb-4">Seleccione moneda para reimprimir</p>
               {(() => {
-                const isCredit = (saleToReprint as any)?.creditOutstandingUSD > 0 || saleToReprint?.paymentMethod?.toUpperCase() === 'CREDIT';
+                const paymentMethodNormalized = String((saleToReprint as any)?.paymentMethod ?? '')
+                  .normalize('NFD')
+                  .replace(/[\u0300-\u036f]/g, '')
+                  .toUpperCase()
+                  .trim();
+                const hasCreditPayment = Array.isArray((saleToReprint as any)?.payments)
+                  && (saleToReprint as any).payments.some((p: any) => String(p?.method ?? '').toLowerCase() === 'credit');
+                const isCredit = Number((saleToReprint as any)?.creditOutstandingUSD ?? 0) > 0
+                  || paymentMethodNormalized === 'CREDIT'
+                  || paymentMethodNormalized === 'CREDITO'
+                  || hasCreditPayment;
                 const handleReprint = (cur: 'USD' | 'VES') => {
                   const sale = saleToReprint;
                   setSaleToReprint(null);
@@ -4882,10 +5037,12 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
                       creditDays: clientCreditDays > 0 ? clientCreditDays : 10,
                       domicilioLibrado: (sale?.client as any)?.address || 'BARQUISIMETO, EDO. LARA',
                       condicionesPago: `A ${clientCreditDays > 0 ? clientCreditDays : 10} DÍAS FECHA`,
+                      librador: 'EMPRENDIMIENTO EL COSTAL',
+                      libradorRif: '',
                     });
                     setPendingLetraConfig({ sale, currency: cur });
                   } else {
-                    printService.printInvoice(sale, cur);
+                    printService.printInvoice(sale, cur, undefined, true);
                   }
                 };
                 return (
@@ -4930,11 +5087,20 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
                 <div className="h-px bg-slate-200" />
                 <div className="flex justify-between items-center">
                   <span className="text-[9px] font-black uppercase tracking-widest text-slate-400">Total USD</span>
-                  <span className="text-[15px] font-black text-emerald-700 font-mono">$ {totalUSDNominal.toFixed(2)}</span>
+                  <span className="text-[15px] font-black text-emerald-700 font-mono">
+                    $ {confirmTotalUSD.toFixed(2)}
+                  </span>
                 </div>
                 <div className="flex justify-between items-center">
                   <span className="text-[9px] font-black uppercase tracking-widest text-slate-400">Total Bs.</span>
-                  <span className="text-[11px] font-black text-slate-600 font-mono">Bs. {(totalUSDNominal * internalRateNumber).toLocaleString('es-VE', { minimumFractionDigits: 2 })}</span>
+                  <span className="text-[11px] font-black text-slate-600 font-mono">
+                    Bs. {(hasAnyCreditPayment && creditCurrency === 'USD'
+                      ? roundMoney(totalUSDNominal * exchangeRateBCV)
+                      : hasAnyCreditPayment && creditCurrency === 'VES'
+                        ? totalVESInternal
+                        : roundMoney(totalUSDNominal * internalRateNumber)
+                    ).toLocaleString('es-VE', { minimumFractionDigits: 2 })}
+                  </span>
                 </div>
                 {currentSession.payments.length > 0 && (
                   <>
@@ -5165,19 +5331,47 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
 
               {/* Devolución automática espejo */}
               <div className="pt-1">
-                <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest block mb-1">Desglose automático de reintegro (espejo de factura)</label>
-                <div className="bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 space-y-1.5">
-                  <p className="text-[9px] font-bold text-slate-500">
+                <div className="rounded-2xl border border-blue-200 bg-blue-50/60 px-3 py-2.5 space-y-2 mb-2">
+                  <div className="flex items-center justify-between">
+                    <label className="text-[9px] font-black text-blue-700 uppercase tracking-widest block">Cómo se pagó la factura original</label>
+                    <span className="text-[8px] font-black uppercase tracking-widest text-blue-700 bg-blue-100 border border-blue-200 rounded-full px-2 py-0.5">
+                      Origen
+                    </span>
+                  </div>
+                  {returnOriginalPaymentLines.length === 0 ? (
+                    <p className="text-[9px] text-blue-700/70">Sin detalle de pago en esta factura.</p>
+                  ) : returnOriginalPaymentLines.map((line, idx) => (
+                    <div key={`orig-${line.method}-${line.bank}-${idx}`} className="flex items-center justify-between gap-2 text-[9px] font-mono border-b border-blue-200/70 last:border-0 pb-1.5 last:pb-0">
+                      <span className="font-black text-blue-900 uppercase">
+                        {paymentMethodVisualIcon(line.method)} Método de Pago: {paymentMethodKeyLabel(line.method)}{line.bank ? ` + Banco: ${line.bank}` : ''}
+                      </span>
+                      <span className="text-blue-800">
+                        $ {line.amountUSD.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        {' / '}
+                        Bs {line.amountVES.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        {line.rateUsed > 0 ? ` @ ${line.rateUsed.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 4 })}` : ''}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+                <div className="rounded-2xl border border-emerald-200 bg-emerald-50/60 px-3 py-2.5 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <label className="text-[9px] font-black text-emerald-700 uppercase tracking-widest block">Desglose automático de reintegro (espejo de factura)</label>
+                    <span className="text-[8px] font-black uppercase tracking-widest text-emerald-700 bg-emerald-100 border border-emerald-200 rounded-full px-2 py-0.5">
+                      Reintegro
+                    </span>
+                  </div>
+                  <p className="text-[9px] font-bold text-emerald-800/80">
                     Se devolverá por los mismos métodos/bancos de la factura, de forma proporcional a los productos seleccionados.
                   </p>
                   {returnAutoPreview.lines.length === 0 ? (
-                    <p className="text-[9px] text-slate-400">Seleccione cantidades para ver el desglose.</p>
+                    <p className="text-[9px] text-emerald-700/70">Seleccione cantidades para ver el desglose.</p>
                   ) : returnAutoPreview.lines.map((line, idx) => (
-                    <div key={`${line.method}-${line.bank}-${idx}`} className="flex items-center justify-between gap-2 text-[9px] font-mono border-b border-slate-200/70 last:border-0 pb-1 last:pb-0">
-                      <span className="font-black text-slate-700 uppercase">
-                        {line.method || 'METODO'}{line.bank ? ` · ${line.bank}` : ''}
+                    <div key={`${line.method}-${line.bank}-${idx}`} className="flex items-center justify-between gap-2 text-[9px] font-mono border-b border-emerald-200/70 last:border-0 pb-1.5 last:pb-0">
+                      <span className="font-black text-emerald-900 uppercase">
+                        {paymentMethodVisualIcon(line.method)} Método de Pago: {paymentMethodKeyLabel(line.method) || 'METODO'}{line.bank ? ` + Banco: ${line.bank}` : ''}
                       </span>
-                      <span className="text-slate-600">
+                      <span className="text-emerald-800">
                         $ {line.amountUSD.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
                         {' / '}
                         Bs {line.amountVES.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
@@ -5414,7 +5608,7 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
                 <p className="text-[9px] text-slate-400 mt-1">Fecha de vencimiento: <span className="font-black text-slate-600">{(() => {
                   const d = new Date(pendingLetraConfig.sale?.timestamp || Date.now());
                   d.setDate(d.getDate() + (letraForm.creditDays ?? 10));
-                  return d.toLocaleDateString('es-VE', { day: '2-digit', month: '2-digit', year: 'numeric' });
+                  return formatDateVE(d, { day: '2-digit', month: '2-digit', year: 'numeric' });
                 })()}</span></p>
               </div>
               {/* Condiciones de pago */}
@@ -5437,6 +5631,27 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
                   onChange={e => setLetraForm(p => ({ ...p, domicilioLibrado: e.target.value.toUpperCase() }))}
                   className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-2.5 text-sm font-bold outline-none focus:ring-2 focus:ring-amber-400/30 focus:border-amber-400 transition-all uppercase"
                   placeholder="BARQUISIMETO, EDO. LARA"
+                />
+              </div>
+              {/* Beneficiario (a la orden de) */}
+              <div>
+                <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest block mb-1">A la orden de (beneficiario)</label>
+                <input
+                  type="text"
+                  value={letraForm.librador ?? ''}
+                  onChange={e => setLetraForm(p => ({ ...p, librador: e.target.value.toUpperCase() }))}
+                  className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-2.5 text-sm font-bold outline-none focus:ring-2 focus:ring-amber-400/30 focus:border-amber-400 transition-all uppercase"
+                  placeholder="EMPRENDIMIENTO EL COSTAL"
+                />
+              </div>
+              <div>
+                <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest block mb-1">RIF del beneficiario (opcional)</label>
+                <input
+                  type="text"
+                  value={letraForm.libradorRif ?? ''}
+                  onChange={e => setLetraForm(p => ({ ...p, libradorRif: e.target.value }))}
+                  className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-2.5 text-sm font-bold outline-none focus:ring-2 focus:ring-amber-400/30 focus:border-amber-400 transition-all"
+                  placeholder="J-XXXXXXXX-X"
                 />
               </div>
               {/* Info de cliente — solo lectura */}

@@ -29,18 +29,22 @@ import {
   Users,
   User,
   ChevronUp,
-  ChevronDown
+  ChevronDown,
+  CircleDollarSign
 } from 'lucide-react';
 import { reportService } from '../../services/reportService';
-import { dataService } from '../../services/dataService';
+import { dataService, type ClientAdvance, type SupplierAdvance, type PurchaseInvoiceHistoryEntry } from '../../services/dataService';
 import { formatQuantity, formatUnitCost } from '../../utils/costCalculations';
 import { compareCorrelativo, compareSalesForReport, normalizeReportCashier } from '../../utils/reportSort';
 import { buildExcelFriendlyCsv } from '../../utils/csvExport';
+import { isCreditSaleByBusinessRule } from '../../utils/salesClassification';
 import { printService } from '../../services/printService';
 
-type ReportTab = 'overview' | 'margins' | 'treasury' | 'zclosure' | 'purchases' | 'expenses' | 'shrinkage' | 'cashier';
+type ReportTab = 'overview' | 'sales' | 'profit' | 'margins' | 'treasury' | 'zclosure' | 'purchases' | 'expenses' | 'shrinkage' | 'cashier' | 'advances';
 type CashierViewMode = 'GENERAL' | 'METHODS' | 'DETAIL';
 type CashierDetailRateMode = 'LINE' | 'BCV' | 'INTERNAL';
+type OverviewMovementType = 'ALL' | 'VENTA' | 'COMPRA' | 'DEVOLUCION' | 'EGRESO' | 'ANTICIPO' | 'COBRO_AR' | 'PAGO_AP' | 'MERMA';
+type OverviewFlow = 'ALL' | 'INCOME' | 'EXPENSE';
 type SalesFilters = {
   client: string;
   method: string;
@@ -67,6 +71,18 @@ const INITIAL_SALES_FILTERS: SalesFilters = {
   sortBy: 'DATE_DESC'
 };
 const SALES_FILTER_PRESETS_KEY = 'reports_sales_filter_presets_v1';
+const REPORTS_VALUATION_RATE_KEY = 'reports_valuation_ves_rate_v1';
+
+const formatInvoiceProductDetails = (lines: any[]): string => {
+  const list = Array.isArray(lines) ? lines : [];
+  if (list.length === 0) return 'Sin detalle de productos';
+  return list.map((line: any, index: number) => {
+    const qty = Number(line?.qty ?? 0) || 0;
+    const unit = String(line?.unit ?? '').trim();
+    const name = String(line?.productDescription ?? line?.description ?? line?.sku ?? line?.code ?? `Producto ${index + 1}`).trim();
+    return `${index + 1}) ${name} - ${qty.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}${unit ? ` ${unit}` : ''}`;
+  }).join(' | ');
+};
 
 export function ReportsView() {
   const fmt = React.useCallback((value: any, decimals: number = 2) =>
@@ -89,26 +105,91 @@ export function ReportsView() {
 
   const [activeTab, setActiveTab] = React.useState<ReportTab>('overview');
   const [filters, setFilters] = React.useState<SalesFilters>(INITIAL_SALES_FILTERS);
+  const [overviewMovementType, setOverviewMovementType] = React.useState<OverviewMovementType>('ALL');
+  const [overviewFlow, setOverviewFlow] = React.useState<OverviewFlow>('ALL');
+  const [overviewQuery, setOverviewQuery] = React.useState('');
   const [dateRange, setDateRange] = React.useState({
     start: new Date(new Date().setDate(new Date().getDate() - 7)).toISOString().split('T')[0],
     end: new Date().toISOString().split('T')[0]
   });
-  const [marginFilters, setMarginFilters] = React.useState({ sku: '', batch: '' });
+  const [profitDateRange, setProfitDateRange] = React.useState({
+    start: new Date(new Date().setDate(new Date().getDate() - 30)).toISOString().split('T')[0],
+    end: new Date().toISOString().split('T')[0]
+  });
+  const [profitProductQuery, setProfitProductQuery] = React.useState<string>('ALL');
+  const [marginFilterMode, setMarginFilterMode] = React.useState<'PRODUCT' | 'BATCH'>('PRODUCT');
+  const [marginFilterQuery, setMarginFilterQuery] = React.useState('');
+  const [marginDateRange, setMarginDateRange] = React.useState({
+    start: new Date(new Date().setDate(new Date().getDate() - 30)).toISOString().split('T')[0],
+    end: new Date().toISOString().split('T')[0]
+  });
   const [zDate, setZDate] = React.useState(new Date().toISOString().split('T')[0]);
   const [zSelectedCashierIds, setZSelectedCashierIds] = React.useState<string[]>([]);
   const [zMethodFilter, setZMethodFilter] = React.useState<string>('ALL');
   const [salesPage, setSalesPage] = React.useState(0);
+  const [salesBookKind, setSalesBookKind] = React.useState<'ALL' | 'CASH' | 'CREDIT'>('ALL');
+  const [salesBookPage, setSalesBookPage] = React.useState(0);
   const SALES_PER_PAGE = 25;
   const [purchaseSearch, setPurchaseSearch] = React.useState('');
   const [purchaseDateRange, setPurchaseDateRange] = React.useState({
     start: new Date(new Date().setDate(new Date().getDate() - 30)).toISOString().split('T')[0],
     end: new Date().toISOString().split('T')[0]
   });
+  const [purchaseInvoiceHistory, setPurchaseInvoiceHistory] = React.useState<PurchaseInvoiceHistoryEntry[]>([]);
   const [expenseCategory, setExpenseCategory] = React.useState<'ALL' | 'FIXED' | 'VARIABLE'>('ALL');
   const [expenseDateRange, setExpenseDateRange] = React.useState({
     start: new Date(new Date().setDate(new Date().getDate() - 30)).toISOString().split('T')[0],
     end: new Date().toISOString().split('T')[0]
   });
+  const [advanceDateRange, setAdvanceDateRange] = React.useState({
+    start: new Date(new Date().setDate(new Date().getDate() - 90)).toISOString().split('T')[0],
+    end: new Date().toISOString().split('T')[0]
+  });
+  const [advanceSearch, setAdvanceSearch] = React.useState('');
+  const [advancesReportKind, setAdvancesReportKind] = React.useState<'client' | 'supplier'>('client');
+  const [advancesIncludeApplied, setAdvancesIncludeApplied] = React.useState(false);
+  const [supplierAdvancesForReport, setSupplierAdvancesForReport] = React.useState<SupplierAdvance[]>([]);
+  const [loadingAdvancesReport, setLoadingAdvancesReport] = React.useState(false);
+  const [advancesRefreshKey, setAdvancesRefreshKey] = React.useState(0);
+  /** Valoración inventario en reportes: costo vs lista, USD vs Bs (tasa manual si Bs). */
+  const [valuationPricing, setValuationPricing] = React.useState<'cost' | 'sale'>('cost');
+  const [valuationCurrency, setValuationCurrency] = React.useState<'USD' | 'VES'>('USD');
+  const [valuationVesRateInput, setValuationVesRateInput] = React.useState(() => {
+    try {
+      const raw = localStorage.getItem('bcvRateData');
+      if (raw) {
+        const parsed = JSON.parse(raw) as { rate?: number };
+        if (typeof parsed.rate === 'number' && parsed.rate > 0) return String(parsed.rate);
+      }
+      const saved = localStorage.getItem(REPORTS_VALUATION_RATE_KEY);
+      if (saved && Number(saved) > 0) return saved;
+    } catch {}
+    return '36.50';
+  });
+  const valuationVesRate = React.useMemo(() => {
+    const n = Number(String(valuationVesRateInput).replace(',', '.'));
+    return Number.isFinite(n) && n > 0 ? n : 36.5;
+  }, [valuationVesRateInput]);
+
+  React.useEffect(() => {
+    if (activeTab !== 'purchases') return;
+    let active = true;
+    dataService.getPurchaseInvoiceHistory()
+      .then((rows) => {
+        if (active) setPurchaseInvoiceHistory(Array.isArray(rows) ? rows : []);
+      })
+      .catch(() => {
+        if (active) setPurchaseInvoiceHistory([]);
+      });
+    return () => { active = false; };
+  }, [activeTab, tick]);
+
+  React.useEffect(() => {
+    try {
+      localStorage.setItem(REPORTS_VALUATION_RATE_KEY, String(valuationVesRate));
+    } catch {}
+  }, [valuationVesRate]);
+
   const [allBankTx, setAllBankTx] = React.useState<any[]>([]);
   const [treasurySelectedBankId, setTreasurySelectedBankId] = React.useState<string>('ALL');
   const [treasurySelectedAccountKey, setTreasurySelectedAccountKey] = React.useState<string>('ALL');
@@ -134,20 +215,32 @@ export function ReportsView() {
   const currentUser = dataService.getCurrentUser();
   const hasPermission = React.useCallback((key: string) => dataService.hasPermission(key as any, currentUser), [currentUser]);
   const canViewSalesReports = hasPermission('REPORTS_SALES') || hasPermission('ALL');
+  const canViewProfitReport = hasPermission('REPORTS_PROFIT_VIEW') || hasPermission('ALL');
   const canViewInventoryReports = hasPermission('REPORTS_INVENTORY') || hasPermission('ALL');
   const canViewFinancialReports = hasPermission('FINANCE_VIEW') || hasPermission('ALL');
+  const canExportTreasuryReports = hasPermission('REPORTS_TREASURY_EXPORT') || hasPermission('ALL');
+  const canExportExpensesReports = hasPermission('REPORTS_EXPENSES_EXPORT') || hasPermission('ALL');
+  const canExportMarginsReports = hasPermission('REPORTS_MARGINS_EXPORT') || hasPermission('ALL');
+  const canExportPurchasesReports = hasPermission('REPORTS_PURCHASES_EXPORT') || hasPermission('ALL');
+  const canExportShrinkageReports = hasPermission('REPORTS_SHRINKAGE_EXPORT') || hasPermission('ALL');
+  const canExportZClosureReports = hasPermission('REPORTS_ZCLOSURE_EXPORT') || hasPermission('ALL');
+  const canExportCashierReports = hasPermission('REPORTS_CASHIER_EXPORT') || hasPermission('ALL');
+  const canExportProfitReports = hasPermission('REPORTS_PROFIT_EXPORT') || hasPermission('ALL');
   const canSeeOverviewFinanceBlocks = canViewFinancialReports;
   const canSeeOverviewInventoryBlocks = canViewInventoryReports;
   const reportTabAccess = React.useMemo<Record<ReportTab, boolean>>(() => ({
     overview: canViewSalesReports,
+    sales: canViewSalesReports,
+    profit: canViewProfitReport,
     zclosure: canViewSalesReports,
     cashier: canViewSalesReports,
     margins: canViewInventoryReports,
     shrinkage: canViewInventoryReports,
     treasury: canViewFinancialReports,
     purchases: canViewFinancialReports,
-    expenses: canViewFinancialReports
-  }), [canViewFinancialReports, canViewInventoryReports, canViewSalesReports]);
+    expenses: canViewFinancialReports,
+    advances: canViewFinancialReports
+  }), [canViewFinancialReports, canViewInventoryReports, canViewProfitReport, canViewSalesReports]);
   const canSeeCashierIdentityAudit = Boolean(
     currentUser
     && (
@@ -158,9 +251,87 @@ export function ReportsView() {
   );
 
   const dailyStats = reportService.getDailySales();
-  const inventoryStats = reportService.getInventoryOverview();
-  const totalValUSD = reportService.getTotalValorization();
+  const inventoryStats = React.useMemo(
+    () => reportService.getInventoryOverview(valuationPricing),
+    [tick, valuationPricing]
+  );
+  const totalValUSD = React.useMemo(
+    () => reportService.getTotalValorization(valuationPricing),
+    [tick, valuationPricing]
+  );
+  const valuationDisplayAmount = React.useMemo(() => {
+    const base = Number(totalValUSD) || 0;
+    return valuationCurrency === 'VES' ? roundMoney(base * valuationVesRate) : roundMoney(base);
+  }, [totalValUSD, valuationCurrency, valuationVesRate]);
+
+  const formatValuationKpi = React.useCallback(
+    (amount: number) =>
+      valuationCurrency === 'VES' ? bs(amount, 2) : usd(amount, 2),
+    [valuationCurrency, bs, usd]
+  );
+
   const todayLiq = reportService.getTodayLiquidation();
+  const companyLoans = dataService.getCompanyLoans();
+  const companyLoansSummary = React.useMemo(() => {
+    const today = new Date();
+    const open = companyLoans.filter((l: any) => l.status !== 'PAID' && l.status !== 'VOID');
+    const overdue = open.filter((l: any) => {
+      const due = new Date(l?.dueDate ?? Date.now());
+      return !Number.isNaN(due.getTime()) && due < today;
+    });
+    const openBalance = open.reduce((sum: number, l: any) => sum + (Number(l?.balanceUSD ?? 0) || 0), 0);
+    return {
+      total: companyLoans.length,
+      openCount: open.length,
+      overdueCount: overdue.length,
+      openBalance
+    };
+  }, [companyLoans]);
+  const profitProductOptions = React.useMemo(() => {
+    const options = dataService.getStocks().map((p: any) => ({
+      code: String(p.code ?? ''),
+      description: String(p.description ?? '')
+    }));
+    return options.sort((a, b) => a.code.localeCompare(b.code));
+  }, [tick]);
+
+  const profitFilterPayload = React.useMemo(() => {
+    const startRaw = new Date(`${profitDateRange.start}T00:00:00`);
+    const endRaw = new Date(`${profitDateRange.end}T23:59:59`);
+    const now = new Date();
+    const start = Number.isNaN(startRaw.getTime()) ? new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0) : startRaw;
+    const end = Number.isNaN(endRaw.getTime()) ? new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999) : endRaw;
+    return {
+      start,
+      end,
+      productQuery: profitProductQuery === 'ALL' ? undefined : profitProductQuery,
+      label: profitProductQuery === 'ALL'
+        ? 'Periodo filtrado'
+        : `Periodo filtrado · SKU ${profitProductQuery}`
+    };
+  }, [profitDateRange.start, profitDateRange.end, profitProductQuery]);
+
+  const profitSummary = React.useMemo(
+    () => reportService.getProfitSummaryByFilter(profitFilterPayload),
+    [tick, profitFilterPayload]
+  );
+  const profitSkuTotals = React.useMemo(() => {
+    return profitSummary.bySku.reduce((acc, row) => {
+      acc.qtySold += Number(row.qtySold ?? 0) || 0;
+      acc.revenueUSD += Number(row.revenueUSD ?? 0) || 0;
+      acc.costUSD += Number(row.costUSD ?? 0) || 0;
+      acc.profitUSD += Number(row.profitUSD ?? 0) || 0;
+      return acc;
+    }, { qtySold: 0, revenueUSD: 0, costUSD: 0, profitUSD: 0 });
+  }, [profitSummary.bySku]);
+  const profitTopSalesTotals = React.useMemo(() => {
+    return profitSummary.topSales.reduce((acc, row) => {
+      acc.revenueUSD += Number(row.revenueUSD ?? 0) || 0;
+      acc.costUSD += Number(row.costUSD ?? 0) || 0;
+      acc.profitUSD += Number(row.profitUSD ?? 0) || 0;
+      return acc;
+    }, { revenueUSD: 0, costUSD: 0, profitUSD: 0 });
+  }, [profitSummary.topSales]);
 
   const normalizePaymentToken = React.useCallback((raw: any): string => {
     return String(raw ?? '')
@@ -171,10 +342,30 @@ export function ReportsView() {
       .replace(/\s+/g, ' ');
   }, []);
 
-  const paymentMethodLabel = React.useCallback((methodRaw: any, bankRaw?: any): string => {
+  const paymentMethodLabel = React.useCallback((methodRaw: any, bankRaw?: any, noteRaw?: any): string => {
     const methodBase = normalizePaymentToken(methodRaw);
     const method = methodBase.replace(/\s+/g, '_');
     const bank = normalizePaymentToken(bankRaw);
+    const note = normalizePaymentToken(noteRaw);
+    if (method === 'others' || method === 'other' || method === 'otro') {
+      const bankLabelRaw = String(bankRaw ?? '').trim();
+      const bankUpper = bankLabelRaw.toUpperCase();
+      const noteUpper = String(noteRaw ?? '').trim().toUpperCase();
+      const hasCxP = bankUpper === 'CXP' || noteUpper.includes('CXP') || note.includes('cxp');
+      const hasCxC = bankUpper === 'CXC' || noteUpper.includes('CXC') || note.includes('cxc');
+      const hasDxV = bankUpper === 'DXV' || noteUpper.includes('DXV') || note.includes('dxv');
+      const hasDxC = bankUpper === 'DXC' || noteUpper.includes('DXC') || note.includes('dxc');
+      if (hasCxP) return 'Otros · CxP';
+      if (hasCxC) return 'Otros · CxC';
+      if (hasDxV) return 'Otros · DxV';
+      if (hasDxC) return 'Otros · DxC';
+      if (bank.includes('ant. cliente') || bank.includes('anticipo cliente')) return 'Otros · Ant. Cliente';
+      if (bank.includes('ant. proveedores') || bank.includes('anticipo proveedores')) return 'Otros · Ant. Proveedores';
+      if (note.includes('ant. cliente') || note.includes('anticipo cliente')) return 'Otros · Ant. Cliente';
+      if (note.includes('ant. proveedores') || note.includes('anticipo proveedores')) return 'Otros · Ant. Proveedores';
+      if (bankLabelRaw) return `Otros · ${bankLabelRaw}`;
+      return 'Otros';
+    }
     const map: Record<string, string> = {
       cash_usd: 'Efectivo USD',
       cash_ves: 'Efectivo Bs',
@@ -209,6 +400,13 @@ export function ReportsView() {
     return String(methodRaw || bankRaw || 'Otro');
   }, [normalizePaymentToken]);
 
+  const overviewMethodLabel = React.useCallback((methodRaw: any, bankRaw?: any): string => {
+    const base = paymentMethodLabel(methodRaw, bankRaw);
+    if (base === 'Efectivo USD') return 'Efectivo $';
+    if (base === 'Pago Móvil') return 'Pago Movil';
+    return base;
+  }, [paymentMethodLabel]);
+
   const bankTxSalePaymentMap = React.useMemo(() => {
     const byCorrelativo: Record<string, Array<{ method: string; amountUSD: number; amountVES: number; count: number; rateUsed: number; reference: string }>> = {};
     allBankTx.forEach((tx: any) => {
@@ -216,7 +414,7 @@ export function ReportsView() {
       if (source !== 'SALE_PAYMENT' && source !== 'CREDIT_DOWN') return;
       const correlativo = String(tx?.saleCorrelativo ?? '').trim();
       if (!correlativo) return;
-      const method = paymentMethodLabel(tx?.method, tx?.bankName ?? tx?.bank);
+      const method = paymentMethodLabel(tx?.method, tx?.bankName ?? tx?.bank, tx?.note);
       const amountUSD = Math.abs(Number(tx?.amountUSD ?? 0) || 0);
       const amountVES = Math.abs(Number(tx?.amountVES ?? 0) || 0);
       const rateUsed = Number(tx?.rateUsed ?? 0) || 0;
@@ -228,12 +426,43 @@ export function ReportsView() {
     return byCorrelativo;
   }, [allBankTx, paymentMethodLabel]);
 
+  const cxpSaleCorrelativoHints = React.useMemo(() => {
+    const hints = new Set<string>();
+    dataService.getExpenses().forEach((expense: any) => {
+      const text = String(expense?.description ?? '').toUpperCase();
+      if (!text.includes('CXP ACTUALIZADO')) return;
+      const viaMatch = text.match(/V[IÍ]A\s+([A-Z]-\d+)/);
+      if (viaMatch?.[1]) {
+        hints.add(String(viaMatch[1]).trim().toUpperCase());
+      }
+    });
+    return hints;
+  }, [tick]);
+
   const extractSalePaymentLines = React.useCallback((sale: any) => {
     const lines: Array<{ method: string; amountUSD: number; amountVES: number; count: number; rateUsed: number; reference: string }> = [];
+    const appendMissingCreditLine = () => {
+      if (!isCreditSaleByBusinessRule(sale)) return;
+      const hasCreditLine = lines.some((line) => String(line.method ?? '').trim().toLowerCase() === 'crédito' || String(line.method ?? '').trim().toLowerCase() === 'credito');
+      if (hasCreditLine) return;
+      const explicitCredit = Number((sale as any)?.creditOutstandingUSD ?? 0) || 0;
+      const nonCreditUSD = lines.reduce((sum, line) => sum + (Number(line.amountUSD ?? 0) || 0), 0);
+      const fallbackCredit = Math.max(0, (Number(sale?.totalUSD ?? 0) || 0) - nonCreditUSD);
+      const amountUSD = explicitCredit > 0.0001 ? explicitCredit : fallbackCredit;
+      if (amountUSD <= 0.0001) return;
+      lines.push({
+        method: 'Crédito',
+        amountUSD,
+        amountVES: 0,
+        count: 1,
+        rateUsed: Number(sale?.exchangeRate ?? 0) || 0,
+        reference: ''
+      });
+    };
     const payments = Array.isArray(sale?.payments) ? sale.payments : [];
     if (payments.length > 0) {
       payments.forEach((p: any) => {
-        const method = paymentMethodLabel(p?.method, p?.bank);
+        const method = paymentMethodLabel(p?.method, p?.bank, p?.note);
         const amountUSD = Math.abs(Number(p?.amountUSD ?? 0) || 0);
         const amountVES = Math.abs(Number(p?.amountVES ?? 0) || 0);
         const rateUsed = Number(p?.rateUsed ?? 0) || 0;
@@ -241,11 +470,14 @@ export function ReportsView() {
         if (amountUSD <= 0.0001 && amountVES <= 0.0001) return;
         lines.push({ method, amountUSD, amountVES, count: 1, rateUsed, reference });
       });
+      appendMissingCreditLine();
       if (lines.length > 0) return lines;
     }
     const correlativo = String(sale?.correlativo ?? '').trim();
     if (correlativo && Array.isArray(bankTxSalePaymentMap[correlativo]) && bankTxSalePaymentMap[correlativo].length > 0) {
-      return bankTxSalePaymentMap[correlativo];
+      lines.push(...bankTxSalePaymentMap[correlativo]);
+      appendMissingCreditLine();
+      return lines;
     }
     // Fallback para ventas antiguas sin detalle de payments.
     // Si el método histórico es MIXTO pero no hay líneas, no inventar
@@ -255,16 +487,44 @@ export function ReportsView() {
     const fallbackMethod = (saleMethodNormalized === 'mixto' || saleMethodNormalized === 'mixed')
       ? 'Sin desglose'
       : paymentMethodLabel(saleMethodRaw);
-    lines.push({
-      method: fallbackMethod,
-      amountUSD: Math.abs(Number(sale?.totalUSD ?? 0) || 0),
-      amountVES: Math.abs(Number(sale?.totalVES ?? 0) || 0),
-      count: 1,
-      rateUsed: Number(sale?.exchangeRate ?? 0) || 0,
-      reference: ''
-    });
+    const correlativoUpper = String(sale?.correlativo ?? '').trim().toUpperCase();
+    const looksLikeCxpCross = (
+      cxpSaleCorrelativoHints.has(correlativoUpper)
+      || (saleMethodNormalized === 'others' && normalizePaymentToken((sale as any)?.notes ?? '').includes('cxp'))
+      || normalizePaymentToken((sale as any)?.notes ?? '').includes('reconciliacion cxp')
+    );
+    if (looksLikeCxpCross) {
+      lines.push({
+        method: 'Otros · CxP',
+        amountUSD: Math.abs(Number(sale?.totalUSD ?? 0) || 0),
+        amountVES: Math.abs(Number(sale?.totalVES ?? 0) || 0),
+        count: 1,
+        rateUsed: Number(sale?.exchangeRate ?? 0) || 0,
+        reference: ''
+      });
+      return lines;
+    }
+    if (isCreditSaleByBusinessRule(sale)) {
+      lines.push({
+        method: 'Crédito',
+        amountUSD: Math.abs(Number((sale as any)?.creditOutstandingUSD ?? sale?.totalUSD ?? 0) || 0),
+        amountVES: 0,
+        count: 1,
+        rateUsed: Number(sale?.exchangeRate ?? 0) || 0,
+        reference: ''
+      });
+    } else {
+      lines.push({
+        method: fallbackMethod,
+        amountUSD: Math.abs(Number(sale?.totalUSD ?? 0) || 0),
+        amountVES: Math.abs(Number(sale?.totalVES ?? 0) || 0),
+        count: 1,
+        rateUsed: Number(sale?.exchangeRate ?? 0) || 0,
+        reference: ''
+      });
+    }
     return lines;
-  }, [paymentMethodLabel, bankTxSalePaymentMap]);
+  }, [paymentMethodLabel, bankTxSalePaymentMap, cxpSaleCorrelativoHints, normalizePaymentToken]);
 
   const salesMethodOptions = React.useMemo(() => {
     const methods = new Set<string>();
@@ -278,31 +538,7 @@ export function ReportsView() {
     return Array.from(cashiers).sort((a, b) => a.localeCompare(b));
   }, [tick]);
 
-  const isCreditSaleByBusinessRule = React.useCallback((sale: any) => {
-    const correlativo = String(sale?.correlativo ?? '').trim().toUpperCase();
-    const compactCorrelativo = correlativo.replace(/\s+/g, '');
-    const hasCreditCorrelativo = compactCorrelativo.startsWith('C-')
-      || /^C\d+/.test(compactCorrelativo)
-      || /(^|[^A-Z0-9])C-\d+/.test(compactCorrelativo);
-    const hasCashCorrelativo = compactCorrelativo.startsWith('G-')
-      || /^G\d+/.test(compactCorrelativo)
-      || /(^|[^A-Z0-9])G-\d+/.test(compactCorrelativo);
-    if (hasCreditCorrelativo) return true;
-    if (hasCashCorrelativo) return false;
-
-    const creditOutstandingUSD = Number(sale?.creditOutstandingUSD ?? 0) || 0;
-    if (creditOutstandingUSD > 0.0001) return true;
-
-    const payments = Array.isArray(sale?.payments) ? sale.payments : [];
-    const hasCreditPaymentLine = payments.some((p: any) => {
-      const method = String(p?.method ?? '').trim().toLowerCase();
-      return method === 'credit' || method === 'credito' || method === 'crédito';
-    });
-    if (hasCreditPaymentLine) return true;
-
-    const method = String(sale?.paymentMethod ?? '').trim().toUpperCase();
-    return method === 'CREDIT' || method === 'CRÉDITO' || method === 'CREDITO';
-  }, []);
+  const classifyCreditSale = React.useCallback((sale: any) => isCreditSaleByBusinessRule(sale), []);
 
   const filteredSales = React.useMemo(() => {
     const q = String(filters.client ?? '').trim().toLowerCase();
@@ -333,7 +569,7 @@ export function ReportsView() {
       if (!cashierMatch) return false;
 
       const status = String((sale as any).status ?? 'COMPLETED').toUpperCase();
-      const isCredit = isCreditSaleByBusinessRule(sale);
+      const isCredit = classifyCreditSale(sale);
       const statusMatch = filters.status === 'ALL'
         || (filters.status === 'VOID' && status === 'VOID')
         || (filters.status === 'COMPLETED' && status !== 'VOID')
@@ -355,11 +591,11 @@ export function ReportsView() {
         sortBy
       )
     );
-  }, [dateRange.start, dateRange.end, filters, tick, isCreditSaleByBusinessRule]);
+  }, [dateRange.start, dateRange.end, filters, tick, classifyCreditSale]);
 
   const filteredSalesSplitSummary = React.useMemo(() => {
     return filteredSales.reduce((acc, sale: any) => {
-      const isCredit = isCreditSaleByBusinessRule(sale);
+      const isCredit = classifyCreditSale(sale);
       const usd = roundMoney(Number(sale?.totalUSD ?? 0) || 0);
       const ves = roundMoney(Number(sale?.totalVES ?? 0) || 0);
       if (isCredit) {
@@ -376,7 +612,7 @@ export function ReportsView() {
       credit: { count: 0, totalUSD: 0, totalVES: 0 },
       cash: { count: 0, totalUSD: 0, totalVES: 0 }
     });
-  }, [filteredSales, isCreditSaleByBusinessRule, roundMoney]);
+  }, [filteredSales, classifyCreditSale, roundMoney]);
 
   const filteredSalesTotals = React.useMemo(() => {
     return filteredSales.reduce((acc, sale: any) => {
@@ -386,6 +622,58 @@ export function ReportsView() {
       return acc;
     }, { count: 0, totalUSD: 0, totalVES: 0 });
   }, [filteredSales, roundMoney]);
+
+  /** Libro de ventas (pestaña Ventas): refina contado/crédito sin duplicar Estado cuando ya es CASH/CREDIT. */
+  const salesBookRows = React.useMemo(() => {
+    const st = String(filters.status ?? 'ALL').toUpperCase();
+    if (st === 'CASH' || st === 'CREDIT') return filteredSales;
+    if (salesBookKind === 'CASH') {
+      return filteredSales.filter((sale: any) => !classifyCreditSale(sale));
+    }
+    if (salesBookKind === 'CREDIT') {
+      return filteredSales.filter((sale: any) => classifyCreditSale(sale));
+    }
+    return filteredSales;
+  }, [filteredSales, filters.status, salesBookKind, classifyCreditSale]);
+
+  const salesBookTotals = React.useMemo(() => {
+    return salesBookRows.reduce((acc, sale: any) => {
+      acc.count += 1;
+      acc.totalUSD += roundMoney(Number(sale?.totalUSD ?? 0) || 0);
+      acc.totalVES += roundMoney(Number(sale?.totalVES ?? 0) || 0);
+      return acc;
+    }, { count: 0, totalUSD: 0, totalVES: 0 });
+  }, [salesBookRows, roundMoney]);
+
+  const salesBookSplitSummary = React.useMemo(() => {
+    return salesBookRows.reduce((acc, sale: any) => {
+      const isCredit = classifyCreditSale(sale);
+      const u = roundMoney(Number(sale?.totalUSD ?? 0) || 0);
+      const v = roundMoney(Number(sale?.totalVES ?? 0) || 0);
+      if (isCredit) {
+        acc.credit.count += 1;
+        acc.credit.totalUSD += u;
+        acc.credit.totalVES += v;
+      } else {
+        acc.cash.count += 1;
+        acc.cash.totalUSD += u;
+        acc.cash.totalVES += v;
+      }
+      return acc;
+    }, {
+      credit: { count: 0, totalUSD: 0, totalVES: 0 },
+      cash: { count: 0, totalUSD: 0, totalVES: 0 }
+    });
+  }, [salesBookRows, classifyCreditSale, roundMoney]);
+
+  const salesBookStatusLabel = React.useMemo(() => {
+    const st = String(filters.status ?? 'ALL').toUpperCase();
+    if (st === 'CREDIT') return 'Crédito (filtro Estado)';
+    if (st === 'CASH') return 'Contado (filtro Estado)';
+    if (salesBookKind === 'CREDIT') return 'Solo crédito';
+    if (salesBookKind === 'CASH') return 'Solo contado';
+    return 'Contado y crédito';
+  }, [filters.status, salesBookKind]);
 
   const salesStatusLabel = React.useMemo(() => {
     const status = String(filters.status ?? 'ALL').toUpperCase();
@@ -399,6 +687,10 @@ export function ReportsView() {
   React.useEffect(() => {
     setSalesPage(0);
   }, [filters.client, filters.method, filters.cashier, filters.status, filters.minUSD, filters.maxUSD, filters.sortBy, dateRange.start, dateRange.end]);
+
+  React.useEffect(() => {
+    setSalesBookPage(0);
+  }, [salesBookKind, filters.client, filters.method, filters.cashier, filters.status, filters.minUSD, filters.maxUSD, filters.sortBy, dateRange.start, dateRange.end]);
 
   React.useEffect(() => {
     try {
@@ -503,11 +795,11 @@ export function ReportsView() {
     );
     // Ventas al contado (no crédito) → efectivo cobrado inmediato
     const cashSalesUSD = periodSales
-      .filter(s => !isCreditSaleByBusinessRule(s))
+      .filter(s => !classifyCreditSale(s))
       .reduce((a, s) => a + Number(s.totalUSD ?? 0), 0);
     // Ventas a crédito (quedan como AR, no entra efectivo aún)
     const creditSalesUSD = periodSales
-      .filter(s => isCreditSaleByBusinessRule(s))
+      .filter(s => classifyCreditSale(s))
       .reduce((a, s) => a + Number(s.totalUSD ?? 0), 0);
     // Cobros AR en el período (via bank_transactions source AR_PAYMENT)
     const arCollectionsUSD = allBankTx
@@ -631,6 +923,10 @@ export function ReportsView() {
   const operationsJournal = React.useMemo(() => {
     const startDate = new Date(dateRange.start + 'T00:00:00');
     const endDate = new Date(dateRange.end + 'T23:59:59');
+    const salesInRange = dataService.getSales().filter((sale: any) => {
+      const ts = sale?.timestamp instanceof Date ? sale.timestamp : new Date(sale?.timestamp ?? Date.now());
+      return ts >= startDate && ts <= endDate;
+    });
     const ops: Array<{
       date: string;
       time: string;
@@ -644,26 +940,29 @@ export function ReportsView() {
       method: string;
       status: string;
       timestamp: number;
+      flow: 'INCOME' | 'EXPENSE';
     }> = [];
 
-    // Ventas — mismo subconjunto que "Libro de ventas" (incl. anuladas si el filtro las incluye)
-    filteredSales.forEach((s) => {
+    // Ventas del período (incluye anuladas para trazabilidad contable)
+    salesInRange.forEach((s: any) => {
       const isVoided = (s as any).status === 'VOID' || (s as any).voided;
+      const saleTs = s.timestamp instanceof Date ? s.timestamp : new Date(s.timestamp);
       ops.push({
-        date: s.timestamp.toISOString().split('T')[0],
-        time: s.timestamp.toISOString().split('T')[1].slice(0, 5),
+        date: saleTs.toISOString().split('T')[0],
+        time: saleTs.toISOString().split('T')[1].slice(0, 5),
         type: 'VENTA',
         typeLabel: isVoided
           ? 'Venta (Anulada)'
-          : (isCreditSaleByBusinessRule(s) ? 'Venta Crédito' : 'Venta Contado'),
-        correlativo: s.correlativo,
-        entity: s.client.name,
+          : (classifyCreditSale(s) ? 'Venta Crédito' : 'Venta Contado'),
+        correlativo: s.correlativo ?? '',
+        entity: s.client?.name ?? 'Cliente',
         description: `${(s as any).items?.length ?? 0} ítem(s)`,
-        amountUSD: s.totalUSD,
-        amountVES: s.totalVES,
-        method: s.paymentMethod,
+        amountUSD: Number(s.totalUSD ?? 0) || 0,
+        amountVES: Number(s.totalVES ?? 0) || 0,
+        method: overviewMethodLabel(s.paymentMethod),
         status: isVoided ? 'ANULADA' : 'COMPLETADA',
-        timestamp: s.timestamp.getTime()
+        timestamp: saleTs.getTime(),
+        flow: 'INCOME'
       });
     });
 
@@ -680,9 +979,10 @@ export function ReportsView() {
           description: ap.description,
           amountUSD: -ap.amountUSD,
           amountVES: 0,
-          method: ap.status === 'PAID' ? 'Contado' : 'Crédito',
+          method: ap.status === 'PAID' ? 'Efectivo $' : 'Crédito',
           status: ap.status,
-          timestamp: ap.timestamp.getTime()
+          timestamp: ap.timestamp.getTime(),
+          flow: 'EXPENSE'
         });
       }
     });
@@ -701,9 +1001,10 @@ export function ReportsView() {
           description: cn.reason || 'Nota de Crédito',
           amountUSD: -(cn.amountUSD || cn.totalUSD || 0),
           amountVES: -(cn.amountVES || cn.totalVES || 0),
-          method: cn.refundMethod || 'Efectivo',
+          method: overviewMethodLabel(cn.refundMethod || 'cash_usd', cn.bankName ?? cn.bank),
           status: cn.status || 'PENDING',
-          timestamp: ts.getTime()
+          timestamp: ts.getTime(),
+          flow: 'EXPENSE'
         });
       }
     });
@@ -721,9 +1022,10 @@ export function ReportsView() {
           description: e.description,
           amountUSD: -e.amountUSD,
           amountVES: -(e.amountVES || 0),
-          method: e.paymentMethod || 'Otro',
+          method: overviewMethodLabel(e.paymentMethod || 'other'),
           status: e.status,
-          timestamp: e.timestamp.getTime()
+          timestamp: e.timestamp.getTime(),
+          flow: 'EXPENSE'
         });
       }
     });
@@ -742,9 +1044,10 @@ export function ReportsView() {
           description: a.note || `Anticipo: $${Number(a.amountUSD || 0).toFixed(2)}`,
           amountUSD: Number(a.amountUSD || 0),
           amountVES: Number(a.originalAmountVES || a.amountVES || 0),
-          method: a.currency || 'USD',
+          method: String(a.currency || 'USD').toUpperCase() === 'VES' ? 'Efectivo Bs' : 'Efectivo $',
           status: a.status || 'ACTIVE',
-          timestamp: ts.getTime()
+          timestamp: ts.getTime(),
+          flow: 'INCOME'
         });
       }
     });
@@ -767,9 +1070,10 @@ export function ReportsView() {
             description: tx.note || 'Cobro de factura',
             amountUSD: Math.abs(tx.amountUSD || 0),
             amountVES: Math.abs(tx.amountVES || 0),
-            method: tx.method || 'Transferencia',
+            method: overviewMethodLabel(tx.method || 'transfer', tx.bankName ?? tx.bank),
             status: 'COMPLETADO',
-            timestamp: ts.getTime()
+            timestamp: ts.getTime(),
+            flow: 'INCOME'
           });
         } else if ((source === 'AP_PAYMENT' || source === 'PURCHASE_PAYMENT') && !isIncoming) {
           ops.push({
@@ -782,9 +1086,10 @@ export function ReportsView() {
             description: tx.note || 'Pago a proveedor',
             amountUSD: -Math.abs(tx.amountUSD || 0),
             amountVES: -Math.abs(tx.amountVES || 0),
-            method: tx.method || 'Transferencia',
+            method: overviewMethodLabel(tx.method || 'transfer', tx.bankName ?? tx.bank),
             status: 'COMPLETADO',
-            timestamp: ts.getTime()
+            timestamp: ts.getTime(),
+            flow: 'EXPENSE'
           });
         }
       }
@@ -795,7 +1100,39 @@ export function ReportsView() {
       if (dt !== 0) return dt;
       return compareCorrelativo(a.correlativo, b.correlativo);
     });
-  }, [dateRange.start, dateRange.end, allBankTx, isCreditSaleByBusinessRule, filteredSales]);
+  }, [dateRange.start, dateRange.end, allBankTx, classifyCreditSale, overviewMethodLabel, tick]);
+
+  const filteredOperationsJournal = React.useMemo(() => {
+    const q = overviewQuery.trim().toLowerCase();
+    return operationsJournal.filter((op) => {
+      const typeMatch = overviewMovementType === 'ALL' || op.type === overviewMovementType;
+      if (!typeMatch) return false;
+      const flowMatch = overviewFlow === 'ALL' || op.flow === overviewFlow;
+      if (!flowMatch) return false;
+      if (!q) return true;
+      const haystack = [
+        op.date,
+        op.time,
+        op.type,
+        op.typeLabel,
+        op.correlativo,
+        op.entity,
+        op.description,
+        op.method,
+        op.status
+      ].join(' ').toLowerCase();
+      return haystack.includes(q);
+    });
+  }, [operationsJournal, overviewMovementType, overviewFlow, overviewQuery]);
+
+  const filteredOperationsTotals = React.useMemo(() => {
+    return filteredOperationsJournal.reduce((acc, op) => {
+      acc.count += 1;
+      acc.totalUSD += Number(op.amountUSD ?? 0) || 0;
+      acc.totalVES += Number(op.amountVES ?? 0) || 0;
+      return acc;
+    }, { count: 0, totalUSD: 0, totalVES: 0 });
+  }, [filteredOperationsJournal]);
 
   // ═══════════════════════════════════════════════════════════════════════
   // MOVIMIENTOS DE INVENTARIO (Entradas y Salidas del período)
@@ -874,50 +1211,124 @@ export function ReportsView() {
     };
   }, [dateRange.start, dateRange.end]);
 
+  const inventoryVolumeLabel = React.useMemo(() => {
+    const byUnit = inventoryStats.reduce((acc, row) => {
+      const unit = String(row.unit ?? 'UND').trim().toUpperCase() || 'UND';
+      acc[unit] = (acc[unit] || 0) + (Number(row.totalQty ?? 0) || 0);
+      return acc;
+    }, {} as Record<string, number>);
+    const parts = (Object.entries(byUnit) as Array<[string, number]>)
+      .filter(([, qty]) => Math.abs(qty) > 0.000001)
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([unit, qty]) => `${fmt(Number(qty), 3)} ${unit}`);
+    return parts.length > 0 ? parts.join(' · ') : '0 UND';
+  }, [inventoryStats]);
+
+  const valuationTrendLabel = React.useMemo(() => {
+    const base = valuationPricing === 'cost' ? 'Precio costo' : 'Precio venta (lista)';
+    if (valuationCurrency === 'VES') {
+      return `${base} · Bs @ ${fmt(valuationVesRate, 4)}`;
+    }
+    return `${base} · USD`;
+  }, [valuationPricing, valuationCurrency, valuationVesRate, fmt]);
+
   const kpis = [
     { title: 'Ventas de Hoy', value: usd(todayLiq.totalUSD), trend: `${todayLiq.count} Ops`, color: 'emerald' },
-    { title: 'Valoracion Activo', value: usd(totalValUSD), trend: 'Market Value', color: 'slate' },
+    { title: 'Valoracion Activo', value: formatValuationKpi(valuationDisplayAmount), trend: valuationTrendLabel, color: 'slate' },
     { title: 'Ticket Promedio', value: usd(dailyStats.reduce((a, b) => a + b.totalUSD, 0) / (dailyStats.length || 1)), trend: 'Historico', color: 'blue' },
-    { title: 'Volumen Total', value: `${fmt(inventoryStats.reduce((a, b) => a + b.totalKg, 0), 0)} KG`, trend: 'Stock Real', color: 'amber' },
+    { title: 'Volumen Total', value: inventoryVolumeLabel, trend: 'Stock Real', color: 'amber' },
   ];
 
   // MARGIN DATA - Solo costo de compra real
   const landedCostData = React.useMemo(() => {
     const stocks = dataService.getStocks();
+    const sales = dataService.getSales();
+    const movements = dataService.getMovements();
+    const soldQtyBySkuBatch = new Map<string, number>();
+    const parseDate = (value: any): Date | null => {
+      if (!value) return null;
+      if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value;
+      const parsed = new Date(value);
+      return Number.isNaN(parsed.getTime()) ? null : parsed;
+    };
+    const periodStartRaw = parseDate(`${marginDateRange.start}T00:00:00`);
+    const periodEndRaw = parseDate(`${marginDateRange.end}T23:59:59`);
+    const periodStart = periodStartRaw && periodEndRaw && periodStartRaw > periodEndRaw ? periodEndRaw : periodStartRaw;
+    const periodEnd = periodStartRaw && periodEndRaw && periodStartRaw > periodEndRaw ? periodStartRaw : periodEndRaw;
+    const inPeriod = (value: any): boolean => {
+      const parsed = parseDate(value);
+      if (!parsed || !periodStart || !periodEnd) return true;
+      return parsed >= periodStart && parsed <= periodEnd;
+    };
+    sales.forEach((sale: any) => {
+      if ((sale as any)?.voided) return;
+      if (String((sale as any)?.status ?? '').toUpperCase() === 'VOID') return;
+      if (!inPeriod(sale?.timestamp)) return;
+      const items = Array.isArray(sale?.items) ? sale.items : [];
+      items.forEach((item: any) => {
+        const sku = String(item?.code ?? '').trim();
+        const lotes = Array.isArray(item?.dispatchLotes) ? item.dispatchLotes : [];
+        lotes.forEach((lot: any) => {
+          const batchId = String(lot?.batchId ?? '').trim();
+          const qty = Math.abs(Number(lot?.qty ?? 0) || 0);
+          if (!sku || !batchId || qty <= 0) return;
+          const key = `${sku}|${batchId}`;
+          soldQtyBySkuBatch.set(key, (soldQtyBySkuBatch.get(key) || 0) + qty);
+        });
+      });
+    });
     const batches: any[] = [];
     stocks.forEach(product => {
       const productBatches = (product as any).lotes || [];
       productBatches.forEach((batch: any) => {
-        const purchaseCost = Number(batch.costUSD || 0) * Number(batch.initialQty || batch.quantity || 0);
-        const qty = Number(batch.quantity || 0);
-        const unitCost = qty > 0 ? purchaseCost / qty : 0;
+        const unitCost = Number(batch.costUSD || 0);
+        const qty = Number(batch.quantity ?? batch.qty ?? 0);
+        const initialQty = Number(batch.initialQty ?? batch.quantity ?? batch.qty ?? 0);
+        const purchaseCost = unitCost * initialQty;
+        const onHandCostUSD = unitCost * qty;
         const currentPrice = Number(product.priceUSD || 0);
         const grossMarginPct = currentPrice > 0 ? ((currentPrice - unitCost) / currentPrice) * 100 : 0;
-        const movements = dataService.getMovements().filter(m => m.sku === product.code && m.batchId === batch.id);
-        const soldQty = movements.filter(m => m.type === 'SALE' || m.type === 'VENTA').reduce((sum, m) => sum + Math.abs(m.qty || 0), 0);
+        const batchId = String(batch.id ?? batch.lote ?? '');
+        const soldByDispatch = soldQtyBySkuBatch.get(`${String(product.code ?? '')}|${batchId}`) || 0;
+        const movementsByBatch = movements.filter((m: any) =>
+          m.sku === product.code &&
+          String(m.batchId ?? '') === batchId &&
+          inPeriod((m as any)?.timestamp)
+        );
+        const soldByBatchMovement = movementsByBatch.filter(m => m.type === 'SALE' || m.type === 'VENTA').reduce((sum, m) => sum + Math.abs(m.qty || 0), 0);
+        const soldBySkuFallback = movements
+          .filter((m: any) => m.sku === product.code && (m.type === 'SALE' || m.type === 'VENTA') && inPeriod((m as any)?.timestamp))
+          .reduce((sum, m) => sum + Math.abs(m.qty || 0), 0);
+        const soldQty = soldByDispatch > 0 ? soldByDispatch : (soldByBatchMovement > 0 ? soldByBatchMovement : soldBySkuFallback);
         const revenueUSD = soldQty * currentPrice;
-        if (purchaseCost > 0) {
+        const soldProfitUSD = soldQty * (currentPrice - unitCost);
+        if (unitCost > 0) {
           batches.push({
-            batchId: batch.id || batch.lote || `${product.code}-${Date.now()}`,
+            batchId: batchId || `${product.code}-${Date.now()}`,
             sku: product.code,
             description: product.description,
             purchaseCostUSD: purchaseCost,
+            onHandCostUSD,
             qty,
             unitCost,
             currentPriceUSD: currentPrice,
             grossMarginPct,
             soldQty,
-            revenueUSD
+            revenueUSD,
+            soldProfitUSD
           });
         }
       });
     });
     return batches.filter(b => {
-      const skuMatch = marginFilters.sku === '' || b.sku.toLowerCase().includes(marginFilters.sku.toLowerCase());
-      const batchMatch = marginFilters.batch === '' || b.batchId.toLowerCase().includes(marginFilters.batch.toLowerCase());
-      return skuMatch && batchMatch;
+      const query = marginFilterQuery.trim().toLowerCase();
+      if (!query) return true;
+      if (marginFilterMode === 'PRODUCT') {
+        return b.sku.toLowerCase().includes(query) || String(b.description ?? '').toLowerCase().includes(query);
+      }
+      return b.batchId.toLowerCase().includes(query);
     }).sort((a, b) => b.grossMarginPct - a.grossMarginPct);
-  }, [marginFilters]);
+  }, [marginFilterMode, marginFilterQuery, marginDateRange.start, marginDateRange.end, tick]);
 
   // REP-01 FIX: Load real bank transactions for treasury
   React.useEffect(() => {
@@ -997,11 +1408,8 @@ export function ReportsView() {
       const isGeneralFlow = isSaleFlow || isPurchaseFlow;
       const amountUSD = Number(tx?.amountUSD ?? 0) || 0;
       const amountVES = Number(tx?.amountVES ?? 0) || 0;
-      const rateUsed = Number(tx?.rateUsed ?? 0) || 0;
-      const equivalentUSD = amountUSD !== 0 ? amountUSD : (rateUsed > 0 ? amountVES / rateUsed : 0);
-      const equivalentVES = amountVES !== 0 ? amountVES : (rateUsed > 0 ? amountUSD * rateUsed : 0);
-      const hasUSD = Math.abs(equivalentUSD) > 0.0001;
-      const hasVES = Math.abs(equivalentVES) > 0.0001;
+      const hasUSD = Math.abs(amountUSD) > 0.0001;
+      const hasVES = Math.abs(amountVES) > 0.0001;
       if (treasuryFlowFilter === 'GENERAL' && !isGeneralFlow) return;
       if (treasuryFlowFilter === 'SALES' && !isSaleFlow) return;
       if (treasuryFlowFilter === 'PURCHASES' && !isPurchaseFlow) return;
@@ -1068,11 +1476,8 @@ export function ReportsView() {
           || customerNorm.includes('RETIRO DE CAJA');
         const amountUSD = Number(tx?.amountUSD ?? 0) || 0;
         const amountVES = Number(tx?.amountVES ?? 0) || 0;
-        const rateUsed = Number(tx?.rateUsed ?? 0) || 0;
-        const equivalentUSD = amountUSD !== 0 ? amountUSD : (rateUsed > 0 ? amountVES / rateUsed : 0);
-        const equivalentVES = amountVES !== 0 ? amountVES : (rateUsed > 0 ? amountUSD * rateUsed : 0);
-        const hasUSD = Math.abs(equivalentUSD) > 0.0001;
-        const hasVES = Math.abs(equivalentVES) > 0.0001;
+        const hasUSD = Math.abs(amountUSD) > 0.0001;
+        const hasVES = Math.abs(amountVES) > 0.0001;
         if (treasuryFlowFilter === 'GENERAL' && !isGeneralFlow) return false;
         if (treasuryFlowFilter === 'SALES' && !isSaleFlow) return false;
         if (treasuryFlowFilter === 'PURCHASES' && !isPurchaseFlow) return false;
@@ -1111,8 +1516,6 @@ export function ReportsView() {
       const amountUSD = Number(tx?.amountUSD ?? 0) || 0;
       const amountVES = Number(tx?.amountVES ?? 0) || 0;
       const rateUsed = Number(tx?.rateUsed ?? 0) || 0;
-      const equivalentUSD = amountUSD !== 0 ? amountUSD : (rateUsed > 0 ? amountVES / rateUsed : 0);
-      const equivalentVES = amountVES !== 0 ? amountVES : (rateUsed > 0 ? amountUSD * rateUsed : 0);
       runningUSD += amountUSD;
       runningVES += amountVES;
       const dateObj = new Date(tx?.createdAt ?? Date.now());
@@ -1142,8 +1545,6 @@ export function ReportsView() {
         rateUsed,
         amountUSD,
         amountVES,
-        equivalentUSD,
-        equivalentVES,
         runningUSD,
         runningVES
       };
@@ -1155,8 +1556,6 @@ export function ReportsView() {
       count: treasuryDetailRows.length,
       movementUSD: treasuryDetailRows.reduce((sum, row) => sum + (Number(row.amountUSD ?? 0) || 0), 0),
       movementVES: treasuryDetailRows.reduce((sum, row) => sum + (Number(row.amountVES ?? 0) || 0), 0),
-      movementEquivalentUSD: treasuryDetailRows.reduce((sum, row) => sum + (Number(row.equivalentUSD ?? 0) || 0), 0),
-      movementEquivalentVES: treasuryDetailRows.reduce((sum, row) => sum + (Number(row.equivalentVES ?? 0) || 0), 0),
       balanceUSD: treasuryDetailRows.length > 0 ? treasuryDetailRows[treasuryDetailRows.length - 1].runningUSD : 0,
       balanceVES: treasuryDetailRows.length > 0 ? treasuryDetailRows[treasuryDetailRows.length - 1].runningVES : 0
     };
@@ -1164,7 +1563,9 @@ export function ReportsView() {
 
   // Z-CLOSURE DATA - Sin IVA ni IGTF
   const zClosureData = React.useMemo(() => {
-    const sales = dataService.getSales().filter(s => s.timestamp.toISOString().split('T')[0] === zDate);
+    const dailySales = dataService.getSales().filter((s: any) => s.timestamp.toISOString().split('T')[0] === zDate);
+    const activeSales = dailySales.filter((s: any) => String((s as any).status ?? '').toUpperCase() !== 'VOID' && !(s as any).voided);
+    const voidedExcluded = Math.max(0, dailySales.length - activeSales.length);
     const users = dataService.getUsers();
     const normalizeIdentity = (value: any) =>
       String(value ?? '').trim().toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
@@ -1197,6 +1598,49 @@ export function ReportsView() {
       if (firebaseUid) usersByFirebaseUid.set(firebaseUid, u);
       if (emailNorm) usersByEmail.set(emailNorm, u);
     });
+    const sessionWindows = dataService.getCashBoxSessions().map((session: any) => {
+      const openTimeRaw = String(session?.openTime ?? '').trim();
+      const closeTimeRaw = String(session?.closeTime ?? '').trim();
+      const safeOpenTime = /^\d{2}:\d{2}/.test(openTimeRaw) ? openTimeRaw.slice(0, 5) : '00:00';
+      const safeCloseTime = /^\d{2}:\d{2}/.test(closeTimeRaw) ? closeTimeRaw.slice(0, 5) : '23:59';
+      const startMs = new Date(`${String(session?.openDate ?? '')}T${safeOpenTime}:00`).getTime();
+      const closeDate = String(session?.closeDate ?? '').trim() || String(session?.openDate ?? '').trim();
+      const endMs = Number.isFinite(new Date(`${closeDate}T${safeCloseTime}:59`).getTime())
+        ? new Date(`${closeDate}T${safeCloseTime}:59`).getTime()
+        : new Date(`${String(session?.openDate ?? '')}T23:59:59`).getTime();
+      return {
+        userId: String(session?.userId ?? '').trim(),
+        userName: String(session?.userName ?? '').trim(),
+        startMs,
+        endMs
+      };
+    }).filter((session: any) =>
+      !!session.userId
+      && Number.isFinite(session.startMs)
+      && Number.isFinite(session.endMs)
+      && session.endMs >= session.startMs
+    );
+    const resolveOperatorBySessionWindow = (sale: any) => {
+      const saleTime = sale?.timestamp instanceof Date
+        ? sale.timestamp.getTime()
+        : new Date(sale?.timestamp ?? Date.now()).getTime();
+      if (!Number.isFinite(saleTime)) return null;
+      const matches = sessionWindows
+        .filter((session: any) => saleTime >= session.startMs && saleTime <= session.endMs);
+      if (matches.length === 0) return null;
+      const uniqueUserIds = Array.from(new Set(matches.map((session: any) => session.userId).filter(Boolean)));
+      if (uniqueUserIds.length !== 1) return null;
+      const matchedUserId = uniqueUserIds[0];
+      const matchedSession = matches
+        .filter((session: any) => session.userId === matchedUserId)
+        .sort((a: any, b: any) => b.startMs - a.startMs)[0];
+      if (!matchedSession) return null;
+      const matchedUser = usersById.get(matchedUserId);
+      return {
+        userId: matchedUserId,
+        name: String(matchedUser?.name ?? '').trim() || matchedSession.userName || ''
+      };
+    };
 
     const bankActorByCorrelativo = new Map<string, { actorUserId: string; actorName: string }>();
     allBankTx.forEach((tx: any) => {
@@ -1252,13 +1696,18 @@ export function ReportsView() {
         };
       }
 
+      const sessionOperator = resolveOperatorBySessionWindow(sale);
+      if (sessionOperator?.name) {
+        return sessionOperator;
+      }
+
       return {
         userId: saleUserIdRaw || bankActorUserId || '',
         name: saleOperatorNameRaw || bankActorName || 'Sin cajero'
       };
     };
 
-    const salesWithOperator = sales.map((sale: any) => ({
+    const salesWithOperator = activeSales.map((sale: any) => ({
       sale,
       operator: resolveSaleOperatorIdentity(sale)
     }));
@@ -1276,8 +1725,34 @@ export function ReportsView() {
 
     const availableMethods = new Set<string>();
     const byMethod: Record<string, { count: number; usd: number; ves: number }> = {};
+    const detailRowsByMethod: Array<{
+      method: string;
+      date: string;
+      time: string;
+      timestampMs: number;
+      correlativo: string;
+      client: string;
+      cashier: string;
+      lineUSD: number;
+      lineVES: number;
+    }> = [];
     const byCashierSummaries: Record<string, { cashierName: string; salesCount: number; totalUSD: number; totalVES: number; methods: Record<string, { count: number; usd: number; ves: number }> }> = {};
     const salesIncludedByMethodFilter = new Set<string>();
+    const creditSalesIncluded = new Set<string>();
+    const cashSalesIncluded = new Set<string>();
+    const salesWithoutMethodBreakdown = new Set<string>();
+    const salesWithPaymentBreakdown: Array<{
+      date: string;
+      time: string;
+      timestampMs: number;
+      correlativo: string;
+      client: string;
+      cashier: string;
+      totalUSD: number;
+      totalVES: number;
+      methodsLabel: string;
+      methodsCount: number;
+    }> = [];
 
     cashierFilteredEntries.forEach((entry: any) => {
       const sale = entry.sale;
@@ -1293,6 +1768,11 @@ export function ReportsView() {
 
       const saleKey = String(sale?.id ?? sale?.correlativo ?? `${cashierName}-${sale?.timestamp?.getTime?.() ?? ''}`);
       salesIncludedByMethodFilter.add(saleKey);
+      if (classifyCreditSale(sale)) creditSalesIncluded.add(saleKey);
+      else cashSalesIncluded.add(saleKey);
+      if (paymentLines.length === 1 && String(paymentLines[0]?.method ?? '').trim().toUpperCase() === 'SIN DESGLOSE') {
+        salesWithoutMethodBreakdown.add(saleKey);
+      }
 
       if (!byCashierSummaries[cashierName]) {
         byCashierSummaries[cashierName] = {
@@ -1323,11 +1803,74 @@ export function ReportsView() {
         byMethod[method].usd += line.amountUSD;
         byMethod[method].ves += line.amountVES;
       });
+
+      const saleDate = sale?.timestamp instanceof Date ? sale.timestamp : new Date(sale?.timestamp ?? Date.now());
+      filteredLines.forEach((line) => {
+        const method = String(line.method || 'OTRO');
+        detailRowsByMethod.push({
+          method,
+          date: saleDate.toISOString().split('T')[0],
+          time: saleDate.toLocaleTimeString('es-VE', { hour: '2-digit', minute: '2-digit' }),
+          timestampMs: saleDate.getTime(),
+          correlativo: String(sale?.correlativo ?? ''),
+          client: String(sale?.client?.name ?? ''),
+          cashier: cashierName,
+          lineUSD: Number(line.amountUSD ?? 0) || 0,
+          lineVES: Number(line.amountVES ?? 0) || 0
+        });
+      });
+
+      const methodsLabel = filteredLines
+        .map((line) => {
+          const usdValue = Number(line.amountUSD ?? 0) || 0;
+          const vesValue = Number(line.amountVES ?? 0) || 0;
+          const parts: string[] = [];
+          if (Math.abs(usdValue) > 0.0001) parts.push(`$ ${usdValue.toFixed(2)}`);
+          if (Math.abs(vesValue) > 0.0001) parts.push(`Bs ${vesValue.toFixed(2)}`);
+          const amountLabel = parts.length > 0 ? ` (${parts.join(' | ')})` : '';
+          return `${line.method}${amountLabel}`;
+        })
+        .join(' + ');
+
+      salesWithPaymentBreakdown.push({
+        date: saleDate.toISOString().split('T')[0],
+        time: saleDate.toLocaleTimeString('es-VE', { hour: '2-digit', minute: '2-digit' }),
+        timestampMs: saleDate.getTime(),
+        correlativo: String(sale?.correlativo ?? ''),
+        client: String(sale?.client?.name ?? ''),
+        cashier: cashierName,
+        totalUSD: Number(sale?.totalUSD ?? 0) || 0,
+        totalVES: Number(sale?.totalVES ?? 0) || 0,
+        methodsLabel: methodsLabel || 'Sin desglose',
+        methodsCount: filteredLines.length
+      });
     });
     const totalUSD = Object.values(byMethod).reduce((sum, item) => sum + (Number(item.usd ?? 0) || 0), 0);
     const totalVES = Object.values(byMethod).reduce((sum, item) => sum + (Number(item.ves ?? 0) || 0), 0);
     const declaredUSD = parseFloat(cashDeclaration.usd) || 0;
     const declaredVES = parseFloat(cashDeclaration.ves) || 0;
+    const methodDetailGroups = Object.entries(
+      detailRowsByMethod.reduce((acc, row) => {
+        if (!acc[row.method]) acc[row.method] = [];
+        acc[row.method].push(row);
+        return acc;
+      }, {} as Record<string, typeof detailRowsByMethod>)
+    )
+      .map(([method, rows]) => ({
+        method,
+        rows: rows.sort((a, b) => {
+          const byCorrelativo = compareCorrelativo(String(a.correlativo ?? ''), String(b.correlativo ?? ''));
+          if (byCorrelativo !== 0) return byCorrelativo;
+          return Number(a.timestampMs ?? 0) - Number(b.timestampMs ?? 0);
+        }),
+        totals: rows.reduce((totals, row) => ({
+          count: totals.count + 1,
+          usd: totals.usd + (Number(row.lineUSD ?? 0) || 0),
+          ves: totals.ves + (Number(row.lineVES ?? 0) || 0)
+        }), { count: 0, usd: 0, ves: 0 })
+      }))
+      .sort((a, b) => a.method.localeCompare(b.method));
+
     return {
       date: zDate,
       sales: cashierFilteredSales,
@@ -1335,6 +1878,7 @@ export function ReportsView() {
       methodOptions: Array.from(availableMethods).sort((a, b) => a.localeCompare(b)),
       totals: { usd: totalUSD, ves: totalVES },
       byMethod,
+      methodDetailGroups,
       byCashierSummaries: Object.values(byCashierSummaries)
         .map((summary) => ({
           ...summary,
@@ -1343,10 +1887,21 @@ export function ReportsView() {
             .sort((a, b) => (Number(b.usd ?? 0) - Number(a.usd ?? 0)))
         }))
         .sort((a, b) => Number(b.totalUSD ?? 0) - Number(a.totalUSD ?? 0)),
-      counts: { total: salesIncludedByMethodFilter.size },
+      salesDetailRows: salesWithPaymentBreakdown.sort((a, b) => {
+        const t = Number(b.timestampMs ?? 0) - Number(a.timestampMs ?? 0);
+        if (t !== 0) return t;
+        return compareCorrelativo(String(a.correlativo ?? ''), String(b.correlativo ?? ''));
+      }),
+      counts: {
+        total: salesIncludedByMethodFilter.size,
+        credit: creditSalesIncluded.size,
+        cash: cashSalesIncluded.size,
+        withoutBreakdown: salesWithoutMethodBreakdown.size,
+        voidedExcluded
+      },
       variance: { usd: declaredUSD - totalUSD, ves: declaredVES - totalVES, hasDeclaration: cashDeclaration.usd !== '' || cashDeclaration.ves !== '' }
     };
-  }, [zDate, zSelectedCashierIds, zMethodFilter, cashDeclaration, extractSalePaymentLines, allBankTx]);
+  }, [zDate, zSelectedCashierIds, zMethodFilter, cashDeclaration, extractSalePaymentLines, allBankTx, classifyCreditSale]);
 
   React.useEffect(() => {
     const methodOptions = Array.isArray((zClosureData as any).methodOptions) ? (zClosureData as any).methodOptions : [];
@@ -1371,6 +1926,49 @@ export function ReportsView() {
       return compareCorrelativo(a.id, b.id);
     });
   }, [purchaseSearch, purchaseDateRange]);
+
+  const purchaseBookExportRows = React.useMemo(() => {
+    const source = purchaseInvoiceHistory.length > 0
+      ? purchaseInvoiceHistory.map((entry) => {
+          const rawDate = entry.invoiceDate || entry.createdAt || '';
+          const timestamp = rawDate
+            ? new Date(String(rawDate).includes('T') ? rawDate : `${String(rawDate).slice(0, 10)}T12:00:00`)
+            : new Date(0);
+          return {
+            timestamp,
+            supplier: entry.supplier,
+            description: entry.invoiceNumber ? `Factura ${entry.invoiceNumber}` : entry.invoiceGroupId,
+            operator: String(entry.operatorName ?? '').trim() || 'SISTEMA',
+            amountUSD: Number(entry.totalInvoiceUSD ?? 0) || 0,
+            status: entry.status,
+            lines: entry.lines,
+            productDetails: formatInvoiceProductDetails(entry.lines)
+          };
+        })
+      : filteredPurchases.map((entry: any) => ({
+          timestamp: entry.timestamp,
+          supplier: entry.supplier,
+          description: entry.description,
+          operator: String((entry as any).createdBy ?? '').trim() || 'SISTEMA',
+          amountUSD: Number(entry.amountUSD ?? 0) || 0,
+          status: entry.status,
+          lines: [],
+          productDetails: String(entry.description ?? '')
+        }));
+
+    const term = purchaseSearch.trim().toUpperCase();
+    return source.filter((row) => {
+      const d = row.timestamp instanceof Date && !Number.isNaN(row.timestamp.getTime())
+        ? row.timestamp.toISOString().slice(0, 10)
+        : '';
+      const dateOk = d >= purchaseDateRange.start && d <= purchaseDateRange.end;
+      const searchOk = !term
+        || String(row.supplier ?? '').toUpperCase().includes(term)
+        || String(row.description ?? '').toUpperCase().includes(term)
+        || String(row.productDetails ?? '').toUpperCase().includes(term);
+      return dateOk && searchOk;
+    }).sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
+  }, [purchaseInvoiceHistory, filteredPurchases, purchaseSearch, purchaseDateRange]);
 
   // EXPENSES TAB DATA
   const filteredExpenses = React.useMemo(() => {
@@ -1473,6 +2071,54 @@ export function ReportsView() {
       if (firebaseUid) usersByFirebaseUid.set(firebaseUid, u);
       if (emailNorm) usersByEmail.set(emailNorm, u);
     });
+    const sessionWindows = dataService.getCashBoxSessions().map((session: any) => {
+      const openTimeRaw = String(session?.openTime ?? '').trim();
+      const closeTimeRaw = String(session?.closeTime ?? '').trim();
+      const safeOpenTime = /^\d{2}:\d{2}/.test(openTimeRaw) ? openTimeRaw.slice(0, 5) : '00:00';
+      const safeCloseTime = /^\d{2}:\d{2}/.test(closeTimeRaw) ? closeTimeRaw.slice(0, 5) : '23:59';
+      const startMs = new Date(`${String(session?.openDate ?? '')}T${safeOpenTime}:00`).getTime();
+      const closeDate = String(session?.closeDate ?? '').trim() || String(session?.openDate ?? '').trim();
+      const endMs = Number.isFinite(new Date(`${closeDate}T${safeCloseTime}:59`).getTime())
+        ? new Date(`${closeDate}T${safeCloseTime}:59`).getTime()
+        : new Date(`${String(session?.openDate ?? '')}T23:59:59`).getTime();
+      return {
+        userId: String(session?.userId ?? '').trim(),
+        userName: String(session?.userName ?? '').trim(),
+        startMs,
+        endMs
+      };
+    }).filter((session: any) =>
+      !!session.userId
+      && Number.isFinite(session.startMs)
+      && Number.isFinite(session.endMs)
+      && session.endMs >= session.startMs
+    );
+    const resolveOperatorBySessionWindow = (sale: any) => {
+      const saleTime = sale?.timestamp instanceof Date
+        ? sale.timestamp.getTime()
+        : new Date(sale?.timestamp ?? Date.now()).getTime();
+      if (!Number.isFinite(saleTime)) return null;
+      const matches = sessionWindows
+        .filter((session: any) => saleTime >= session.startMs && saleTime <= session.endMs);
+      if (matches.length === 0) return null;
+      const uniqueUserIds = Array.from(new Set(matches.map((session: any) => session.userId).filter(Boolean)));
+      if (uniqueUserIds.length !== 1) return null;
+      const matchedUserId = uniqueUserIds[0];
+      const matchedSession = matches
+        .filter((session: any) => session.userId === matchedUserId)
+        .sort((a: any, b: any) => b.startMs - a.startMs)[0];
+      if (!matchedSession) return null;
+      const matchedUser = usersById.get(matchedUserId);
+      return {
+        userId: matchedUserId,
+        firebaseUid: String(matchedUser?.firebaseUid ?? '').trim(),
+        emailNorm: normalizeIdentity(matchedUser?.email ?? ''),
+        name: String(matchedUser?.name ?? '').trim() || matchedSession.userName || '',
+        nameNorm: normalizeIdentity(matchedUser?.name ?? '') || normalizeIdentity(matchedSession.userName ?? ''),
+        source: 'SESSION_WINDOW',
+        sourceDetail: 'cashbox_sessions'
+      };
+    };
 
     const bankActorByCorrelativo = new Map<string, { actorUserId: string; actorName: string }>();
     allBankTx.forEach((tx: any) => {
@@ -1546,6 +2192,11 @@ export function ReportsView() {
             ? 'bank_transactions.actor'
             : 'nombre aproximado'
         };
+      }
+
+      const sessionOperator = resolveOperatorBySessionWindow(sale);
+      if (sessionOperator?.name) {
+        return sessionOperator;
       }
 
       return {
@@ -1887,8 +2538,27 @@ export function ReportsView() {
       cashierMethodFilter === 'ALL' || String(row.paymentMethod) === cashierMethodFilter
     ));
     return baseRows.map((row) => {
-      const vesAmount = Number(row.paymentVES ?? 0) || 0;
-      const usdAmount = Number(row.paymentUSD ?? 0) || 0;
+      const rawVesAmount = Number(row.paymentVES ?? 0) || 0;
+      const rawUsdAmount = Number(row.paymentUSD ?? 0) || 0;
+      const methodToken = normalizePaymentToken(row.paymentMethod).replace(/\s+/g, '_');
+      const isVesMethod =
+        cashierVesMethods.has(String(row.paymentMethod ?? ''))
+        || methodToken.includes('efectivo_bs')
+        || methodToken.includes('efectivo_ves')
+        || methodToken.includes('pago_movil')
+        || methodToken.includes('transfer')
+        || methodToken.includes('debit')
+        || methodToken.includes('biopago');
+      const forceUsdOnlyMethod =
+        cashierUsdMethods.has(String(row.paymentMethod ?? ''))
+        || String(row.paymentMethod ?? '') === 'Efectivo USD'
+        || methodToken.includes('efectivo_usd')
+        || methodToken.includes('cxp')
+        || methodToken.includes('credito');
+      // Regla solicitada para REP Factura x Cajero:
+      // cobros en USD efectivo o CxP no deben contaminar columna/total Bs.
+      const vesAmount = forceUsdOnlyMethod ? 0 : rawVesAmount;
+      const usdAmount = rawUsdAmount;
       const lineRate = Number(row.lineRate ?? 0) || 0;
       const bcvRate = Number(row.bcvRate ?? 0) || 0;
       const internalRate = Number(row.internalRate ?? 0) || 0;
@@ -1899,35 +2569,43 @@ export function ReportsView() {
         ? internalRate
         : lineRate;
 
-      let equivalentUSD = usdAmount;
-      if (vesAmount > 0) {
-        if (selectedRate > 0) equivalentUSD = vesAmount / selectedRate;
-        else if (usdAmount > 0) equivalentUSD = usdAmount;
-        else equivalentUSD = 0;
-      }
+      // Regla contable para detalle por cajero:
+      // si la línea ya trae USD explícito (p.ej. CxP en USD), ese es el valor real.
+      // Solo convertir desde Bs cuando no exista monto USD en la línea.
+      const hasUsdAmount = Math.abs(usdAmount) > 0.0001 && !isVesMethod;
+      // "Equiv USD" en este reporte ahora representa solo salida/cobro real en USD.
+      // No convierte líneas en Bs para esta columna.
+      const equivalentUSD = hasUsdAmount ? usdAmount : 0;
 
-      const usdReceived = usdAmount > 0
-        ? usdAmount
-        : (vesAmount > 0 && selectedRate > 0 ? vesAmount / selectedRate : 0);
+      // Separación estricta por moneda:
+      // - USD real: solo lo que venga explícitamente en amountUSD.
+      // - Bs real: en amountVES.
+      // No mezclar para el total principal USD.
+      const usdReceived = hasUsdAmount ? usdAmount : 0;
+      const netUSD = usdReceived + (vesAmount > 0 && selectedRate > 0 ? (vesAmount / selectedRate) : 0);
 
       return {
         ...row,
+        paymentVES: vesAmount,
         appliedRate: selectedRate,
         equivalentUSD,
-        usdReceived
+        usdReceived,
+        netUSD
       };
     });
-  }, [cashierInvoiceExportRows, cashierMethodFilter, cashierDetailRateMode]);
+  }, [cashierInvoiceExportRows, cashierMethodFilter, cashierDetailRateMode, normalizePaymentToken, cashierUsdMethods, cashierVesMethods]);
 
   const cashierDetailTotals = React.useMemo(() => {
     const totalVES = cashierDetailRows.reduce((sum, row) => sum + (Number(row.paymentVES ?? 0) || 0), 0);
     const totalEquivalentUSD = cashierDetailRows.reduce((sum, row) => sum + (Number(row.equivalentUSD ?? 0) || 0), 0);
     const totalUSDReceived = cashierDetailRows.reduce((sum, row) => sum + (Number(row.usdReceived ?? 0) || 0), 0);
+    const totalNetUSD = cashierDetailRows.reduce((sum, row) => sum + (Number((row as any).netUSD ?? 0) || 0), 0);
     return {
       count: cashierDetailRows.length,
       totalVES,
       totalEquivalentUSD,
-      totalUSDReceived
+      totalUSDReceived,
+      totalNetUSD
     };
   }, [cashierDetailRows]);
 
@@ -1936,14 +2614,110 @@ export function ReportsView() {
     return cashierReportData.globalPaymentMethods.filter((pm) => String(pm.method) === cashierMethodFilter);
   }, [cashierReportData.globalPaymentMethods, cashierMethodFilter]);
 
+  const advanceDateBounds = React.useMemo(() => {
+    const start = new Date(`${advanceDateRange.start}T00:00:00`);
+    const end = new Date(`${advanceDateRange.end}T23:59:59.999`);
+    return { start, end };
+  }, [advanceDateRange.start, advanceDateRange.end]);
+
+  const reportClientAdvancesRows = React.useMemo(() => {
+    const { start, end } = advanceDateBounds;
+    const q = advanceSearch.trim().toLowerCase();
+    return (dataService.getAllClientAdvances() as ClientAdvance[])
+      .filter((a) => {
+        const ts = new Date(a.createdAt);
+        if (Number.isNaN(ts.getTime()) || ts < start || ts > end) return false;
+        if (!advancesIncludeApplied && a.status === 'APPLIED') return false;
+        if (!q) return true;
+        const hay = [
+          a.customerName,
+          a.customerId,
+          a.originCorrelativo,
+          a.originInvoiceId,
+          a.note ?? '',
+          a.id
+        ]
+          .join(' ')
+          .toLowerCase();
+        return hay.includes(q);
+      })
+      .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+  }, [tick, advanceDateBounds, advanceSearch, advancesIncludeApplied]);
+
+  const reportSupplierAdvancesRows = React.useMemo(() => {
+    const { start, end } = advanceDateBounds;
+    const q = advanceSearch.trim().toLowerCase();
+    return supplierAdvancesForReport.filter((a) => {
+      const ts = new Date(a.createdAt);
+      if (Number.isNaN(ts.getTime()) || ts < start || ts > end) return false;
+      if (!q) return true;
+      const hay = [
+        a.supplierName,
+        a.supplierId ?? '',
+        a.reference,
+        a.note ?? '',
+        a.id
+      ]
+        .join(' ')
+        .toLowerCase();
+      return hay.includes(q);
+    }).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+  }, [supplierAdvancesForReport, advanceDateBounds, advanceSearch]);
+
+  const advancesClientTotals = React.useMemo(
+    () => ({
+      count: reportClientAdvancesRows.length,
+      originalUSD: reportClientAdvancesRows.reduce((s, a) => s + (Number(a.amountUSD) || 0), 0),
+      balanceUSD: reportClientAdvancesRows.reduce((s, a) => s + (Number(a.balanceUSD) || 0), 0)
+    }),
+    [reportClientAdvancesRows]
+  );
+
+  const advancesSupplierTotals = React.useMemo(
+    () => ({
+      count: reportSupplierAdvancesRows.length,
+      originalUSD: reportSupplierAdvancesRows.reduce((s, a) => s + (Number(a.amountUSD) || 0), 0),
+      balanceUSD: reportSupplierAdvancesRows.reduce((s, a) => s + (Number(a.balanceUSD) || 0), 0)
+    }),
+    [reportSupplierAdvancesRows]
+  );
+
+  React.useEffect(() => {
+    if (activeTab !== 'advances' || advancesReportKind !== 'supplier') {
+      setLoadingAdvancesReport(false);
+      return;
+    }
+    let cancelled = false;
+    setLoadingAdvancesReport(true);
+    dataService
+      .getAllSupplierAdvancesForAdmin(advancesIncludeApplied)
+      .then((list) => {
+        if (!cancelled) {
+          setSupplierAdvancesForReport(Array.isArray(list) ? list : []);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setSupplierAdvancesForReport([]);
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingAdvancesReport(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, advancesReportKind, advancesIncludeApplied, advancesRefreshKey]);
+
   const tabs = [
     { key: 'overview',   label: 'Visión General',  icon: BarChart },
+    { key: 'sales',      label: 'Ventas',          icon: ShoppingBag },
+    { key: 'profit',     label: 'Utilidad vendida', icon: CircleDollarSign },
     { key: 'margins',    label: 'Márgenes',         icon: Package },
     { key: 'treasury',   label: 'Tesorería',        icon: Wallet },
     { key: 'purchases',  label: 'Libro Compras',    icon: Truck },
     { key: 'expenses',   label: 'Egresos',          icon: TrendingDown },
+    { key: 'advances',   label: 'Anticipos',        icon: CreditCard },
     { key: 'shrinkage',  label: 'Mermas',           icon: Scale },
-    { key: 'zclosure',   label: 'Cierre Z',         icon: Lock },
+    { key: 'zclosure',   label: 'Cierre Caja',      icon: Lock },
     { key: 'cashier',    label: 'Factura x Cajero', icon: Users }
   ].filter((tab) => reportTabAccess[tab.key as ReportTab]);
 
@@ -1956,11 +2730,14 @@ export function ReportsView() {
   const getActiveReportLabel = React.useCallback(() => {
     const map: Record<ReportTab, string> = {
       overview: 'Vision General',
+      sales: 'Ventas',
+      profit: 'Utilidad vendida',
       margins: 'Margenes',
       treasury: 'Tesoreria',
-      zclosure: 'Cierre Z',
+      zclosure: 'Cierre Caja',
       purchases: 'Libro de Compras',
       expenses: 'Libro de Egresos',
+      advances: 'Anticipos',
       shrinkage: 'Mermas',
       cashier: 'Factura x Cajero'
     };
@@ -1970,6 +2747,21 @@ export function ReportsView() {
   const getActiveFilterLabel = React.useCallback(() => {
     if (activeTab === 'overview') {
       return [
+        `Rango: ${dateRange.start} a ${dateRange.end}`,
+        `Tipo mov.: ${overviewMovementType === 'ALL' ? 'Todos' : overviewMovementType}`,
+        `Flujo: ${overviewFlow === 'ALL' ? 'Todos' : (overviewFlow === 'INCOME' ? 'Ingresos' : 'Egresos')}`,
+        `Busqueda: ${overviewQuery.trim() || 'Todos'}`
+      ].join(' | ');
+    }
+    if (activeTab === 'sales') {
+      const tipo =
+        String(filters.status ?? '').toUpperCase() === 'CASH' ? 'Contado (Estado)'
+          : String(filters.status ?? '').toUpperCase() === 'CREDIT' ? 'Crédito (Estado)'
+            : salesBookKind === 'CASH' ? 'Solo contado'
+              : salesBookKind === 'CREDIT' ? 'Solo crédito'
+                : 'Contado y crédito';
+      return [
+        `Libro ventas: ${tipo}`,
         `Rango: ${dateRange.start} a ${dateRange.end}`,
         `Cliente: ${filters.client || 'Todos'}`,
         `Metodo: ${filters.method || 'ALL'}`,
@@ -2017,6 +2809,27 @@ export function ReportsView() {
     if (activeTab === 'expenses') {
       return `Rango: ${expenseDateRange.start} a ${expenseDateRange.end} | Categoria: ${expenseCategory}`;
     }
+    if (activeTab === 'advances') {
+      return [
+        `Tipo: ${advancesReportKind === 'client' ? 'Clientes' : 'Proveedores'}`,
+        `Rango: ${advanceDateRange.start} a ${advanceDateRange.end}`,
+        advancesIncludeApplied ? 'Incluye aplicados' : 'Solo disponibles / parciales',
+        `Busqueda: ${advanceSearch.trim() || '—'}`
+      ].join(' | ');
+    }
+    if (activeTab === 'profit') {
+      return [
+        `Rango: ${profitDateRange.start} a ${profitDateRange.end}`,
+        `Producto: ${profitProductQuery === 'ALL' ? 'Todos' : profitProductQuery}`,
+        'Base: ventas no anuladas; costo por lote despachado o promedio de stock'
+      ].join(' | ');
+    }
+    if (activeTab === 'margins') {
+      const filterTarget = marginFilterMode === 'PRODUCT'
+        ? `Filtro por Producto: ${marginFilterQuery.trim() || 'Todos'}`
+        : `Filtro por Lote: ${marginFilterQuery.trim() || 'Todos'}`;
+      return `Periodo: ${marginDateRange.start} a ${marginDateRange.end} | ${filterTarget}`;
+    }
     return 'Sin filtros adicionales';
   }, [
     activeTab,
@@ -2046,15 +2859,32 @@ export function ReportsView() {
     purchaseSearch,
     expenseDateRange.start,
     expenseDateRange.end,
-    expenseCategory
+    expenseCategory,
+    salesBookKind,
+    advancesReportKind,
+    advanceDateRange.start,
+    advanceDateRange.end,
+    advancesIncludeApplied,
+    advanceSearch,
+    profitDateRange.start,
+    profitDateRange.end,
+    profitProductQuery,
+    overviewMovementType,
+    overviewFlow,
+    overviewQuery,
+    marginFilterMode,
+    marginFilterQuery,
+    marginDateRange.start,
+    marginDateRange.end
   ]);
 
-  const exportCSV = (rows: any[], filename: string, context?: { reportLabel?: string; filterLabel?: string }) => {
+  const exportCSV = (rows: any[], filename: string, context?: { reportLabel?: string; filterLabel?: string; includeTotals?: boolean }) => {
     if (!rows.length) return;
     const reportLabel = context?.reportLabel ?? getActiveReportLabel();
     const filterLabel = context?.filterLabel ?? getActiveFilterLabel();
+    const includeTotals = Boolean(context?.includeTotals);
     const generatedBy = String(currentUser?.name ?? currentUser?.email ?? 'Sistema');
-    const generatedAt = new Date().toLocaleString();
+    const generatedAt = new Date().toLocaleString('es-VE');
     const keySet = new Set<string>();
     rows.forEach((r) => {
       if (r && typeof r === 'object') {
@@ -2065,6 +2895,32 @@ export function ReportsView() {
     const extra = Array.from(keySet).filter((k) => !firstKeys.includes(k)).sort((a, b) => a.localeCompare(b, 'es'));
     const headers = firstKeys.length > 0 ? [...firstKeys, ...extra] : Array.from(keySet);
     if (headers.length === 0) return;
+    const csvRows = [...rows];
+    if (includeTotals) {
+      const numericHeaders = headers.filter((h) =>
+        csvRows.every((r: any) => {
+          const v = r?.[h];
+          if (v === '' || v == null) return true;
+          return Number.isFinite(Number(v));
+        })
+      );
+      if (numericHeaders.length > 0) {
+        const totalRow: Record<string, any> = {};
+        headers.forEach((h, idx) => {
+          if (idx === 0) {
+            totalRow[h] = 'TOTAL';
+            return;
+          }
+          if (!numericHeaders.includes(h)) {
+            totalRow[h] = '';
+            return;
+          }
+          const sum = csvRows.reduce((acc: number, r: any) => acc + (Number(r?.[h] ?? 0) || 0), 0);
+          totalRow[h] = roundMoney(sum);
+        });
+        csvRows.push(totalRow);
+      }
+    }
     const preambleRows: string[][] = [
       ['TIPO_REPORTE', reportLabel],
       ['FILTROS_APLICADOS', filterLabel],
@@ -2072,7 +2928,7 @@ export function ReportsView() {
       ['FECHA_GENERACION', generatedAt],
       Array.from({ length: headers.length }, () => '')
     ];
-    const csv = buildExcelFriendlyCsv(headers, rows, { preambleRows });
+    const csv = buildExcelFriendlyCsv(headers, csvRows, { preambleRows });
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -2080,6 +2936,14 @@ export function ReportsView() {
     a.download = filename;
     a.click();
     URL.revokeObjectURL(url);
+    const detail = [
+      'Exportacion CSV',
+      `Reporte: ${reportLabel}`,
+      `Archivo: ${filename}`,
+      `Filtros: ${filterLabel}`,
+      `Fecha: ${generatedAt}`
+    ].join(' | ');
+    void dataService.addAuditEntry('REPORTS', 'EXPORT', detail).catch(() => {});
   };
 
   if (tabs.length === 0) {
@@ -2250,18 +3114,34 @@ export function ReportsView() {
             >
               Limpiar filtros
             </button>
-            <button onClick={() => printService.printSalesReport(
-              filteredSales,
-              dateRange,
-              filters,
-              {
-                includeReturns: false,
-                includeVoided: filters.status === 'ALL' || filters.status === 'VOID',
-                showNetTotals: true
-              }
+            <button
+              onClick={() => reportService.exportGeneralOperationsToPDF(
+                filteredOperationsJournal,
+                { dateRange, filterLabel: getActiveFilterLabel() }
+              )}
+              className="flex items-center gap-2 px-4 py-2 bg-emerald-950 text-white rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-emerald-900 transition-all"
+            >
+              <Download className="w-3 h-3" /> PDF General
+            </button>
+            <button onClick={() => exportCSV(
+              filteredOperationsJournal.map(o => ({
+                fecha: o.date,
+                hora: o.time,
+                tipo: o.type,
+                tipo_label: o.typeLabel,
+                correlativo: o.correlativo,
+                entidad: o.entity,
+                descripcion: o.description,
+                usd: Number(o.amountUSD ?? 0),
+                ves: Number(o.amountVES ?? 0),
+                metodo: o.method,
+                estado: o.status
+              })),
+              `vision_general_contable_${dateRange.start}_${dateRange.end}.csv`,
+              { reportLabel: 'Vision General Contable', filterLabel: getActiveFilterLabel(), includeTotals: true }
             )}
-              className="flex items-center gap-2 px-4 py-2 bg-emerald-950 text-white rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-emerald-900 transition-all">
-              <Download className="w-3 h-3" /> Exportar
+              className="flex items-center gap-2 px-4 py-2 bg-white border border-slate-200 text-slate-600 rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-slate-50 transition-all">
+              <Download className="w-3 h-3" /> Excel General
             </button>
           </div>
           <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 space-y-3">
@@ -2314,14 +3194,14 @@ export function ReportsView() {
           </div>
 
           <div className="flex flex-wrap items-center gap-2 text-[9px] font-bold text-slate-600 bg-slate-50/80 border border-slate-200/80 rounded-2xl px-4 py-2.5">
-            <span className="font-black uppercase text-slate-500 tracking-wider">Totales con filtros actuales</span>
+            <span className="font-black uppercase text-slate-500 tracking-wider">Totales contables con filtros actuales</span>
             <span className="text-slate-400">|</span>
-            <span>{filteredSales.length} facturas</span>
+            <span>{filteredOperationsTotals.count} movimientos</span>
             <span className="text-slate-400">·</span>
-            <span className="font-mono text-slate-800">{usd(filteredSalesTotals.totalUSD)}</span>
+            <span className="font-mono text-slate-800">USD neto {usd(filteredOperationsTotals.totalUSD)}</span>
             <span className="text-slate-400">·</span>
-            <span className="font-mono text-slate-800">{bs(filteredSalesTotals.totalVES)}</span>
-            <span className="ml-1 text-slate-400 font-normal">(Alineado con tabla y exportaciones de esta pestaña.)</span>
+            <span className="font-mono text-slate-800">VES neto {bs(filteredOperationsTotals.totalVES)}</span>
+            <span className="ml-1 text-slate-400 font-normal">(Alineado con el libro de operaciones y su exportación.)</span>
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
@@ -2361,14 +3241,78 @@ export function ReportsView() {
               </div>
             </div>
             <div className="lg:col-span-4 bg-slate-900 p-6 rounded-[2rem] text-white">
-              <h3 className="text-lg font-black uppercase mb-6">Valoracion de Inventario</h3>
+              <div className="flex flex-col gap-4 mb-6">
+                <h3 className="text-lg font-black uppercase">Valoracion de Inventario</h3>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-[9px] font-black uppercase tracking-widest">
+                  <label className="flex flex-col gap-1.5">
+                    <span className="text-white/50">Criterio</span>
+                    <select
+                      value={valuationPricing}
+                      onChange={(e) => setValuationPricing(e.target.value === 'sale' ? 'sale' : 'cost')}
+                      className="bg-white/10 border border-white/20 rounded-xl px-3 py-2 text-white font-black normal-case tracking-normal"
+                    >
+                      <option value="cost">Precio costo</option>
+                      <option value="sale">Precio venta (lista)</option>
+                    </select>
+                  </label>
+                  <label className="flex flex-col gap-1.5">
+                    <span className="text-white/50">Moneda total</span>
+                    <select
+                      value={valuationCurrency}
+                      onChange={(e) => setValuationCurrency(e.target.value === 'VES' ? 'VES' : 'USD')}
+                      className="bg-white/10 border border-white/20 rounded-xl px-3 py-2 text-white font-black normal-case tracking-normal"
+                    >
+                      <option value="USD">Total en USD</option>
+                      <option value="VES">Total en Bs</option>
+                    </select>
+                  </label>
+                </div>
+                {valuationCurrency === 'VES' && (
+                  <label className="flex flex-col gap-1.5 text-[9px] font-black uppercase tracking-widest">
+                    <span className="text-white/50">Tasa Bs/USD</span>
+                    <input
+                      type="text"
+                      inputMode="decimal"
+                      value={valuationVesRateInput}
+                      onChange={(e) => setValuationVesRateInput(e.target.value)}
+                      className="bg-white/10 border border-white/20 rounded-xl px-3 py-2 text-white font-mono font-black normal-case tracking-normal"
+                      placeholder="Ej. 36.50"
+                    />
+                  </label>
+                )}
+                <div className="flex flex-wrap gap-2 items-center">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      reportService.exportInventoryToPDF({
+                        pricing: valuationPricing,
+                        currency: valuationCurrency,
+                        vesRate: valuationVesRate
+                      })
+                    }
+                    className="inline-flex items-center gap-2 px-3 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-[9px] font-black uppercase tracking-widest transition-colors"
+                  >
+                    <Download className="w-3 h-3" />
+                    PDF valorización
+                  </button>
+                  <span className="text-[8px] font-bold text-white/40 normal-case">
+                    Mismo criterio y tasa que la tabla
+                  </span>
+                </div>
+              </div>
               <div className="space-y-4">
-                {inventoryStats.slice(0, 5).map((p, i) => (
-                  <div key={i} className="flex justify-between items-center border-b border-white/10 pb-2">
-                    <span className="text-[10px] font-bold uppercase">{p.description.slice(0, 20)}</span>
-                    <span className="text-[11px] font-black font-mono">${p.valueUSD.toFixed(0)}</span>
-                  </div>
-                ))}
+                {inventoryStats.slice(0, 5).map((p, i) => {
+                  const usdVal = Number(p.valueUSD) || 0;
+                  const shown =
+                    valuationCurrency === 'VES' ? roundMoney(usdVal * valuationVesRate) : usdVal;
+                  const shownText = valuationCurrency === 'VES' ? bs(shown, 0) : usd(shown, 0);
+                  return (
+                    <div key={i} className="flex justify-between items-center border-b border-white/10 pb-2 gap-2">
+                      <span className="text-[10px] font-bold uppercase truncate">{p.description.slice(0, 20)}</span>
+                      <span className="text-[11px] font-black font-mono shrink-0">{shownText}</span>
+                    </div>
+                  );
+                })}
               </div>
             </div>
           </div>
@@ -2378,7 +3322,11 @@ export function ReportsView() {
             <div className="bg-white rounded-[2rem] border border-slate-200 shadow-sm overflow-hidden">
               <div className="p-6 border-b border-slate-100 flex justify-between items-center">
                 <h3 className="text-lg font-black text-slate-900 uppercase">Ventas por Método de Pago</h3>
-                <button onClick={() => exportCSV(methodDist, `metodos_pago_${new Date().toISOString().split('T')[0]}.csv`)}
+                <button onClick={() => exportCSV(
+                  methodDist,
+                  `metodos_pago_${new Date().toISOString().split('T')[0]}.csv`,
+                  { reportLabel: 'Ventas por metodo de pago', filterLabel: getActiveFilterLabel(), includeTotals: true }
+                )}
                   className="flex items-center gap-2 px-3 py-1.5 bg-slate-100 text-slate-600 rounded-xl text-[9px] font-black uppercase hover:bg-slate-200 transition-all">
                   <Download className="w-3 h-3" /> Excel
                 </button>
@@ -2474,6 +3422,48 @@ export function ReportsView() {
             </div>
           )}
 
+          {canSeeOverviewFinanceBlocks ? (
+            <div className="bg-white rounded-[2rem] border border-slate-200 shadow-sm overflow-hidden">
+              <div className="p-6 border-b border-slate-100 flex items-center justify-between gap-3 flex-wrap">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 bg-blue-900 rounded-2xl flex items-center justify-center shrink-0">
+                    <CircleDollarSign className="w-5 h-5 text-blue-100" />
+                  </div>
+                  <div>
+                    <h3 className="text-lg font-black text-slate-900 uppercase">Préstamos Internos</h3>
+                    <p className="text-[9px] font-bold text-slate-400 uppercase mt-0.5">
+                      Reporte rápido de cartera (trabajadores y socios)
+                    </p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => reportService.exportCompanyLoansToPDF(companyLoans)}
+                  className="flex items-center gap-2 px-4 py-2 bg-blue-700 text-white rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-blue-800 transition-all"
+                >
+                  <FileText className="w-3 h-3" /> Abrir PDF
+                </button>
+              </div>
+              <div className="p-6 grid grid-cols-2 md:grid-cols-4 gap-3 bg-blue-50/40">
+                <div className="rounded-xl border border-blue-100 bg-white px-3 py-2">
+                  <div className="text-[8px] font-black uppercase tracking-widest text-slate-400">Registrados</div>
+                  <div className="text-[14px] font-black text-slate-900">{companyLoansSummary.total}</div>
+                </div>
+                <div className="rounded-xl border border-blue-100 bg-white px-3 py-2">
+                  <div className="text-[8px] font-black uppercase tracking-widest text-blue-600">Activos</div>
+                  <div className="text-[14px] font-black text-blue-700">{companyLoansSummary.openCount}</div>
+                </div>
+                <div className="rounded-xl border border-red-100 bg-white px-3 py-2">
+                  <div className="text-[8px] font-black uppercase tracking-widest text-red-600">Vencidos</div>
+                  <div className="text-[14px] font-black text-red-700">{companyLoansSummary.overdueCount}</div>
+                </div>
+                <div className="rounded-xl border border-emerald-100 bg-white px-3 py-2">
+                  <div className="text-[8px] font-black uppercase tracking-widest text-emerald-600">Saldo abierto</div>
+                  <div className="text-[14px] font-black text-emerald-700">{usd(companyLoansSummary.openBalance)}</div>
+                </div>
+              </div>
+            </div>
+          ) : null}
+
           {/* LIBRO DE OPERACIONES CONSOLIDADO */}
           {canSeeOverviewFinanceBlocks ? (
           <div className="bg-white rounded-[2rem] border border-slate-200 shadow-sm overflow-hidden">
@@ -2485,29 +3475,84 @@ export function ReportsView() {
                 <div>
                   <h3 className="text-lg font-black text-slate-900 uppercase">Libro de Operaciones</h3>
                   <p className="text-[9px] font-bold text-slate-400 uppercase mt-0.5">
-                    {operationsJournal.length} registros · Ventas, Compras, Devoluciones, Egresos y Anticipos
+                    {filteredOperationsJournal.length} registros filtrados · movimientos contables consolidados
                   </p>
                 </div>
               </div>
-              <button onClick={() => exportCSV(
-                operationsJournal.map(o => ({
-                  fecha: o.date,
-                  hora: o.time,
-                  tipo: o.type,
-                  tipo_label: o.typeLabel,
-                  correlativo: o.correlativo,
-                  entidad: o.entity,
-                  descripcion: o.description,
-                  usd: o.amountUSD.toFixed(2),
-                  ves: o.amountVES.toFixed(2),
-                  metodo: o.method,
-                  estado: o.status
-                })),
-                `libro_operaciones_${dateRange.start}_${dateRange.end}.csv`
-              )}
-                className="flex items-center gap-2 px-3 py-1.5 bg-slate-900 text-white rounded-xl text-[9px] font-black uppercase hover:bg-slate-800 transition-all">
-                <Download className="w-3 h-3" /> Excel
-              </button>
+              <div className="flex items-center gap-2 flex-wrap">
+                <select
+                  value={overviewMovementType}
+                  onChange={(e) => setOverviewMovementType((e.target.value as OverviewMovementType) || 'ALL')}
+                  className="px-3 py-1.5 bg-slate-100 text-slate-700 rounded-xl text-[9px] font-black uppercase border border-slate-200"
+                >
+                  <option value="ALL">Todos los tipos</option>
+                  <option value="VENTA">Ventas</option>
+                  <option value="COMPRA">Compras</option>
+                  <option value="DEVOLUCION">Devoluciones / Notas crédito</option>
+                  <option value="EGRESO">Egresos</option>
+                  <option value="ANTICIPO">Anticipos</option>
+                  <option value="COBRO_AR">Cobros AR</option>
+                  <option value="PAGO_AP">Pagos AP</option>
+                  <option value="MERMA">Mermas</option>
+                </select>
+                <select
+                  value={overviewFlow}
+                  onChange={(e) => setOverviewFlow((e.target.value as OverviewFlow) || 'ALL')}
+                  className="px-3 py-1.5 bg-slate-100 text-slate-700 rounded-xl text-[9px] font-black uppercase border border-slate-200"
+                >
+                  <option value="ALL">Todos los flujos</option>
+                  <option value="INCOME">Solo ingresos</option>
+                  <option value="EXPENSE">Solo egresos</option>
+                </select>
+                <input
+                  type="text"
+                  value={overviewQuery}
+                  onChange={(e) => setOverviewQuery(e.target.value)}
+                  placeholder="Buscar por entidad, correlativo, descripción..."
+                  className="px-3 py-1.5 bg-slate-100 text-slate-700 rounded-xl text-[9px] font-black border border-slate-200 min-w-[260px]"
+                />
+                <button
+                  onClick={() => {
+                    setOverviewMovementType('ALL');
+                    setOverviewFlow('ALL');
+                    setOverviewQuery('');
+                  }}
+                  className="px-3 py-1.5 bg-white border border-slate-200 text-slate-600 rounded-xl text-[9px] font-black uppercase hover:bg-slate-50 transition-all"
+                >
+                  Limpiar
+                </button>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => reportService.exportGeneralOperationsToPDF(
+                    filteredOperationsJournal,
+                    { dateRange, filterLabel: getActiveFilterLabel() }
+                  )}
+                  className="flex items-center gap-2 px-3 py-1.5 bg-emerald-950 text-white rounded-xl text-[9px] font-black uppercase hover:bg-emerald-900 transition-all"
+                >
+                  <Download className="w-3 h-3" /> PDF
+                </button>
+                <button onClick={() => exportCSV(
+                  filteredOperationsJournal.map(o => ({
+                    fecha: o.date,
+                    hora: o.time,
+                    tipo: o.type,
+                    tipo_label: o.typeLabel,
+                    correlativo: o.correlativo,
+                    entidad: o.entity,
+                    descripcion: o.description,
+                    usd: o.amountUSD.toFixed(2),
+                    ves: o.amountVES.toFixed(2),
+                    metodo: o.method,
+                    estado: o.status
+                  })),
+                  `libro_operaciones_${dateRange.start}_${dateRange.end}.csv`,
+                  { reportLabel: 'Libro de Operaciones Contables', filterLabel: getActiveFilterLabel(), includeTotals: true }
+                )}
+                  className="flex items-center gap-2 px-3 py-1.5 bg-slate-900 text-white rounded-xl text-[9px] font-black uppercase hover:bg-slate-800 transition-all">
+                  <Download className="w-3 h-3" /> Excel
+                </button>
+              </div>
             </div>
             <div className="overflow-x-auto">
               <table className="w-full">
@@ -2525,9 +3570,9 @@ export function ReportsView() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {operationsJournal.length === 0 ? (
+                  {filteredOperationsJournal.length === 0 ? (
                     <tr><td colSpan={9} className="py-16 text-center text-slate-300 font-black uppercase text-sm">Sin operaciones en este período</td></tr>
-                  ) : operationsJournal.slice(0, 50).map((op, i) => {
+                  ) : filteredOperationsJournal.slice(0, 200).map((op, i) => {
                     const isIncome = op.amountUSD > 0 || op.amountVES > 0;
                     const typeColors: Record<string, string> = {
                       'VENTA': 'bg-emerald-100 text-emerald-700',
@@ -2709,7 +3754,8 @@ export function ReportsView() {
                   valor_entradas_usd: p.inValueUSD.toFixed(2),
                   valor_salidas_usd: p.outValueUSD.toFixed(2)
                 })),
-                `movimientos_inventario_${dateRange.start}_${dateRange.end}.csv`
+                `movimientos_inventario_${dateRange.start}_${dateRange.end}.csv`,
+                { reportLabel: 'Movimientos de inventario', filterLabel: getActiveFilterLabel(), includeTotals: true }
               )}
                 className="flex items-center gap-2 px-3 py-1.5 bg-slate-900 text-white rounded-xl text-[9px] font-black uppercase hover:bg-slate-800 transition-all">
                 <Download className="w-3 h-3" /> Excel
@@ -2814,6 +3860,19 @@ export function ReportsView() {
                 </p>
               </div>
               <div className="flex items-center gap-2">
+                <button
+                  onClick={() => reportService.exportSalesBookToPDF(filteredSales as any, {
+                    start: dateRange.start,
+                    end: dateRange.end,
+                    search: filters.client,
+                    filterLabel: getActiveFilterLabel(),
+                    title: 'LIBRO DE VENTAS'
+                  })}
+                  disabled={filteredSales.length === 0}
+                  className="flex items-center gap-1 px-3 py-1.5 bg-emerald-950 text-white rounded-xl text-[9px] font-black uppercase hover:bg-emerald-900 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <Download className="w-3 h-3" /> PDF
+                </button>
                 <button onClick={() => {
                   const creditCount = filteredSalesSplitSummary.credit.count;
                   const cashCount = filteredSalesSplitSummary.cash.count;
@@ -2830,6 +3889,7 @@ export function ReportsView() {
                         rif: s.client.id,
                         totalUSD: s.totalUSD,
                         totalVES: s.totalVES,
+                        detalle_productos: formatInvoiceProductDetails((s as any).items),
                         metodo: s.paymentMethod
                       })),
                       {
@@ -2839,6 +3899,7 @@ export function ReportsView() {
                         rif: '',
                         totalUSD: '',
                         totalVES: '',
+                        detalle_productos: '',
                         metodo: ''
                       },
                       {
@@ -2848,6 +3909,7 @@ export function ReportsView() {
                         rif: '',
                         totalUSD: cashUSD,
                         totalVES: cashVES,
+                        detalle_productos: '',
                         metodo: ''
                       },
                       {
@@ -2857,6 +3919,7 @@ export function ReportsView() {
                         rif: '',
                         totalUSD: creditUSD,
                         totalVES: creditVES,
+                        detalle_productos: '',
                         metodo: ''
                       }
                     ],
@@ -3018,6 +4081,358 @@ export function ReportsView() {
         </div>
       )}
 
+      {activeTab === 'sales' && (
+        <div className="space-y-6">
+          <div className="flex flex-wrap items-center gap-4">
+            <div className="flex flex-col gap-1">
+              <span className="text-[8px] font-black text-slate-400 uppercase tracking-widest ml-1">Periodo</span>
+              <div className="flex items-center gap-2 bg-slate-100 p-2 rounded-xl border border-slate-200">
+                <Calendar className="w-3 h-3 text-slate-400 ml-1" />
+                <input type="date" value={dateRange.start}
+                  onChange={(e) => setDateRange(prev => ({ ...prev, start: e.target.value }))}
+                  className="bg-transparent border-0 p-0 text-[10px] font-black uppercase text-slate-600 focus:ring-0" />
+                <span className="text-[10px] font-black text-slate-300 px-1">/</span>
+                <input type="date" value={dateRange.end}
+                  onChange={(e) => setDateRange(prev => ({ ...prev, end: e.target.value }))}
+                  className="bg-transparent border-0 p-0 text-[10px] font-black uppercase text-slate-600 focus:ring-0" />
+              </div>
+            </div>
+            <div className="flex flex-col gap-1">
+              <span className="text-[8px] font-black text-slate-400 uppercase tracking-widest ml-1">Búsqueda</span>
+              <div className="flex items-center gap-2 bg-slate-100 p-2 rounded-xl border border-slate-200">
+                <ShoppingBag className="w-3 h-3 text-slate-400 ml-1" />
+                <input type="text" placeholder="Cliente, RIF, factura, cajero..." value={filters.client}
+                  onChange={(e) => setFilters(prev => ({ ...prev, client: e.target.value }))}
+                  className="bg-transparent border-0 p-0 text-[10px] font-black uppercase text-slate-600 focus:ring-0 placeholder:text-slate-300 w-56" />
+              </div>
+            </div>
+            <div className="flex flex-col gap-1">
+              <span className="text-[8px] font-black text-slate-400 uppercase tracking-widest ml-1">Método</span>
+              <div className="flex items-center gap-2 bg-slate-100 p-2 rounded-xl border border-slate-200">
+                <CreditCard className="w-3 h-3 text-slate-400 ml-1" />
+                <select
+                  value={filters.method}
+                  onChange={(e) => setFilters(prev => ({ ...prev, method: e.target.value }))}
+                  className="bg-transparent border-0 p-0 text-[10px] font-black uppercase text-slate-600 focus:ring-0"
+                >
+                  <option value="ALL">TODOS</option>
+                  {salesMethodOptions.map((method) => (
+                    <option key={method} value={method}>{method}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+            <div className="flex flex-col gap-1">
+              <span className="text-[8px] font-black text-slate-400 uppercase tracking-widest ml-1">Estado</span>
+              <div className="flex items-center gap-2 bg-slate-100 p-2 rounded-xl border border-slate-200">
+                <Activity className="w-3 h-3 text-slate-400 ml-1" />
+                <select
+                  value={filters.status}
+                  onChange={(e) => setFilters(prev => ({ ...prev, status: e.target.value }))}
+                  className="bg-transparent border-0 p-0 text-[10px] font-black uppercase text-slate-600 focus:ring-0"
+                >
+                  <option value="ALL">TODOS</option>
+                  <option value="COMPLETED">COMPLETADAS</option>
+                  <option value="VOID">ANULADAS</option>
+                  <option value="CASH">CONTADO</option>
+                  <option value="CREDIT">CRÉDITO</option>
+                </select>
+              </div>
+            </div>
+            <div className="flex flex-col gap-1">
+              <span className="text-[8px] font-black text-slate-400 uppercase tracking-widest ml-1">Cajero</span>
+              <div className="flex items-center gap-2 bg-slate-100 p-2 rounded-xl border border-slate-200">
+                <User className="w-3 h-3 text-slate-400 ml-1" />
+                <select
+                  value={filters.cashier}
+                  onChange={(e) => setFilters(prev => ({ ...prev, cashier: e.target.value }))}
+                  className="bg-transparent border-0 p-0 text-[10px] font-black uppercase text-slate-600 focus:ring-0 max-w-[170px]"
+                >
+                  <option value="ALL">TODOS</option>
+                  {salesCashierOptions.map((cashier) => (
+                    <option key={cashier} value={cashier}>{cashier}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+            <div className="flex flex-col gap-1">
+              <span className="text-[8px] font-black text-slate-400 uppercase tracking-widest ml-1">Rango USD</span>
+              <div className="flex items-center gap-2 bg-slate-100 p-2 rounded-xl border border-slate-200">
+                <DollarSign className="w-3 h-3 text-slate-400 ml-1" />
+                <input type="number" min="0" step="0.01" placeholder="Min" value={filters.minUSD}
+                  onChange={(e) => setFilters(prev => ({ ...prev, minUSD: e.target.value }))}
+                  className="w-16 bg-transparent border-0 p-0 text-[10px] font-black uppercase text-slate-600 focus:ring-0 placeholder:text-slate-300" />
+                <span className="text-[10px] font-black text-slate-300">-</span>
+                <input type="number" min="0" step="0.01" placeholder="Max" value={filters.maxUSD}
+                  onChange={(e) => setFilters(prev => ({ ...prev, maxUSD: e.target.value }))}
+                  className="w-16 bg-transparent border-0 p-0 text-[10px] font-black uppercase text-slate-600 focus:ring-0 placeholder:text-slate-300" />
+              </div>
+            </div>
+            <div className="flex flex-col gap-1">
+              <span className="text-[8px] font-black text-slate-400 uppercase tracking-widest ml-1">Orden</span>
+              <div className="flex items-center gap-2 bg-slate-100 p-2 rounded-xl border border-slate-200">
+                <TrendingUp className="w-3 h-3 text-slate-400 ml-1" />
+                <select
+                  value={filters.sortBy}
+                  onChange={(e) => setFilters(prev => ({ ...prev, sortBy: e.target.value }))}
+                  className="bg-transparent border-0 p-0 text-[10px] font-black uppercase text-slate-600 focus:ring-0"
+                >
+                  <option value="DATE_DESC">Fecha desc</option>
+                  <option value="DATE_ASC">Fecha asc</option>
+                  <option value="USD_DESC">Monto desc</option>
+                  <option value="USD_ASC">Monto asc</option>
+                </select>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => { setFilters(INITIAL_SALES_FILTERS); setSalesBookKind('ALL'); }}
+              className="px-4 py-2 bg-white border border-slate-200 text-slate-600 rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-slate-50 transition-all"
+            >
+              Limpiar filtros
+            </button>
+            <button
+              type="button"
+              disabled={salesBookRows.length === 0}
+              onClick={() => printService.printSalesReport(
+                salesBookRows,
+                dateRange,
+                filters,
+                {
+                  includeReturns: false,
+                  includeVoided: filters.status === 'ALL' || filters.status === 'VOID',
+                  showNetTotals: true
+                }
+              )}
+              className="flex items-center gap-2 px-4 py-2 bg-emerald-950 text-white rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-emerald-900 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              <Download className="w-3 h-3" /> Exportar PDF
+            </button>
+          </div>
+
+          <div className="flex flex-col gap-2">
+            <span className="text-[8px] font-black text-slate-400 uppercase tracking-widest ml-1">Tipo de venta (contado / crédito)</span>
+            <div className="flex flex-wrap items-center gap-2">
+              {(['ALL', 'CASH', 'CREDIT'] as const).map((k) => {
+                const active = salesBookKind === k;
+                const disabled = filters.status === 'CASH' || filters.status === 'CREDIT';
+                const label = k === 'ALL' ? 'Ambas' : k === 'CASH' ? 'Solo contado' : 'Solo crédito';
+                return (
+                  <button
+                    key={k}
+                    type="button"
+                    disabled={disabled}
+                    onClick={() => setSalesBookKind(k)}
+                    className={`px-4 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest border transition-all ${
+                      disabled ? 'opacity-40 cursor-not-allowed bg-slate-100 text-slate-400 border-slate-200'
+                        : active ? 'bg-emerald-900 text-white border-emerald-900 shadow-md'
+                          : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
+                    }`}
+                  >
+                    {label}
+                  </button>
+                );
+              })}
+              {(filters.status === 'CASH' || filters.status === 'CREDIT') && (
+                <span className="text-[9px] font-bold text-slate-500 uppercase ml-2">
+                  Use Estado CONTADO/CRÉDITO; tipo fijo por ese filtro.
+                </span>
+              )}
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 text-[9px] font-bold text-slate-600 bg-slate-50/80 border border-slate-200/80 rounded-2xl px-4 py-2.5">
+            <span className="font-black uppercase text-slate-500 tracking-wider">Totales (pestaña Ventas)</span>
+            <span className="text-slate-400">|</span>
+            <span>{salesBookRows.length} facturas</span>
+            <span className="text-slate-400">·</span>
+            <span className="font-mono text-slate-800">{usd(salesBookTotals.totalUSD)}</span>
+            <span className="text-slate-400">·</span>
+            <span className="font-mono text-slate-800">{bs(salesBookTotals.totalVES)}</span>
+            <span className="text-slate-400">·</span>
+            <span className="font-black uppercase text-emerald-700">{salesBookStatusLabel}</span>
+          </div>
+
+          <div className="bg-white rounded-[2rem] border border-slate-200 shadow-sm overflow-hidden">
+            <div className="p-6 border-b border-slate-100 flex justify-between items-center flex-wrap gap-3">
+              <div>
+                <h3 className="text-lg font-black text-slate-900 uppercase">Libro de ventas</h3>
+                <p className="text-[9px] font-bold text-slate-400 uppercase mt-0.5">
+                  Mostrando {Math.min((salesBookPage + 1) * SALES_PER_PAGE, salesBookRows.length)} de {salesBookRows.length} registros
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  disabled={salesBookRows.length === 0}
+                  onClick={() => reportService.exportSalesBookToPDF(salesBookRows as any, {
+                    start: dateRange.start,
+                    end: dateRange.end,
+                    search: filters.client,
+                    filterLabel: getActiveFilterLabel(),
+                    title: 'LIBRO DE VENTAS'
+                  })}
+                  className="flex items-center gap-1 px-3 py-1.5 bg-emerald-950 text-white rounded-xl text-[9px] font-black uppercase hover:bg-emerald-900 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <Download className="w-3 h-3" /> PDF
+                </button>
+                <button
+                  type="button"
+                  disabled={salesBookRows.length === 0}
+                  onClick={() => {
+                    const creditCount = salesBookSplitSummary.credit.count;
+                    const cashCount = salesBookSplitSummary.cash.count;
+                    const creditUSD = salesBookSplitSummary.credit.totalUSD;
+                    const cashUSD = salesBookSplitSummary.cash.totalUSD;
+                    const creditVES = salesBookSplitSummary.credit.totalVES;
+                    const cashVES = salesBookSplitSummary.cash.totalVES;
+                    exportCSV(
+                      [
+                        ...salesBookRows.map(s => ({
+                          fecha: s.timestamp.toISOString().slice(0, 10),
+                          correlativo: s.correlativo,
+                          cliente: s.client.name,
+                          rif: s.client.id,
+                          totalUSD: s.totalUSD,
+                          totalVES: s.totalVES,
+                          metodo: s.paymentMethod,
+                          detalle_productos: formatInvoiceProductDetails((s as any).items),
+                          tipo: classifyCreditSale(s) ? 'CREDITO' : 'CONTADO'
+                        })),
+                        {
+                          fecha: '— RESUMEN —',
+                          correlativo: 'Total facturas (listado)',
+                          cliente: String(salesBookRows.length),
+                          rif: '',
+                          totalUSD: '',
+                          totalVES: '',
+                          metodo: '',
+                          detalle_productos: '',
+                          tipo: ''
+                        },
+                        {
+                          fecha: 'RESUMEN',
+                          correlativo: 'Contado (G)',
+                          cliente: `Facturas: ${cashCount}`,
+                          rif: '',
+                          totalUSD: cashUSD,
+                          totalVES: cashVES,
+                          metodo: '',
+                          detalle_productos: '',
+                          tipo: ''
+                        },
+                        {
+                          fecha: 'RESUMEN',
+                          correlativo: 'Crédito (C)',
+                          cliente: `Facturas: ${creditCount}`,
+                          rif: '',
+                          totalUSD: creditUSD,
+                          totalVES: creditVES,
+                          metodo: '',
+                          detalle_productos: '',
+                          tipo: ''
+                        }
+                      ],
+                      `libro_ventas_${new Date().toISOString().split('T')[0]}.csv`,
+                      { reportLabel: 'Ventas', filterLabel: getActiveFilterLabel() }
+                    );
+                  }}
+                  className="flex items-center gap-1 px-3 py-1.5 bg-slate-100 text-slate-600 rounded-xl text-[9px] font-black uppercase hover:bg-slate-200 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <Download className="w-3 h-3" /> Excel
+                </button>
+              </div>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full">
+                <thead className="bg-slate-50">
+                  <tr className="text-[9px] font-black text-slate-400 uppercase tracking-wider">
+                    <th className="px-6 py-3 text-left">Fecha</th>
+                    <th className="px-6 py-3 text-left">Correlativo</th>
+                    <th className="px-6 py-3 text-left">Cliente</th>
+                    <th className="px-6 py-3 text-center">Tipo</th>
+                    <th className="px-6 py-3 text-right">Total $</th>
+                    <th className="px-6 py-3 text-right">Total Bs</th>
+                    <th className="px-6 py-3 text-center">Método</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {salesBookRows.length === 0 ? (
+                    <tr>
+                      <td colSpan={7} className="py-16 text-center text-slate-300 font-black uppercase text-sm">
+                        Sin ventas con los filtros seleccionados
+                      </td>
+                    </tr>
+                  ) : salesBookRows.slice(salesBookPage * SALES_PER_PAGE, (salesBookPage + 1) * SALES_PER_PAGE).map((sale, i) => {
+                    const cred = classifyCreditSale(sale);
+                    return (
+                      <tr key={`${sale.correlativo}-${i}`} className="hover:bg-slate-50 transition-colors">
+                        <td className="px-6 py-3 text-[11px] font-mono text-slate-600">{sale.timestamp.toISOString().slice(0, 10)}</td>
+                        <td className="px-6 py-3 text-[11px] font-black text-slate-900">{sale.correlativo}</td>
+                        <td className="px-6 py-3 text-[11px] text-slate-700">{sale.client.name}</td>
+                        <td className="px-6 py-3 text-center">
+                          <span className={`inline-flex px-2 py-1 rounded-lg text-[9px] font-black uppercase ${cred ? 'bg-cyan-100 text-cyan-800' : 'bg-emerald-100 text-emerald-800'}`}>
+                            {cred ? 'Crédito' : 'Contado'}
+                          </span>
+                        </td>
+                        <td className="px-6 py-3 text-[11px] font-black font-mono text-right text-emerald-700">{usd(sale.totalUSD)}</td>
+                        <td className="px-6 py-3 text-[11px] font-mono text-right text-slate-600">{bs(sale.totalVES)}</td>
+                        <td className="px-6 py-3 text-center">
+                          <span className="inline-flex px-2 py-1 rounded-lg bg-slate-100 text-[9px] font-black uppercase text-slate-600">{sale.paymentMethod}</span>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+                <tfoot className="border-t-2 border-slate-300 bg-slate-100">
+                  <tr className="border-b border-slate-300">
+                    <td className="px-6 py-2 text-[10px] font-black uppercase text-slate-800" colSpan={4}>
+                      Total listado ({salesBookStatusLabel}) — Facturas: {salesBookTotals.count}
+                    </td>
+                    <td className="px-6 py-2 text-[11px] font-black font-mono text-right text-slate-900">{usd(salesBookTotals.totalUSD)}</td>
+                    <td className="px-6 py-2 text-[11px] font-black font-mono text-right text-slate-900">{bs(salesBookTotals.totalVES)}</td>
+                    <td className="px-6 py-2 text-center text-[9px] font-black uppercase text-slate-700">—</td>
+                  </tr>
+                  <tr>
+                    <td className="px-6 py-2 text-[9px] font-black uppercase text-slate-600" colSpan={4}>
+                      Subtotal contado (G) — {salesBookSplitSummary.cash.count} facturas
+                    </td>
+                    <td className="px-6 py-2 text-[10px] font-black font-mono text-right text-emerald-700">{usd(salesBookSplitSummary.cash.totalUSD)}</td>
+                    <td className="px-6 py-2 text-[10px] font-black font-mono text-right text-emerald-700">{bs(salesBookSplitSummary.cash.totalVES)}</td>
+                    <td />
+                  </tr>
+                  <tr>
+                    <td className="px-6 py-2 text-[9px] font-black uppercase text-slate-600" colSpan={4}>
+                      Subtotal crédito (C) — {salesBookSplitSummary.credit.count} facturas
+                    </td>
+                    <td className="px-6 py-2 text-[10px] font-black font-mono text-right text-cyan-800">{usd(salesBookSplitSummary.credit.totalUSD)}</td>
+                    <td className="px-6 py-2 text-[10px] font-black font-mono text-right text-cyan-800">{bs(salesBookSplitSummary.credit.totalVES)}</td>
+                    <td />
+                  </tr>
+                </tfoot>
+              </table>
+            </div>
+            {salesBookRows.length > SALES_PER_PAGE && (
+              <div className="flex items-center justify-between px-6 py-4 border-t border-slate-100 bg-slate-50/50">
+                <span className="text-[10px] font-black text-slate-500 uppercase">
+                  Página {salesBookPage + 1} de {Math.ceil(salesBookRows.length / SALES_PER_PAGE) || 1}
+                </span>
+                <div className="flex items-center gap-2">
+                  <button type="button" onClick={() => setSalesBookPage(p => Math.max(0, p - 1))} disabled={salesBookPage === 0}
+                    className="p-2 rounded-xl bg-slate-100 text-slate-600 hover:bg-slate-200 disabled:opacity-30 transition-all">
+                    <ChevronLeft className="w-4 h-4" />
+                  </button>
+                  <button type="button" onClick={() => setSalesBookPage(p => Math.min(Math.max(0, Math.ceil(salesBookRows.length / SALES_PER_PAGE) - 1), p + 1))} disabled={(salesBookPage + 1) * SALES_PER_PAGE >= salesBookRows.length}
+                    className="p-2 rounded-xl bg-slate-100 text-slate-600 hover:bg-slate-200 disabled:opacity-30 transition-all">
+                    <ChevronRight className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* REP-01 FIX + REP-02: Treasury único con datos reales */}
       {activeTab === "treasury" && (
         <div className="space-y-6">
@@ -3032,8 +4447,13 @@ export function ReportsView() {
                   <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Saldo calculado desde transacciones reales</p>
                 </div>
               </div>
-              <button onClick={() => exportCSV(treasuryData.banks.map(b => ({ banco: b.name, saldoUSD: b.balanceUSD, saldoVES: b.balanceVES, transacciones: b.txCount })), `tesoreria_${new Date().toISOString().split('T')[0]}.csv`)}
-                className="flex items-center gap-2 px-4 py-2 bg-slate-100 text-slate-600 rounded-xl text-[10px] font-black uppercase hover:bg-slate-200 transition-all">
+              <button onClick={() => exportCSV(
+                treasuryData.banks.map(b => ({ banco: b.name, saldoUSD: b.balanceUSD, saldoVES: b.balanceVES, transacciones: b.txCount })),
+                `tesoreria_${new Date().toISOString().split('T')[0]}.csv`,
+                { reportLabel: 'Tesoreria por banco', filterLabel: getActiveFilterLabel(), includeTotals: true }
+              )}
+                disabled={!canExportTreasuryReports}
+                className="flex items-center gap-2 px-4 py-2 bg-slate-100 text-slate-600 rounded-xl text-[10px] font-black uppercase hover:bg-slate-200 transition-all disabled:opacity-40 disabled:cursor-not-allowed">
                 <Download className="w-3 h-3" /> Excel
               </button>
             </div>
@@ -3106,6 +4526,7 @@ export function ReportsView() {
                   </p>
                 </div>
                 <button
+                  disabled={treasuryDetailRows.length === 0 || !canExportTreasuryReports}
                   onClick={() => exportCSV(
                     [
                       ...treasuryDetailRows.map((row) => ({
@@ -3120,12 +4541,7 @@ export function ReportsView() {
                         cajero: row.cashier,
                         referencia: row.reference || '',
                         tasaUsada: row.rateUsed > 0 ? row.rateUsed.toFixed(4) : '',
-                        movimientoUSD: row.amountUSD.toFixed(2),
-                        movimientoVES: row.amountVES.toFixed(2),
-                        equivalenteUSD: row.equivalentUSD.toFixed(2),
-                        equivalenteVES: row.equivalentVES.toFixed(2),
-                        saldoAcumUSD: row.runningUSD.toFixed(2),
-                        saldoAcumVES: row.runningVES.toFixed(2)
+                        movimientoVES: row.amountVES.toFixed(2)
                       })),
                       {
                         fecha: '',
@@ -3139,21 +4555,18 @@ export function ReportsView() {
                         cajero: '',
                         referencia: '',
                         tasaUsada: '',
-                        movimientoUSD: treasuryDetailTotals.movementUSD.toFixed(2),
-                        movimientoVES: treasuryDetailTotals.movementVES.toFixed(2),
-                        equivalenteUSD: treasuryDetailTotals.movementEquivalentUSD.toFixed(2),
-                        equivalenteVES: treasuryDetailTotals.movementEquivalentVES.toFixed(2),
-                        saldoAcumUSD: treasuryDetailTotals.balanceUSD.toFixed(2),
-                        saldoAcumVES: treasuryDetailTotals.balanceVES.toFixed(2)
+                        movimientoVES: treasuryDetailTotals.movementVES.toFixed(2)
                       }
                     ],
-                    `tesoreria_operaciones_${new Date().toISOString().split('T')[0]}.csv`
+                    `tesoreria_operaciones_${new Date().toISOString().split('T')[0]}.csv`,
+                    { reportLabel: 'Tesoreria operaciones detalladas', filterLabel: getActiveFilterLabel() }
                   )}
-                  className="flex items-center gap-2 px-4 py-2 bg-slate-900 text-white rounded-xl text-[10px] font-black uppercase hover:bg-slate-800 transition-all"
+                  className="flex items-center gap-2 px-4 py-2 bg-slate-900 text-white rounded-xl text-[10px] font-black uppercase hover:bg-slate-800 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   <Download className="w-3 h-3" /> Excel Operaciones
                 </button>
                 <button
+                  disabled={treasuryDetailRows.length === 0 || !canExportTreasuryReports}
                   onClick={() => {
                     const selectedAccountId = treasurySelectedAccountKey === 'ALL'
                       ? ''
@@ -3190,10 +4603,7 @@ export function ReportsView() {
                         cashier: row.cashier,
                         reference: row.reference,
                         rateUsed: row.rateUsed,
-                        amountUSD: row.amountUSD,
                         amountVES: row.amountVES,
-                        equivalentUSD: row.equivalentUSD,
-                        equivalentVES: row.equivalentVES,
                         runningUSD: row.runningUSD,
                         runningVES: row.runningVES
                       })),
@@ -3208,7 +4618,7 @@ export function ReportsView() {
                       }
                     );
                   }}
-                  className="flex items-center gap-2 px-4 py-2 bg-emerald-900 text-white rounded-xl text-[10px] font-black uppercase hover:bg-emerald-800 transition-all"
+                  className="flex items-center gap-2 px-4 py-2 bg-emerald-900 text-white rounded-xl text-[10px] font-black uppercase hover:bg-emerald-800 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   <Download className="w-3 h-3" /> PDF Operaciones
                 </button>
@@ -3302,16 +4712,9 @@ export function ReportsView() {
                   </select>
                 </div>
                 <div className="bg-white border border-slate-200 rounded-xl px-3 py-2">
-                  <p className="text-[8px] uppercase font-black text-slate-400">Mov. neto USD</p>
-                  <p className="text-[14px] font-black text-blue-700">$ {treasuryDetailTotals.movementUSD.toFixed(2)}</p>
-                  <p className="text-[8px] text-slate-400">Equiv.: $ {treasuryDetailTotals.movementEquivalentUSD.toFixed(2)}</p>
-                  <p className="text-[8px] text-slate-400">Saldo acum.: $ {treasuryDetailTotals.balanceUSD.toFixed(2)}</p>
-                </div>
-                <div className="bg-white border border-slate-200 rounded-xl px-3 py-2">
                   <p className="text-[8px] uppercase font-black text-slate-400">Mov. neto Bs</p>
                   <p className="text-[14px] font-black text-emerald-700">Bs {treasuryDetailTotals.movementVES.toFixed(2)}</p>
-                  <p className="text-[8px] text-slate-400">Equiv.: Bs {treasuryDetailTotals.movementEquivalentVES.toFixed(2)}</p>
-                  <p className="text-[8px] text-slate-400">Saldo acum.: Bs {treasuryDetailTotals.balanceVES.toFixed(2)}</p>
+                  <p className="text-[8px] text-slate-400">Saldo filtrado: Bs {treasuryDetailTotals.balanceVES.toFixed(2)}</p>
                 </div>
               </div>
 
@@ -3328,18 +4731,13 @@ export function ReportsView() {
                       <th className="px-3 py-2">Cajero</th>
                       <th className="px-3 py-2">Referencia</th>
                       <th className="px-3 py-2 text-right">Tasa</th>
-                      <th className="px-3 py-2 text-right">Mov. USD</th>
                       <th className="px-3 py-2 text-right">Mov. Bs</th>
-                      <th className="px-3 py-2 text-right">Equiv. USD</th>
-                      <th className="px-3 py-2 text-right">Equiv. Bs</th>
-                      <th className="px-3 py-2 text-right">Saldo USD</th>
-                      <th className="px-3 py-2 text-right">Saldo Bs</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
                     {treasuryDetailRows.length === 0 ? (
                       <tr>
-                        <td colSpan={15} className="py-10 text-center text-slate-300 font-black uppercase text-[11px]">
+                        <td colSpan={10} className="py-10 text-center text-slate-300 font-black uppercase text-[11px]">
                           Sin movimientos para el filtro seleccionado
                         </td>
                       </tr>
@@ -3359,20 +4757,9 @@ export function ReportsView() {
                         <td className="px-3 py-2 text-[10px] text-right font-mono text-slate-600">
                           {row.rateUsed > 0 ? row.rateUsed.toFixed(4) : '-'}
                         </td>
-                        <td className={`px-3 py-2 text-[10px] text-right font-mono font-black ${row.amountUSD >= 0 ? 'text-blue-700' : 'text-rose-700'}`}>
-                          {row.amountUSD >= 0 ? '+' : ''}{row.amountUSD.toFixed(2)}
-                        </td>
                         <td className={`px-3 py-2 text-[10px] text-right font-mono font-black ${row.amountVES >= 0 ? 'text-emerald-700' : 'text-rose-700'}`}>
                           {row.amountVES >= 0 ? '+' : ''}{row.amountVES.toFixed(2)}
                         </td>
-                        <td className={`px-3 py-2 text-[10px] text-right font-mono font-black ${row.equivalentUSD >= 0 ? 'text-blue-700' : 'text-rose-700'}`}>
-                          {row.equivalentUSD >= 0 ? '+' : ''}{row.equivalentUSD.toFixed(2)}
-                        </td>
-                        <td className={`px-3 py-2 text-[10px] text-right font-mono font-black ${row.equivalentVES >= 0 ? 'text-emerald-700' : 'text-rose-700'}`}>
-                          {row.equivalentVES >= 0 ? '+' : ''}{row.equivalentVES.toFixed(2)}
-                        </td>
-                        <td className="px-3 py-2 text-[10px] text-right font-mono text-blue-700">{row.runningUSD.toFixed(2)}</td>
-                        <td className="px-3 py-2 text-[10px] text-right font-mono text-emerald-700">{row.runningVES.toFixed(2)}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -3408,9 +4795,34 @@ export function ReportsView() {
                 <input type="text" placeholder="Proveedor / descripción..." value={purchaseSearch}
                   onChange={e => setPurchaseSearch(e.target.value)}
                   className="bg-slate-100 border border-slate-200 rounded-xl px-3 py-2 text-[10px] font-black text-slate-700 focus:ring-2 focus:ring-emerald-500 w-48" />
-                <button onClick={() => exportCSV(filteredPurchases.map(e => ({ fecha: e.timestamp.toISOString().slice(0,10), proveedor: e.supplier, descripcion: e.description, montoUSD: e.amountUSD, estado: e.status })), `libro_compras_${new Date().toISOString().split('T')[0]}.csv`)}
-                  className="flex items-center gap-2 px-4 py-2 bg-slate-900 text-white rounded-xl text-[10px] font-black uppercase hover:bg-slate-800 transition-all">
+                <button onClick={() => exportCSV(
+                  purchaseBookExportRows.map(e => ({
+                    fecha: e.timestamp.toISOString().slice(0,10),
+                    proveedor: e.supplier,
+                    descripcion: e.description,
+                    operador: String((e as any).operator ?? '').trim() || 'SISTEMA',
+                    detalle_productos: e.productDetails,
+                    montoUSD: e.amountUSD,
+                    estado: e.status
+                  })),
+                  `libro_compras_${new Date().toISOString().split('T')[0]}.csv`,
+                  { reportLabel: 'Libro de compras', filterLabel: getActiveFilterLabel(), includeTotals: true }
+                )}
+                  disabled={!canExportPurchasesReports}
+                  className="flex items-center gap-2 px-4 py-2 bg-slate-900 text-white rounded-xl text-[10px] font-black uppercase hover:bg-slate-800 transition-all disabled:opacity-40 disabled:cursor-not-allowed">
                   <Download className="w-3 h-3" /> Excel
+                </button>
+                <button
+                  disabled={!canExportPurchasesReports}
+                  onClick={() => reportService.exportPurchasesBookToPDF(purchaseBookExportRows, {
+                    start: purchaseDateRange.start,
+                    end: purchaseDateRange.end,
+                    search: purchaseSearch,
+                    filterLabel: getActiveFilterLabel()
+                  })}
+                  className="flex items-center gap-2 px-4 py-2 bg-emerald-900 text-white rounded-xl text-[10px] font-black uppercase hover:bg-emerald-800 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <FileText className="w-3 h-3" /> PDF
                 </button>
               </div>
             </div>
@@ -3457,6 +4869,322 @@ export function ReportsView() {
         </div>
       )}
 
+      {/* Anticipos clientes / proveedores (Firestore) */}
+      {activeTab === 'advances' && (
+        <div className="space-y-6">
+          <div className="bg-white rounded-[2.5rem] border border-slate-200 overflow-hidden shadow-sm">
+            <div className="p-8 border-b bg-amber-50/40 flex flex-wrap justify-between items-center gap-4">
+              <div>
+                <h3 className="font-headline font-black text-2xl tracking-tighter uppercase text-slate-900">Reporte de anticipos</h3>
+                <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mt-1">
+                  Listado por línea · mismos datos que Finanzas &gt; Anticipos
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="flex bg-white border border-slate-200 rounded-xl overflow-hidden text-[10px] font-black">
+                  <button
+                    type="button"
+                    onClick={() => setAdvancesReportKind('client')}
+                    className={`px-4 py-2 transition-all ${advancesReportKind === 'client' ? 'bg-amber-600 text-white' : 'text-slate-500 hover:bg-slate-50'}`}
+                  >
+                    Clientes
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setAdvancesReportKind('supplier')}
+                    className={`px-4 py-2 transition-all ${advancesReportKind === 'supplier' ? 'bg-slate-800 text-white' : 'text-slate-500 hover:bg-slate-50'}`}
+                  >
+                    Proveedores
+                  </button>
+                </div>
+                <div className="flex bg-white border border-slate-200 rounded-xl overflow-hidden text-[10px] font-black">
+                  <button
+                    type="button"
+                    onClick={() => setAdvancesIncludeApplied(false)}
+                    className={`px-3 py-2 transition-all ${!advancesIncludeApplied ? 'bg-emerald-600 text-white' : 'text-slate-500 hover:bg-slate-50'}`}
+                  >
+                    Disponibles
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setAdvancesIncludeApplied(true)}
+                    className={`px-3 py-2 transition-all ${advancesIncludeApplied ? 'bg-slate-700 text-white' : 'text-slate-500 hover:bg-slate-50'}`}
+                  >
+                    Todos
+                  </button>
+                </div>
+                <div className="flex items-center gap-2 bg-slate-100 p-2 rounded-xl border border-slate-200">
+                  <Calendar className="w-3 h-3 text-slate-400" />
+                  <input
+                    type="date"
+                    value={advanceDateRange.start}
+                    onChange={(e) => setAdvanceDateRange((p) => ({ ...p, start: e.target.value }))}
+                    className="bg-transparent border-0 p-0 text-[10px] font-black text-slate-600 focus:ring-0"
+                  />
+                  <span className="text-slate-300">/</span>
+                  <input
+                    type="date"
+                    value={advanceDateRange.end}
+                    onChange={(e) => setAdvanceDateRange((p) => ({ ...p, end: e.target.value }))}
+                    className="bg-transparent border-0 p-0 text-[10px] font-black text-slate-600 focus:ring-0"
+                  />
+                </div>
+                <input
+                  type="text"
+                  placeholder={advancesReportKind === 'client' ? 'Cliente, factura, nota…' : 'Proveedor, referencia, nota…'}
+                  value={advanceSearch}
+                  onChange={(e) => setAdvanceSearch(e.target.value)}
+                  className="bg-slate-100 border border-slate-200 rounded-xl px-3 py-2 text-[10px] font-black text-slate-700 focus:ring-2 focus:ring-amber-500 min-w-[12rem] flex-1 max-w-xs"
+                />
+                <button
+                  type="button"
+                  onClick={() => setAdvancesRefreshKey((k) => k + 1)}
+                  className="flex items-center gap-2 px-4 py-2 bg-slate-100 text-slate-700 rounded-xl text-[10px] font-black uppercase hover:bg-slate-200 transition-all"
+                >
+                  Actualizar
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 px-8 py-4 border-b border-slate-100 bg-slate-50/50">
+              <div className="rounded-2xl border border-amber-200 bg-white p-4 text-center">
+                <p className="text-[9px] font-black text-amber-600 uppercase tracking-widest">Registros (filtrados)</p>
+                <p className="text-xl font-black text-slate-900 mt-1">
+                  {advancesReportKind === 'client' ? advancesClientTotals.count : advancesSupplierTotals.count}
+                </p>
+              </div>
+              <div className="rounded-2xl border border-slate-200 bg-white p-4 text-center">
+                <p className="text-[9px] font-black text-slate-500 uppercase tracking-widest">Monto original USD</p>
+                <p className="text-xl font-black text-slate-800 mt-1">
+                  ${(advancesReportKind === 'client' ? advancesClientTotals.originalUSD : advancesSupplierTotals.originalUSD).toFixed(2)}
+                </p>
+              </div>
+              <div className="rounded-2xl border border-amber-200 bg-white p-4 text-center">
+                <p className="text-[9px] font-black text-amber-600 uppercase tracking-widest">Saldo pendiente USD</p>
+                <p className="text-xl font-black text-amber-700 mt-1">
+                  ${(advancesReportKind === 'client' ? advancesClientTotals.balanceUSD : advancesSupplierTotals.balanceUSD).toFixed(2)}
+                </p>
+              </div>
+            </div>
+
+            {advancesReportKind === 'client' && (
+              <div className="p-4 sm:px-8 sm:pb-6 flex flex-wrap justify-end gap-2">
+                <button
+                  type="button"
+                  disabled={reportClientAdvancesRows.length === 0}
+                  onClick={() =>
+                    exportCSV(
+                      reportClientAdvancesRows.map((a) => ({
+                        fecha: String(a.createdAt ?? '').slice(0, 10),
+                        cliente: a.customerName,
+                        clienteId: a.customerId,
+                        montoUSD: roundMoney(a.amountUSD),
+                        saldoUSD: roundMoney(a.balanceUSD),
+                        moneda: a.currency,
+                        bsOriginal: a.originalAmountVES ?? '',
+                        tasa: a.rateAtCreation ?? '',
+                        estado: a.status,
+                        facturaOrigen: a.originCorrelativo || a.originInvoiceId || '',
+                        nota: a.note ?? '',
+                        idAnticipo: a.id
+                      })),
+                      `anticipos_clientes_${new Date().toISOString().split('T')[0]}.csv`,
+                      { reportLabel: 'Anticipos Clientes', filterLabel: getActiveFilterLabel(), includeTotals: true }
+                    )
+                  }
+                  className="flex items-center gap-2 px-4 py-2 bg-slate-900 text-white rounded-xl text-[10px] font-black uppercase hover:bg-slate-800 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <Download className="w-3 h-3" /> Excel
+                </button>
+                <button
+                  type="button"
+                  disabled={reportClientAdvancesRows.length === 0}
+                  onClick={() =>
+                    void printService.printAdvancesReport({
+                      kind: 'client',
+                      periodLabel: `${advanceDateRange.start} a ${advanceDateRange.end}`,
+                      filterLabel: getActiveFilterLabel(),
+                      clientRows: reportClientAdvancesRows
+                    })
+                  }
+                  className="flex items-center gap-2 px-4 py-2 bg-emerald-950 text-white rounded-xl text-[10px] font-black uppercase hover:bg-emerald-900 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <FileText className="w-3 h-3" /> PDF
+                </button>
+              </div>
+            )}
+
+            {advancesReportKind === 'supplier' && (
+              <div className="p-4 sm:px-8 sm:pb-6 flex flex-wrap justify-end gap-2">
+                <button
+                  type="button"
+                  disabled={reportSupplierAdvancesRows.length === 0 || loadingAdvancesReport}
+                  onClick={() =>
+                    exportCSV(
+                      reportSupplierAdvancesRows.map((a) => ({
+                        fecha: String(a.createdAt ?? '').slice(0, 10),
+                        proveedor: a.supplierName,
+                        proveedorId: a.supplierId ?? '',
+                        montoUSD: roundMoney(a.amountUSD),
+                        saldoUSD: roundMoney(a.balanceUSD),
+                        moneda: a.currency,
+                        bsOriginal: a.originalAmountVES ?? '',
+                        referencia: a.reference,
+                        metodo: a.method ?? '',
+                        estado: a.status,
+                        nota: a.note ?? '',
+                        idAnticipo: a.id
+                      })),
+                      `anticipos_proveedores_${new Date().toISOString().split('T')[0]}.csv`,
+                      { reportLabel: 'Anticipos Proveedores', filterLabel: getActiveFilterLabel(), includeTotals: true }
+                    )
+                  }
+                  className="flex items-center gap-2 px-4 py-2 bg-slate-900 text-white rounded-xl text-[10px] font-black uppercase hover:bg-slate-800 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <Download className="w-3 h-3" /> Excel
+                </button>
+                <button
+                  type="button"
+                  disabled={reportSupplierAdvancesRows.length === 0 || loadingAdvancesReport}
+                  onClick={() =>
+                    void printService.printAdvancesReport({
+                      kind: 'supplier',
+                      periodLabel: `${advanceDateRange.start} a ${advanceDateRange.end}`,
+                      filterLabel: getActiveFilterLabel(),
+                      supplierRows: reportSupplierAdvancesRows
+                    })
+                  }
+                  className="flex items-center gap-2 px-4 py-2 bg-emerald-950 text-white rounded-xl text-[10px] font-black uppercase hover:bg-emerald-900 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <FileText className="w-3 h-3" /> PDF
+                </button>
+              </div>
+            )}
+
+            <div className="overflow-x-auto">
+              {advancesReportKind === 'supplier' && loadingAdvancesReport ? (
+                <div className="py-20 text-center text-[11px] font-bold text-slate-400 uppercase">Cargando anticipos de proveedor…</div>
+              ) : advancesReportKind === 'client' ? (
+                <table className="w-full text-left">
+                  <thead className="bg-slate-50">
+                    <tr className="text-[9px] font-black text-slate-400 uppercase tracking-wider">
+                      <th className="px-6 py-3">Fecha</th>
+                      <th className="px-6 py-3">Cliente</th>
+                      <th className="px-6 py-3 text-right">Monto USD</th>
+                      <th className="px-6 py-3 text-right">Saldo USD</th>
+                      <th className="px-6 py-3 text-center">Estado</th>
+                      <th className="px-6 py-3">Fact. origen</th>
+                      <th className="px-6 py-3 max-w-[200px]">Nota</th>
+                      <th className="px-6 py-3 font-mono text-[8px]">Id</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {reportClientAdvancesRows.length === 0 ? (
+                      <tr>
+                        <td colSpan={8} className="py-16 text-center text-slate-300 font-black uppercase text-sm">
+                          Sin anticipos de clientes con los filtros seleccionados
+                        </td>
+                      </tr>
+                    ) : (
+                      reportClientAdvancesRows.map((a) => (
+                        <tr key={a.id} className="hover:bg-slate-50 transition-colors">
+                          <td className="px-6 py-3 text-[11px] font-mono text-slate-600">{String(a.createdAt ?? '').slice(0, 10)}</td>
+                          <td className="px-6 py-3 text-[11px]">
+                            <span className="font-black text-slate-900 block">{a.customerName}</span>
+                            <span className="text-[9px] font-mono text-slate-400">{a.customerId}</span>
+                          </td>
+                          <td className="px-6 py-3 text-[11px] font-black font-mono text-right text-slate-800">{usd(a.amountUSD)}</td>
+                          <td className="px-6 py-3 text-[11px] font-black font-mono text-right text-amber-700">{usd(a.balanceUSD)}</td>
+                          <td className="px-6 py-3 text-center">
+                            <span
+                              className={`inline-flex px-2 py-1 rounded-lg text-[9px] font-black uppercase ${
+                                a.status === 'AVAILABLE'
+                                  ? 'bg-emerald-100 text-emerald-800'
+                                  : a.status === 'PARTIAL'
+                                    ? 'bg-amber-100 text-amber-800'
+                                    : 'bg-slate-100 text-slate-500'
+                              }`}
+                            >
+                              {a.status === 'AVAILABLE' ? 'Disponible' : a.status === 'PARTIAL' ? 'Parcial' : 'Aplicado'}
+                            </span>
+                          </td>
+                          <td className="px-6 py-3 text-[10px] font-mono text-slate-700">{a.originCorrelativo || a.originInvoiceId || '—'}</td>
+                          <td className="px-6 py-3 text-[10px] text-slate-600 max-w-[220px] truncate" title={a.note}>
+                            {a.note || '—'}
+                          </td>
+                          <td className="px-6 py-3 text-[9px] font-mono text-slate-400 truncate max-w-[100px]" title={a.id}>
+                            {a.id}
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              ) : (
+                <table className="w-full text-left">
+                  <thead className="bg-slate-50">
+                    <tr className="text-[9px] font-black text-slate-400 uppercase tracking-wider">
+                      <th className="px-6 py-3">Fecha</th>
+                      <th className="px-6 py-3">Proveedor</th>
+                      <th className="px-6 py-3 text-right">Monto USD</th>
+                      <th className="px-6 py-3 text-right">Saldo USD</th>
+                      <th className="px-6 py-3 text-center">Estado</th>
+                      <th className="px-6 py-3">Referencia</th>
+                      <th className="px-6 py-3 max-w-[200px]">Nota</th>
+                      <th className="px-6 py-3 font-mono text-[8px]">Id</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {reportSupplierAdvancesRows.length === 0 ? (
+                      <tr>
+                        <td colSpan={8} className="py-16 text-center text-slate-300 font-black uppercase text-sm">
+                          Sin anticipos de proveedores con los filtros seleccionados
+                        </td>
+                      </tr>
+                    ) : (
+                      reportSupplierAdvancesRows.map((a) => (
+                        <tr key={a.id} className="hover:bg-slate-50 transition-colors">
+                          <td className="px-6 py-3 text-[11px] font-mono text-slate-600">{String(a.createdAt ?? '').slice(0, 10)}</td>
+                          <td className="px-6 py-3 text-[11px]">
+                            <span className="font-black text-slate-900 block">{a.supplierName}</span>
+                            {a.supplierId ? <span className="text-[9px] font-mono text-slate-400">{a.supplierId}</span> : null}
+                          </td>
+                          <td className="px-6 py-3 text-[11px] font-black font-mono text-right text-slate-800">{usd(a.amountUSD)}</td>
+                          <td className="px-6 py-3 text-[11px] font-black font-mono text-right text-amber-700">{usd(a.balanceUSD)}</td>
+                          <td className="px-6 py-3 text-center">
+                            <span
+                              className={`inline-flex px-2 py-1 rounded-lg text-[9px] font-black uppercase ${
+                                a.status === 'AVAILABLE'
+                                  ? 'bg-emerald-100 text-emerald-800'
+                                  : a.status === 'PARTIAL'
+                                    ? 'bg-amber-100 text-amber-800'
+                                    : 'bg-slate-100 text-slate-500'
+                              }`}
+                            >
+                              {a.status === 'AVAILABLE' ? 'Disponible' : a.status === 'PARTIAL' ? 'Parcial' : 'Aplicado'}
+                            </span>
+                          </td>
+                          <td className="px-6 py-3 text-[10px] font-mono text-slate-700">{a.reference || '—'}</td>
+                          <td className="px-6 py-3 text-[10px] text-slate-600 max-w-[220px] truncate" title={a.note}>
+                            {a.note || '—'}
+                          </td>
+                          <td className="px-6 py-3 text-[9px] font-mono text-slate-400 truncate max-w-[100px]" title={a.id}>
+                            {a.id}
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              )}
+            </div>
+            <p className="text-[9px] text-slate-500 font-bold uppercase px-8 py-3 border-t border-slate-100">
+              Clientes: datos en tiempo real desde Firestore. Proveedores: se consultan al elegir la pestaña o al pulsar Actualizar.
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* REP-05: Egresos / Gastos */}
       {activeTab === "expenses" && (
         <div className="space-y-6">
@@ -3483,9 +5211,26 @@ export function ReportsView() {
                     </button>
                   ))}
                 </div>
-                <button onClick={() => exportCSV(filteredExpenses.map(e => ({ fecha: e.timestamp.toISOString().slice(0,10), descripcion: e.description, categoria: e.category, montoUSD: e.amountUSD })), `egresos_${new Date().toISOString().split('T')[0]}.csv`)}
-                  className="flex items-center gap-2 px-4 py-2 bg-slate-900 text-white rounded-xl text-[10px] font-black uppercase hover:bg-slate-800 transition-all">
+                <button onClick={() => exportCSV(
+                  filteredExpenses.map(e => ({ fecha: e.timestamp.toISOString().slice(0,10), descripcion: e.description, categoria: e.category, montoUSD: e.amountUSD })),
+                  `egresos_${new Date().toISOString().split('T')[0]}.csv`,
+                  { reportLabel: 'Libro de egresos', filterLabel: getActiveFilterLabel(), includeTotals: true }
+                )}
+                  disabled={!canExportExpensesReports}
+                  className="flex items-center gap-2 px-4 py-2 bg-slate-900 text-white rounded-xl text-[10px] font-black uppercase hover:bg-slate-800 transition-all disabled:opacity-40 disabled:cursor-not-allowed">
                   <Download className="w-3 h-3" /> Excel
+                </button>
+                <button
+                  disabled={!canExportExpensesReports}
+                  onClick={() => reportService.exportExpensesBookToPDF(filteredExpenses, {
+                    start: expenseDateRange.start,
+                    end: expenseDateRange.end,
+                    category: expenseCategory,
+                    filterLabel: getActiveFilterLabel()
+                  })}
+                  className="flex items-center gap-2 px-4 py-2 bg-emerald-900 text-white rounded-xl text-[10px] font-black uppercase hover:bg-emerald-800 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <FileText className="w-3 h-3" /> PDF
                 </button>
               </div>
             </div>
@@ -3538,9 +5283,21 @@ export function ReportsView() {
                 <h3 className="font-headline font-black text-2xl tracking-tighter uppercase text-slate-900">Mermas y Contracciones</h3>
                 <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mt-1">Pérdidas por merma natural y manipulación</p>
               </div>
-              <button onClick={() => exportCSV(shrinkageStats.byProduct.map(p => ({ producto: p.description, merma_natural_kg: p.natural, merma_manip_kg: p.manip, total_kg: p.total })), `mermas_${new Date().toISOString().split('T')[0]}.csv`)}
-                className="flex items-center gap-2 px-4 py-2 bg-slate-900 text-white rounded-xl text-[10px] font-black uppercase hover:bg-slate-800 transition-all">
+              <button onClick={() => exportCSV(
+                shrinkageStats.byProduct.map(p => ({ producto: p.description, merma_natural_kg: p.natural, merma_manip_kg: p.manip, total_kg: p.total })),
+                `mermas_${new Date().toISOString().split('T')[0]}.csv`,
+                { reportLabel: 'Mermas y contracciones', filterLabel: getActiveFilterLabel(), includeTotals: true }
+              )}
+                disabled={!canExportShrinkageReports}
+                className="flex items-center gap-2 px-4 py-2 bg-slate-900 text-white rounded-xl text-[10px] font-black uppercase hover:bg-slate-800 transition-all disabled:opacity-40 disabled:cursor-not-allowed">
                 <Download className="w-3 h-3" /> Excel
+              </button>
+              <button
+                disabled={!canExportShrinkageReports}
+                onClick={() => reportService.exportShrinkageToPDF(shrinkageStats, { filterLabel: getActiveFilterLabel() })}
+                className="flex items-center gap-2 px-4 py-2 bg-emerald-900 text-white rounded-xl text-[10px] font-black uppercase hover:bg-emerald-800 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                <FileText className="w-3 h-3" /> PDF
               </button>
             </div>
 
@@ -3585,24 +5342,329 @@ export function ReportsView() {
         </div>
       )}
 
+      {activeTab === 'profit' && (
+        <div className="space-y-6">
+          <div className="bg-white rounded-[2.5rem] border border-slate-200 overflow-hidden shadow-sm">
+            <div className="p-8 border-b bg-[#f8fafc]/50 flex flex-wrap justify-between items-center gap-4">
+              <div>
+                <h3 className="font-headline font-black text-2xl tracking-tighter uppercase text-slate-900">Utilidad bruta vendida</h3>
+                <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mt-1 max-w-2xl">
+                  Total USD facturado menos costo de mercancía vendida (lotes despachados en la venta; si no hay trazabilidad,
+                  costo medio ponderado del stock actual del SKU).
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  disabled={!canExportProfitReports}
+                  onClick={() => reportService.exportProfitPerformanceToPDF(profitFilterPayload)}
+                  className="flex items-center gap-2 px-4 py-2 bg-emerald-950 text-white rounded-xl text-[10px] font-black uppercase hover:bg-emerald-900 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <Download className="w-3 h-3" /> PDF
+                </button>
+                <button
+                  type="button"
+                  disabled={!canExportProfitReports}
+                  onClick={() => {
+                    const baseRows = profitSummary.bySku.map((r) => ({
+                      sku: r.code,
+                      descripcion: r.description,
+                      qty_vendida: r.qtySold,
+                      venta_usd: r.revenueUSD,
+                      costo_usd: r.costUSD,
+                      utilidad_usd: r.profitUSD
+                    }));
+                    const summaryRows = [
+                      {
+                        sku: 'RESUMEN',
+                        descripcion: 'Total Vendido',
+                        qty_vendida: '',
+                        venta_usd: profitSummary.revenueUSD,
+                        costo_usd: '',
+                        utilidad_usd: ''
+                      },
+                      {
+                        sku: 'RESUMEN',
+                        descripcion: 'Total Utilidad',
+                        qty_vendida: '',
+                        venta_usd: '',
+                        costo_usd: '',
+                        utilidad_usd: profitSummary.grossProfitUSD
+                      }
+                    ];
+                    exportCSV(
+                      [...baseRows, ...summaryRows],
+                      `utilidad_sku_mes_${new Date().toISOString().split('T')[0]}.csv`,
+                      { reportLabel: 'Utilidad por SKU (periodo filtrado)', filterLabel: getActiveFilterLabel(), includeTotals: false }
+                    );
+                  }}
+                  className="flex items-center gap-2 px-4 py-2 bg-slate-100 text-slate-600 rounded-xl text-[10px] font-black uppercase hover:bg-slate-200 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  <Download className="w-3 h-3" /> Excel mes (SKU)
+                </button>
+              </div>
+            </div>
+
+            <div className="p-8 border-b border-slate-100 grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div>
+                <label className="block text-[9px] font-black uppercase text-slate-400 tracking-widest mb-2">Desde</label>
+                <input
+                  type="date"
+                  value={profitDateRange.start}
+                  onChange={(e) => setProfitDateRange((prev) => ({ ...prev, start: e.target.value }))}
+                  className="w-full px-3 py-2 rounded-xl border border-slate-200 text-[11px] font-bold text-slate-700"
+                />
+              </div>
+              <div>
+                <label className="block text-[9px] font-black uppercase text-slate-400 tracking-widest mb-2">Hasta</label>
+                <input
+                  type="date"
+                  value={profitDateRange.end}
+                  onChange={(e) => setProfitDateRange((prev) => ({ ...prev, end: e.target.value }))}
+                  className="w-full px-3 py-2 rounded-xl border border-slate-200 text-[11px] font-bold text-slate-700"
+                />
+              </div>
+              <div>
+                <label className="block text-[9px] font-black uppercase text-slate-400 tracking-widest mb-2">Producto</label>
+                <select
+                  value={profitProductQuery}
+                  onChange={(e) => setProfitProductQuery(e.target.value)}
+                  className="w-full px-3 py-2 rounded-xl border border-slate-200 text-[11px] font-bold text-slate-700 bg-white"
+                >
+                  <option value="ALL">Todos</option>
+                  {profitProductOptions.map((p) => (
+                    <option key={p.code} value={p.code}>
+                      {p.code} - {p.description}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-px bg-slate-200 border-b border-slate-200">
+              <div className="bg-white p-6 space-y-3 md:col-span-3">
+                <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest">{profitSummary.label}</p>
+                <p className="text-[10px] font-bold text-slate-500">
+                  {profitSummary.start.toLocaleDateString('es-VE')} — {profitSummary.end.toLocaleDateString('es-VE')}
+                </p>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-[11px]">
+                  <div>
+                    <span className="text-slate-400 font-black uppercase text-[8px]">Tickets</span>
+                    <p className="font-black text-slate-800">{profitSummary.tickets}</p>
+                  </div>
+                  <div>
+                    <span className="text-slate-400 font-black uppercase text-[8px]">Ítems vendidos</span>
+                    <p className="font-black text-slate-800">{formatQuantity(profitSkuTotals.qtySold)}</p>
+                  </div>
+                  <div>
+                    <span className="text-slate-400 font-black uppercase text-[8px]">Margen %</span>
+                    <p className="font-black text-emerald-700">{profitSummary.marginPct.toFixed(1)} %</p>
+                  </div>
+                  <div>
+                    <span className="text-slate-400 font-black uppercase text-[8px]">Venta USD</span>
+                    <p className="font-mono font-black text-slate-800">{usd(profitSummary.revenueUSD)}</p>
+                  </div>
+                  <div className="md:col-span-2">
+                    <span className="text-slate-400 font-black uppercase text-[8px]">Costo USD</span>
+                    <p className="font-mono font-black text-amber-800">{usd(profitSummary.costUSD)}</p>
+                  </div>
+                </div>
+                <div className="flex justify-between text-[12px] pt-2 border-t border-slate-100">
+                  <span className="text-slate-900 font-black uppercase">Utilidad</span>
+                  <span className="font-mono font-black text-emerald-700">{usd(profitSummary.grossProfitUSD)}</span>
+                </div>
+              </div>
+            </div>
+
+            <div className="p-8 border-b border-slate-100">
+              <h4 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-4">
+                Detalle por SKU — periodo filtrado (por utilidad)
+              </h4>
+              <div className="overflow-x-auto max-h-[360px] overflow-y-auto rounded-2xl border border-slate-100">
+                <table className="w-full text-left text-[11px]">
+                  <thead className="bg-slate-50 sticky top-0 z-10">
+                    <tr className="text-[9px] font-black text-slate-400 uppercase">
+                      <th className="px-4 py-3">SKU</th>
+                      <th className="px-4 py-3">Descripción</th>
+                      <th className="px-4 py-3 text-right">Cant.</th>
+                      <th className="px-4 py-3 text-right">Venta USD</th>
+                      <th className="px-4 py-3 text-right">Costo</th>
+                      <th className="px-4 py-3 text-right">Utilidad</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {profitSummary.bySku.length === 0 ? (
+                      <tr>
+                        <td colSpan={6} className="py-12 text-center text-slate-300 font-black uppercase">
+                          Sin ventas en el periodo filtrado
+                        </td>
+                      </tr>
+                    ) : (
+                      profitSummary.bySku.map((r) => (
+                        <tr key={r.code} className="hover:bg-slate-50/80">
+                          <td className="px-4 py-2 font-mono font-black text-slate-600">{r.code}</td>
+                          <td className="px-4 py-2 font-bold text-slate-800 max-w-[200px] truncate">{r.description}</td>
+                          <td className="px-4 py-2 text-right font-mono text-slate-600">{formatQuantity(r.qtySold)}</td>
+                          <td className="px-4 py-2 text-right font-mono">{usd(r.revenueUSD)}</td>
+                          <td className="px-4 py-2 text-right font-mono text-amber-800">{usd(r.costUSD)}</td>
+                          <td className="px-4 py-2 text-right font-black font-mono text-emerald-700">{usd(r.profitUSD)}</td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                  {profitSummary.bySku.length > 0 && (
+                    <tfoot className="bg-slate-100 border-t border-slate-200">
+                      <tr className="text-[10px] font-black uppercase text-slate-700">
+                        <td className="px-4 py-2" colSpan={2}>Total filas ({profitSummary.bySku.length} ítems SKU)</td>
+                        <td className="px-4 py-2 text-right font-mono">{formatQuantity(profitSkuTotals.qtySold)}</td>
+                        <td className="px-4 py-2 text-right font-mono">{usd(profitSkuTotals.revenueUSD)}</td>
+                        <td className="px-4 py-2 text-right font-mono text-amber-800">{usd(profitSkuTotals.costUSD)}</td>
+                        <td className="px-4 py-2 text-right font-mono text-emerald-700">{usd(profitSkuTotals.profitUSD)}</td>
+                      </tr>
+                    </tfoot>
+                  )}
+                </table>
+              </div>
+            </div>
+
+            <div className="p-8">
+              <h4 className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-4">
+                Tickets con mayor utilidad (periodo filtrado, top 25)
+              </h4>
+              <div className="overflow-x-auto rounded-2xl border border-slate-100">
+                <table className="w-full text-left text-[11px]">
+                  <thead className="bg-slate-50">
+                    <tr className="text-[9px] font-black text-slate-400 uppercase">
+                      <th className="px-4 py-3">Fecha</th>
+                      <th className="px-4 py-3">Factura</th>
+                      <th className="px-4 py-3 text-right">Venta</th>
+                      <th className="px-4 py-3 text-right">Costo</th>
+                      <th className="px-4 py-3 text-right">Utilidad</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {profitSummary.topSales.length === 0 ? (
+                      <tr>
+                        <td colSpan={5} className="py-8 text-center text-slate-300 font-black uppercase">—</td>
+                      </tr>
+                    ) : (
+                      profitSummary.topSales.map((s, idx) => (
+                        <tr key={`${s.correlativo}-${idx}`} className="hover:bg-slate-50/80">
+                          <td className="px-4 py-2 font-mono text-slate-600">{s.ts.toLocaleString('es-VE')}</td>
+                          <td className="px-4 py-2 font-black">{s.correlativo}</td>
+                          <td className="px-4 py-2 text-right font-mono">{usd(s.revenueUSD)}</td>
+                          <td className="px-4 py-2 text-right font-mono text-amber-800">{usd(s.costUSD)}</td>
+                          <td className="px-4 py-2 text-right font-black font-mono text-emerald-700">{usd(s.profitUSD)}</td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                  {profitSummary.topSales.length > 0 && (
+                    <tfoot className="bg-slate-100 border-t border-slate-200">
+                      <tr className="text-[10px] font-black uppercase text-slate-700">
+                        <td className="px-4 py-2" colSpan={2}>Total tickets mostrados ({profitSummary.topSales.length})</td>
+                        <td className="px-4 py-2 text-right font-mono">{usd(profitTopSalesTotals.revenueUSD)}</td>
+                        <td className="px-4 py-2 text-right font-mono text-amber-800">{usd(profitTopSalesTotals.costUSD)}</td>
+                        <td className="px-4 py-2 text-right font-mono text-emerald-700">{usd(profitTopSalesTotals.profitUSD)}</td>
+                      </tr>
+                    </tfoot>
+                  )}
+                </table>
+              </div>
+              <div className="mt-4 overflow-x-auto rounded-xl border border-slate-200">
+                <table className="w-full text-left">
+                  <thead className="bg-emerald-950">
+                    <tr className="text-[9px] font-black uppercase tracking-wider text-white">
+                      <th className="px-4 py-2">Indicador</th>
+                      <th className="px-4 py-2 text-right">Valor</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-200 bg-white text-[11px]">
+                    <tr>
+                      <td className="px-4 py-2 font-black uppercase text-slate-700">Total Vendido</td>
+                      <td className="px-4 py-2 text-right font-mono font-black text-slate-900">{usd(profitSummary.revenueUSD)}</td>
+                    </tr>
+                    <tr className="bg-emerald-50">
+                      <td className="px-4 py-2 font-black uppercase text-emerald-800">Total Utilidad</td>
+                      <td className="px-4 py-2 text-right font-mono font-black text-emerald-800">{usd(profitSummary.grossProfitUSD)}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {activeTab === "margins" && (
         <div className="space-y-6">
           <div className="bg-white rounded-[2.5rem] border border-slate-200 overflow-hidden shadow-sm">
             <div className="p-8 border-b bg-[#f8fafc]/50 flex justify-between items-center">
               <div>
-                <h3 className="font-headline font-black text-2xl tracking-tighter uppercase text-slate-900">Márgenes por Lote</h3>
+                <h3 className="font-headline font-black text-2xl tracking-tighter uppercase text-slate-900">
+                  {marginFilterMode === 'PRODUCT' ? 'Márgenes por Producto' : 'Márgenes por Lote'}
+                </h3>
                 <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mt-1">Costo de compra real vs precio de venta actual</p>
               </div>
               <div className="flex items-center gap-2">
-                <button onClick={() => reportService.exportMarginReportToPDF()}
-                  className="flex items-center gap-2 px-4 py-2 bg-emerald-950 text-white rounded-xl text-[10px] font-black uppercase hover:bg-emerald-900 transition-all">
+                <button onClick={() => reportService.exportMarginReportToPDF({
+                  productQuery: marginFilterMode === 'PRODUCT' ? marginFilterQuery : '',
+                  batchQuery: marginFilterMode === 'BATCH' ? marginFilterQuery : '',
+                  dateRange: marginDateRange
+                })}
+                  disabled={!canExportMarginsReports}
+                  className="flex items-center gap-2 px-4 py-2 bg-emerald-950 text-white rounded-xl text-[10px] font-black uppercase hover:bg-emerald-900 transition-all disabled:opacity-40 disabled:cursor-not-allowed">
                   <Download className="w-3 h-3" /> PDF
                 </button>
-                <button onClick={() => exportCSV(landedCostData.map(b => ({ sku: b.sku, descripcion: b.description, costo_usd: b.purchaseCostUSD, qty: b.qty, precio_venta: b.currentPriceUSD, margen_pct: b.grossMarginPct.toFixed(1) })), `margenes_${new Date().toISOString().split('T')[0]}.csv`)}
-                  className="flex items-center gap-2 px-4 py-2 bg-slate-100 text-slate-600 rounded-xl text-[10px] font-black uppercase hover:bg-slate-200 transition-all">
+                <button onClick={() => exportCSV(
+                  landedCostData.map(b => ({ sku: b.sku, descripcion: b.description, costo_unit_usd: b.unitCost, costo_lote_inicial_usd: b.purchaseCostUSD, costo_existencia_usd: b.onHandCostUSD, qty: b.qty, precio_venta: b.currentPriceUSD, margen_pct: Number(b.grossMarginPct.toFixed(1)), vendido_qty: b.soldQty, total_usd: b.revenueUSD, utilidad_vendida_usd: b.soldProfitUSD })),
+                  `margenes_${new Date().toISOString().split('T')[0]}.csv`,
+                  {
+                    reportLabel: marginFilterMode === 'PRODUCT' ? 'Margenes por producto' : 'Margenes por lote',
+                    filterLabel: getActiveFilterLabel(),
+                    includeTotals: true
+                  }
+                )}
+                  disabled={!canExportMarginsReports}
+                  className="flex items-center gap-2 px-4 py-2 bg-slate-100 text-slate-600 rounded-xl text-[10px] font-black uppercase hover:bg-slate-200 transition-all disabled:opacity-40 disabled:cursor-not-allowed">
                   <Download className="w-3 h-3" /> Excel
                 </button>
               </div>
+            </div>
+            <div className="px-8 py-4 border-b border-slate-100 grid grid-cols-1 md:grid-cols-3 gap-3">
+              <input
+                type="date"
+                value={marginDateRange.start}
+                onChange={(e) => setMarginDateRange((prev) => ({ ...prev, start: e.target.value }))}
+                className="w-full px-3 py-2 rounded-xl border border-slate-200 text-[11px] font-bold text-slate-700 bg-white"
+              />
+              <input
+                type="date"
+                value={marginDateRange.end}
+                onChange={(e) => setMarginDateRange((prev) => ({ ...prev, end: e.target.value }))}
+                className="w-full px-3 py-2 rounded-xl border border-slate-200 text-[11px] font-bold text-slate-700 bg-white"
+              />
+              <select
+                value={marginFilterMode}
+                onChange={(e) => {
+                  const nextMode = (e.target.value === 'BATCH' ? 'BATCH' : 'PRODUCT') as 'PRODUCT' | 'BATCH';
+                  setMarginFilterMode(nextMode);
+                  setMarginFilterQuery('');
+                }}
+                className="w-full px-3 py-2 rounded-xl border border-slate-200 text-[11px] font-bold text-slate-700 bg-white"
+              >
+                <option value="PRODUCT">Filtrar por Producto</option>
+                <option value="BATCH">Filtrar por Lote</option>
+              </select>
+              <input
+                type="text"
+                value={marginFilterQuery}
+                onChange={(e) => setMarginFilterQuery(e.target.value)}
+                placeholder={marginFilterMode === 'PRODUCT'
+                  ? 'Escribe SKU o nombre del producto (ej: Mani)'
+                  : 'Escribe numero/codigo de lote'}
+                className="w-full px-3 py-2 rounded-xl border border-slate-200 text-[11px] font-bold text-slate-700 md:col-span-3"
+              />
             </div>
             <div className="overflow-x-auto">
               <table className="w-full text-left">
@@ -3615,12 +5677,13 @@ export function ReportsView() {
                     <th className="px-6 py-3 text-right">Precio Venta $</th>
                     <th className="px-6 py-3 text-right">Margen %</th>
                     <th className="px-6 py-3 text-right">Vendido</th>
-                    <th className="px-6 py-3 text-right">Revenue $</th>
+                    <th className="px-6 py-3 text-right">Total $</th>
+                    <th className="px-6 py-3 text-right">Utilidad $</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
                   {landedCostData.length === 0 ? (
-                    <tr><td colSpan={8} className="py-16 text-center text-slate-300 font-black uppercase text-sm">Sin lotes con costo registrado</td></tr>
+                    <tr><td colSpan={9} className="py-16 text-center text-slate-300 font-black uppercase text-sm">Sin lotes con costo registrado</td></tr>
                   ) : landedCostData.map((b, i) => (
                     <tr key={i} className="hover:bg-slate-50 transition-colors">
                       <td className="px-6 py-3 text-[10px] font-black text-slate-500 font-mono">{b.sku}</td>
@@ -3636,6 +5699,7 @@ export function ReportsView() {
                       </td>
                       <td className="px-6 py-3 text-right text-[11px] font-mono text-slate-500">{formatQuantity(b.soldQty)}</td>
                       <td className="px-6 py-3 text-right text-[11px] font-black font-mono text-blue-700">$ {b.revenueUSD.toFixed(2)}</td>
+                      <td className="px-6 py-3 text-right text-[11px] font-black font-mono text-emerald-700">$ {b.soldProfitUSD.toFixed(2)}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -3671,8 +5735,53 @@ export function ReportsView() {
                   `Metodo: ${zMethodFilter === 'ALL' ? 'Todos' : zMethodFilter}`
                 );
               }}
-                className="flex items-center gap-2 px-4 py-2 bg-slate-900 text-white rounded-xl text-[10px] font-black uppercase hover:bg-slate-800 transition-all">
+                disabled={!canExportZClosureReports}
+                className="flex items-center gap-2 px-4 py-2 bg-slate-900 text-white rounded-xl text-[10px] font-black uppercase hover:bg-slate-800 transition-all disabled:opacity-40 disabled:cursor-not-allowed">
                 <Download className="w-3 h-3" /> Imprimir PDF
+              </button>
+              <button
+                disabled={!canExportZClosureReports}
+                onClick={() => exportCSV(
+                  Array.isArray((zClosureData as any).methodDetailGroups) && (zClosureData as any).methodDetailGroups.length > 0
+                    ? (zClosureData as any).methodDetailGroups.flatMap((group: any) => {
+                        const rows = Array.isArray(group?.rows) ? group.rows : [];
+                        const detailRows = rows.map((row: any) => ({
+                          metodo: String(group?.method ?? ''),
+                          fecha: row.date,
+                          hora: row.time,
+                          factura: row.correlativo || 'N/D',
+                          cliente: row.client || 'N/D',
+                          cajero: row.cashier || 'Sin cajero',
+                          monto_usd: Number(row.lineUSD ?? 0) || 0,
+                          monto_bs: Number(row.lineVES ?? 0) || 0
+                        }));
+                        const totals = group?.totals ?? {};
+                        return [
+                          ...detailRows,
+                          {
+                            metodo: String(group?.method ?? ''),
+                            fecha: '',
+                            hora: '',
+                            factura: 'SUBTOTAL',
+                            cliente: '',
+                            cajero: '',
+                            monto_usd: Number(totals?.usd ?? 0) || 0,
+                            monto_bs: Number(totals?.ves ?? 0) || 0
+                          }
+                        ];
+                      })
+                    : Object.entries(zClosureData.byMethod).map(([method, data]: [string, any]) => ({
+                        metodo: method,
+                        operaciones: Number(data?.count ?? 0) || 0,
+                        total_usd: Number(data?.usd ?? 0) || 0,
+                        total_bs: Number(data?.ves ?? 0) || 0
+                      })),
+                  `cierre_z_${zDate}.csv`,
+                  { reportLabel: 'Cierre Caja', filterLabel: getActiveFilterLabel(), includeTotals: true }
+                )}
+                className="flex items-center gap-2 px-4 py-2 bg-emerald-900 text-white rounded-xl text-[10px] font-black uppercase hover:bg-emerald-800 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                <Download className="w-3 h-3" /> Excel
               </button>
             </div>
 
@@ -3745,10 +5854,23 @@ export function ReportsView() {
                 <p className="text-[9px] font-black text-emerald-600 uppercase">Ventas Total $</p>
                 <p className="text-xl font-black text-emerald-900">$ {zClosureData.totals.usd.toLocaleString()}</p>
                 <p className="text-[10px] text-emerald-700">{zClosureData.counts.total} ops</p>
+                <p className="text-[9px] text-emerald-700 mt-1">
+                  {Number((zClosureData as any).counts?.cash ?? 0)} contado · {Number((zClosureData as any).counts?.credit ?? 0)} credito
+                </p>
               </div>
               <div className="bg-blue-50 p-4 rounded-xl border border-blue-200">
                 <p className="text-[9px] font-black text-blue-600 uppercase">Ventas Total Bs</p>
                 <p className="text-xl font-black text-blue-900">Bs. {zClosureData.totals.ves.toLocaleString()}</p>
+              </div>
+              <div className="bg-amber-50 p-4 rounded-xl border border-amber-200">
+                <p className="text-[9px] font-black text-amber-700 uppercase">Anuladas excluidas</p>
+                <p className="text-xl font-black text-amber-900">{Number((zClosureData as any).counts?.voidedExcluded ?? 0)}</p>
+                <p className="text-[10px] text-amber-700">No participan en el cierre</p>
+              </div>
+              <div className="bg-slate-50 p-4 rounded-xl border border-slate-200">
+                <p className="text-[9px] font-black text-slate-600 uppercase">Sin desglose</p>
+                <p className="text-xl font-black text-slate-900">{Number((zClosureData as any).counts?.withoutBreakdown ?? 0)}</p>
+                <p className="text-[10px] text-slate-500">Ventas MIXTO sin lineas de pago</p>
               </div>
             </div>
 
@@ -3884,6 +6006,95 @@ export function ReportsView() {
                 </tbody>
               </table>
             </div>
+
+            <div className="overflow-x-auto mt-6">
+              {zSelectedCashierIds.length === 0 && Array.isArray((zClosureData as any).methodDetailGroups) && (zClosureData as any).methodDetailGroups.length > 0 && (
+                <div className="mb-6">
+                  <h4 className="text-[12px] font-black text-slate-600 uppercase mb-3">Detalle por método (todos los cajeros)</h4>
+                  <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                    {(zClosureData as any).methodDetailGroups.map((group: any, groupIdx: number) => (
+                      <div key={`${group.method}-${groupIdx}`} className="bg-white border border-slate-200 rounded-2xl overflow-hidden">
+                        <div className="px-4 py-3 bg-slate-50 border-b border-slate-100 flex items-center justify-between">
+                          <div>
+                            <p className="text-[11px] font-black text-slate-900 uppercase">{group.method}</p>
+                            <p className="text-[9px] font-bold text-slate-400 uppercase">
+                              {Number(group?.totals?.count ?? 0)} registros
+                            </p>
+                          </div>
+                          <div className="text-right">
+                            <p className="text-[11px] font-black text-emerald-700">$ {Number(group?.totals?.usd ?? 0).toFixed(2)}</p>
+                            <p className="text-[10px] font-mono text-blue-700">{bs(Number(group?.totals?.ves ?? 0))}</p>
+                          </div>
+                        </div>
+                        <div className="overflow-x-auto">
+                          <table className="w-full text-left">
+                            <thead>
+                              <tr className="text-[9px] font-black text-slate-400 uppercase tracking-wider border-b border-slate-100">
+                                <th className="px-3 py-2">Factura</th>
+                                <th className="px-3 py-2">Cliente</th>
+                                <th className="px-3 py-2">Cajero</th>
+                                <th className="px-3 py-2 text-right">Monto $</th>
+                                <th className="px-3 py-2 text-right">Monto Bs</th>
+                              </tr>
+                            </thead>
+                            <tbody className="text-[11px]">
+                              {(Array.isArray(group.rows) ? group.rows : []).map((row: any, rowIdx: number) => (
+                                <tr key={`${group.method}-${row.correlativo}-${rowIdx}`} className="border-b border-slate-50 hover:bg-slate-50">
+                                  <td className="px-3 py-2 font-black text-slate-800">{row.correlativo || 'N/D'}</td>
+                                  <td className="px-3 py-2 text-slate-700">{row.client || 'N/D'}</td>
+                                  <td className="px-3 py-2 text-slate-700">{row.cashier || 'Sin cajero'}</td>
+                                  <td className="px-3 py-2 text-right font-mono font-black">$ {Number(row.lineUSD ?? 0).toFixed(2)}</td>
+                                  <td className="px-3 py-2 text-right font-mono">Bs {Number(row.lineVES ?? 0).toFixed(2)}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <h4 className="text-[12px] font-black text-slate-600 uppercase mb-3">Detalle por venta (registro de pago)</h4>
+              <table className="w-full text-left">
+                <thead>
+                  <tr className="text-[9px] font-black text-slate-400 uppercase tracking-wider border-b border-slate-100">
+                    <th className="px-3 py-3">Fecha</th>
+                    <th className="px-3 py-3">Factura</th>
+                    <th className="px-3 py-3">Cliente</th>
+                    <th className="px-3 py-3">Cajero</th>
+                    <th className="px-3 py-3">Metodos registrados</th>
+                    <th className="px-3 py-3 text-right">Total $</th>
+                    <th className="px-3 py-3 text-right">Total Bs</th>
+                  </tr>
+                </thead>
+                <tbody className="text-[11px]">
+                  {Array.isArray((zClosureData as any).salesDetailRows) && (zClosureData as any).salesDetailRows.length > 0 ? (
+                    (zClosureData as any).salesDetailRows.map((row: any, idx: number) => (
+                      <tr key={`${row.correlativo}-${idx}`} className="border-b border-slate-50 hover:bg-slate-50">
+                        <td className="px-3 py-2 font-mono text-[10px] text-slate-600">{row.date} {row.time}</td>
+                        <td className="px-3 py-2 font-black text-slate-800">{row.correlativo || 'N/D'}</td>
+                        <td className="px-3 py-2 text-slate-700">{row.client || 'N/D'}</td>
+                        <td className="px-3 py-2 text-slate-700">{row.cashier || 'Sin cajero'}</td>
+                        <td className="px-3 py-2 text-slate-700">
+                          <span className="font-black text-slate-500 mr-1">[{Number(row.methodsCount ?? 0)}]</span>
+                          {row.methodsLabel || 'Sin desglose'}
+                        </td>
+                        <td className="px-3 py-2 text-right font-mono font-black">$ {Number(row.totalUSD ?? 0).toFixed(2)}</td>
+                        <td className="px-3 py-2 text-right font-mono">Bs {Number(row.totalVES ?? 0).toFixed(2)}</td>
+                      </tr>
+                    ))
+                  ) : (
+                    <tr>
+                      <td colSpan={7} className="py-10 text-center text-slate-300 font-black uppercase text-[10px]">
+                        No hay ventas para mostrar detalle de metodos
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
       )}
@@ -3948,6 +6159,7 @@ export function ReportsView() {
                   </button>
                 </div>
                 <button
+                  disabled={!canExportCashierReports}
                   onClick={() => exportCSV(
                     [
                       ...cashierDetailRows.map((row) => (
@@ -3970,7 +6182,7 @@ export function ReportsView() {
                               referencia: methodRequiresReference(row.paymentMethod) ? (row.reference || 'N/D') : '-',
                               montoBS: row.paymentVES.toFixed(2),
                               tasaUsada: row.appliedRate > 0 ? row.appliedRate.toFixed(4) : 'N/D',
-                              equivUSD: row.equivalentUSD.toFixed(2)
+                              montoUSD: row.equivalentUSD.toFixed(2)
                             }
                       )),
                       cashierSelectedMethodKind === 'USD'
@@ -3990,16 +6202,17 @@ export function ReportsView() {
                             metodo: 'TOTAL',
                             montoBS: cashierDetailTotals.totalVES.toFixed(2),
                             tasaUsada: '',
-                            equivUSD: cashierDetailTotals.totalEquivalentUSD.toFixed(2)
+                            montoUSD: cashierDetailTotals.totalEquivalentUSD.toFixed(2)
                           }
                     ],
                     `facturacion_cajeros_detalle_${cashierReportDate}.csv`
                   )}
-                  className="flex items-center gap-2 px-4 py-2 bg-slate-900 text-white rounded-xl text-[10px] font-black uppercase hover:bg-slate-800 transition-all"
+                  className="flex items-center gap-2 px-4 py-2 bg-slate-900 text-white rounded-xl text-[10px] font-black uppercase hover:bg-slate-800 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   <Download className="w-3 h-3" /> Excel Detalle
                 </button>
                 <button
+                  disabled={!canExportCashierReports}
                   onClick={() => {
                     const selectedCashierName = selectedCashierId === 'ALL'
                       ? 'Todos los cajeros'
@@ -4013,10 +6226,11 @@ export function ReportsView() {
                         client: row.client,
                         paymentMethod: row.paymentMethod,
                         reference: row.reference,
-                        paymentUSD: cashierSelectedMethodKind === 'USD' ? row.usdReceived : 0,
+                        paymentUSD: row.usdReceived,
                         paymentVES: cashierSelectedMethodKind === 'USD' ? 0 : row.paymentVES,
                         rateUsed: row.appliedRate,
-                        equivalentUSD: row.equivalentUSD
+                        equivalentUSD: row.equivalentUSD,
+                        netUSD: row.netUSD
                       })),
                       cashierReportDate,
                       selectedCashierName,
@@ -4028,7 +6242,7 @@ export function ReportsView() {
                       `Metodo: ${cashierMethodFilter === 'ALL' ? 'Todos' : cashierMethodFilter} | Vista: ${cashierViewMode} | Fecha: ${cashierReportDate}`
                     );
                   }}
-                  className="flex items-center gap-2 px-4 py-2 bg-emerald-900 text-white rounded-xl text-[10px] font-black uppercase hover:bg-emerald-800 transition-all"
+                  className="flex items-center gap-2 px-4 py-2 bg-emerald-900 text-white rounded-xl text-[10px] font-black uppercase hover:bg-emerald-800 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   <Download className="w-3 h-3" /> PDF Detalle
                 </button>
@@ -4280,7 +6494,7 @@ export function ReportsView() {
                   Registros: {cashierDetailTotals.count} | Método: {cashierMethodFilter === 'ALL' ? 'Todos' : cashierMethodFilter}
                   {cashierSelectedMethodKind === 'USD'
                     ? ` | Total USD: $ ${cashierDetailTotals.totalUSDReceived.toFixed(2)}`
-                    : ` | Total Bs: Bs ${cashierDetailTotals.totalVES.toFixed(2)} | Equiv USD: $ ${cashierDetailTotals.totalEquivalentUSD.toFixed(2)}`}
+                    : ` | Total Bs: Bs ${cashierDetailTotals.totalVES.toFixed(2)} | Monto USD: $ ${cashierDetailTotals.totalEquivalentUSD.toFixed(2)}`}
                 </p>
               </div>
               

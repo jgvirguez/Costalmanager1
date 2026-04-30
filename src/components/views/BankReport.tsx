@@ -225,13 +225,31 @@ export function BankReport({ bank, onClose }: { bank: any; onClose: () => void }
               item.saldoUSD,
               item.saldoVES
             ]);
+            const totalDebitUSD = reportData.reduce((sum: number, item: any) => sum + (Number(item?.debitUSD ?? 0) || 0), 0);
+            const totalCreditUSD = reportData.reduce((sum: number, item: any) => sum + (Number(item?.creditUSD ?? 0) || 0), 0);
+            const totalDebitVES = reportData.reduce((sum: number, item: any) => sum + (Number(item?.debitVES ?? 0) || 0), 0);
+            const totalCreditVES = reportData.reduce((sum: number, item: any) => sum + (Number(item?.creditVES ?? 0) || 0), 0);
+            const lastRow = reportData.length > 0 ? reportData[reportData.length - 1] : null;
+            dataRows.push([
+              '',
+              'TOTAL',
+              '',
+              '',
+              Number(totalDebitUSD.toFixed(2)),
+              Number(totalCreditUSD.toFixed(2)),
+              Number(totalDebitVES.toFixed(2)),
+              Number(totalCreditVES.toFixed(2)),
+              Number((Number(lastRow?.saldoUSD ?? 0) || 0).toFixed(2)),
+              Number((Number(lastRow?.saldoVES ?? 0) || 0).toFixed(2))
+            ]);
             const w = colHeaders.length;
             const emptyTail = () => Array.from({ length: Math.max(0, w - 2) }, () => '');
             const csv = buildExcelFriendlyMatrixCsv(colHeaders, dataRows, {
               preambleRows: [
-                ['TIPO', 'Mayor bancario', ...emptyTail()],
-                ['BANCO', String(bank?.name ?? ''), ...emptyTail()],
-                ['GENERADO', new Date().toLocaleString('es-VE'), ...emptyTail()],
+                ['TIPO_REPORTE', 'Mayor bancario', ...emptyTail()],
+                ['FILTROS_APLICADOS', `Banco: ${String(bank?.name ?? 'N/D')}`, ...emptyTail()],
+                ['GENERADO_POR', String(dataService.getCurrentUser()?.name ?? dataService.getCurrentUser()?.email ?? 'Sistema'), ...emptyTail()],
+                ['FECHA_GENERACION', new Date().toLocaleString('es-VE'), ...emptyTail()],
                 Array.from({ length: w }, () => '')
               ]
             });
@@ -239,9 +257,19 @@ export function BankReport({ bank, onClose }: { bank: any; onClose: () => void }
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
-            a.download = `reporte_${bank.name.replace(/\s+/g, '_')}_${new Date().toISOString().split('T')[0]}.csv`;
+            const filename = `reporte_${bank.name.replace(/\s+/g, '_')}_${new Date().toISOString().split('T')[0]}.csv`;
+            a.download = filename;
             a.click();
             URL.revokeObjectURL(url);
+            const generatedAt = new Date().toLocaleString('es-VE');
+            const detail = [
+              'Exportacion CSV',
+              'Reporte: Mayor bancario',
+              `Banco: ${String(bank?.name ?? 'N/D')}`,
+              `Archivo: ${filename}`,
+              `Fecha: ${generatedAt}`
+            ].join(' | ');
+            void dataService.addAuditEntry('REPORTS', 'EXPORT', detail).catch(() => {});
           }}
           className="px-4 py-2 bg-emerald-600 text-white rounded-xl text-[10px] font-black uppercase tracking-wider inline-flex items-center gap-2"
         >

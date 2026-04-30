@@ -43,6 +43,8 @@ import { dataService, Batch, ProductPriceHistoryRecord } from '../../services/da
 import { reportService } from '../../services/reportService';
 import { useHotkeys } from '../../utils/hotkeys';
 import { PurchaseEntryModal } from '../modals/PurchaseEntryModal';
+import { PurchaseOrdersPanelModal } from '../modals/PurchaseOrdersPanelModal';
+import { formatDateVE, formatTimeVE } from '../../utils/dateTimeVE';
 
 export function InventoryView({ exchangeRate = 36.50 }: { exchangeRate?: number }) {
   // SEC-08: Helper de permisos
@@ -50,6 +52,7 @@ export function InventoryView({ exchangeRate = 36.50 }: { exchangeRate?: number 
   const canEditInventory = hasPermission('INVENTORY_WRITE') || hasPermission('ALL');
   const canFractionate = hasPermission('FRACTIONATION') || hasPermission('ALL');
   const isSuperUser = hasPermission('superUsuario') || hasPermission('Master');
+  const showPurchaseOrdersButton = false; // Ocultar temporalmente "Ordenes OC".
   
   const [searchQuery, setSearchQuery] = useState('');
   const [showTransferModal, setShowTransferModal] = useState(false);
@@ -75,6 +78,7 @@ export function InventoryView({ exchangeRate = 36.50 }: { exchangeRate?: number 
   const [isVoiding, setIsVoiding] = useState(false);
   const [voidPinError, setVoidPinError] = useState('');
   const [showAdjustModal, setShowAdjustModal] = useState(false);
+  const [showPurchaseOrdersModal, setShowPurchaseOrdersModal] = useState(false);
 
   React.useEffect(() => {
     return dataService.subscribe(() => setTick(t => t + 1));
@@ -142,13 +146,13 @@ export function InventoryView({ exchangeRate = 36.50 }: { exchangeRate?: number 
     // SEC-08: Solo permitir hotkeys si tiene permisos
     'F7': () => canEditInventory && setShowInputModal(true),
     'F4': () => canEditInventory && setShowTransferModal(true),
-    'Escape': () => { setShowTransferModal(false); setShowInputModal(false); setShowReturnModal(false); setShowNoteModal(false); setShowManufacturingModal(false); setShowAdjustModal(false); setExpandedCode(null); },
+    'Escape': () => { setShowTransferModal(false); setShowInputModal(false); setShowReturnModal(false); setShowNoteModal(false); setShowManufacturingModal(false); setShowAdjustModal(false); setShowPurchaseOrdersModal(false); setExpandedCode(null); },
   });
 
   const formatTraceDate = (value?: string | Date) => {
     if (!value) return '-';
     const parsed = value instanceof Date ? value : new Date(value);
-    return Number.isNaN(parsed.getTime()) ? String(value) : parsed.toLocaleDateString();
+    return Number.isNaN(parsed.getTime()) ? String(value) : formatDateVE(parsed);
   };
 
   const handleDeleteProduct = (code: string, description: string, stock: number) => {
@@ -218,11 +222,20 @@ export function InventoryView({ exchangeRate = 36.50 }: { exchangeRate?: number 
           >
             <ClipboardList className="w-4 h-4 text-blue-600" /> Historial
           </button>
+          {canEditInventory && showPurchaseOrdersButton && (
+            <button
+              type="button"
+              onClick={() => setShowPurchaseOrdersModal(true)}
+              className="flex items-center gap-2 px-4 py-2.5 bg-white border border-indigo-200 text-indigo-900 rounded-xl text-[9px] font-black uppercase tracking-widest shadow-sm hover:bg-indigo-50 transition-all"
+            >
+              <Clipboard className="w-4 h-4 text-indigo-600" /> Órdenes OC
+            </button>
+          )}
           <button
-            onClick={() => reportService.exportInventoryToPDF()}
+            onClick={() => reportService.exportInventoryToPDF({ pricing: 'cost', currency: 'USD' })}
             className="flex items-center gap-2 px-4 py-2.5 bg-white border border-slate-200 text-slate-900 rounded-xl text-[9px] font-black uppercase tracking-widest shadow-sm hover:bg-slate-50 transition-all"
           >
-            <FileDown className="w-4 h-4 text-emerald-600" /> Valorización
+            <FileDown className="w-4 h-4 text-emerald-600" /> Valorización (Costo)
           </button>
           <button
             onClick={() => setShowInputModal(true)}
@@ -401,14 +414,14 @@ export function InventoryView({ exchangeRate = 36.50 }: { exchangeRate?: number 
                                       </div>
                                       <div className="rounded-xl border border-slate-100 bg-slate-50 px-3 py-2">
                                         <div className="text-[7px] font-black uppercase tracking-widest text-slate-400">Costo línea</div>
-                                        <div className="mt-1 text-[10px] font-mono font-black text-slate-900">$ {Number(lote.totalLineUSD ?? lote.qty * lote.costUSD).toFixed(2)}</div>
+                                        <div className="mt-1 text-[10px] font-mono font-black text-slate-900">$ {((Number(lote.qty ?? 0) || 0) * (Number(lote.costUSD ?? 0) || 0)).toFixed(2)}</div>
                                       </div>
                                     </div>
 
                                     <div className="flex justify-between items-end mt-1 border-t pt-2 border-slate-50">
                                       <div>
                                         <p className={`text-[8px] font-bold ${new Date(lote.expiry).getTime() - Date.now() < 30 * 24 * 60 * 60 * 1000 ? 'text-red-500' : 'text-slate-400'}`}>
-                                          Exp: {lote.expiry.toLocaleDateString()}
+                                          Exp: {formatDateVE(lote.expiry)}
                                         </p>
                                         <p className="text-[8px] font-bold text-slate-400 uppercase">
                                           Factura total: $ {Number(lote.totalInvoiceUSD ?? 0).toFixed(2)}
@@ -483,7 +496,7 @@ export function InventoryView({ exchangeRate = 36.50 }: { exchangeRate?: number 
                       <p className="text-[9px] font-black text-emerald-500 uppercase tracking-tighter">{lote.id} • {lote.warehouse}</p>
                       <h5 className="font-black text-[10px] uppercase text-white mt-0.5">{stocks.find(s => s.code === lote.sku)?.description}</h5>
                     </div>
-                    <span className={`px-1.5 py-0.5 rounded text-[7px] font-black uppercase ${new Date(lote.expiry).getTime() - Date.now() < 30 * 24 * 60 * 60 * 1000 ? 'bg-red-500 text-white' : 'bg-emerald-500/20 text-emerald-400'}`}>Exp: {lote.expiry.toLocaleDateString()}</span>
+                    <span className={`px-1.5 py-0.5 rounded text-[7px] font-black uppercase ${new Date(lote.expiry).getTime() - Date.now() < 30 * 24 * 60 * 60 * 1000 ? 'bg-red-500 text-white' : 'bg-emerald-500/20 text-emerald-400'}`}>Exp: {formatDateVE(lote.expiry)}</span>
                   </div>
                 </div>
               ))}
@@ -505,7 +518,7 @@ export function InventoryView({ exchangeRate = 36.50 }: { exchangeRate?: number 
                   <div className="space-y-0.5 text-left">
                     <p className="text-[10px] font-black text-slate-900 uppercase leading-none">{log.type}: {log.sku}</p>
                     <p className="text-[8px] font-bold text-slate-400 uppercase tracking-tight">
-                      {log.warehouse} • {formatQuantity(Math.abs(log.qty))} KG • {log.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                      {log.warehouse} • {formatQuantity(Math.abs(log.qty))} KG • {formatTimeVE(log.timestamp, { hour: '2-digit', minute: '2-digit' })}
                     </p>
                   </div>
                 </div>
@@ -521,6 +534,10 @@ export function InventoryView({ exchangeRate = 36.50 }: { exchangeRate?: number 
           onClose={() => setShowInputModal(false)}
           onSaved={() => setShowInputModal(false)}
         />
+      )}
+
+      {showPurchaseOrdersModal && (
+        <PurchaseOrdersPanelModal onClose={() => setShowPurchaseOrdersModal(false)} />
       )}
 
       {showTransferModal && (
@@ -995,8 +1012,8 @@ function KardexModal({ product, movements, stocks, onClose }: {
                 {filtered.map((m, idx) => (
                   <tr key={m.id + idx} className="border-b border-slate-50 hover:bg-slate-50 transition-colors">
                     <td className="px-4 py-2.5 font-mono text-[9px] text-slate-500 whitespace-nowrap">
-                      {new Date(m.timestamp).toLocaleDateString()}<br/>
-                      <span className="text-[8px] text-slate-300">{new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                      {formatDateVE(new Date(m.timestamp))}<br/>
+                      <span className="text-[8px] text-slate-300">{formatTimeVE(new Date(m.timestamp), { hour: '2-digit', minute: '2-digit' })}</span>
                     </td>
                     <td className="px-4 py-2.5">
                       <span className={`px-2 py-0.5 rounded-full text-[7px] font-black uppercase ${m.info.color}`}>{m.info.label}</span>
@@ -1270,7 +1287,7 @@ function InventoryAdjustmentModal({ stocks, onClose, onSaved }: { stocks: any[];
               <option value="">Seleccione lote...</option>
               {batches.map((l: any) => (
                 <option key={l.id} value={l.id}>
-                  {String(l.batch ?? l.id).slice(-8).toUpperCase()} — {l.warehouse} — Exp: {new Date(l.expiry).toLocaleDateString()} — {Number(l.qty ?? 0).toFixed(3)}
+                  {String(l.batch ?? l.id).slice(-8).toUpperCase()} — {l.warehouse} — Exp: {formatDateVE(new Date(l.expiry))} — {Number(l.qty ?? 0).toFixed(3)}
                 </option>
               ))}
             </select>
@@ -1504,7 +1521,7 @@ function TransferModal({ stocks, onClose, onSaved }: { stocks: any[]; onClose: (
               <option value="">Seleccione lote...</option>
               {originLotes.map((l: any) => (
                 <option key={l.id} value={l.id}>
-                  {String(l.batch ?? l.id).slice(-8).toUpperCase()} — Exp: {new Date(l.expiry).toLocaleDateString()} — {Number(l.qty ?? 0).toFixed(3)}
+                  {String(l.batch ?? l.id).slice(-8).toUpperCase()} — Exp: {formatDateVE(new Date(l.expiry))} — {Number(l.qty ?? 0).toFixed(3)}
                 </option>
               ))}
             </select>
@@ -1673,7 +1690,7 @@ function PurchaseReturnModal({ stocks, onClose, onSaved }: any) {
             <select value={batchId} onChange={(e) => setBatchId(e.target.value)} className="w-full bg-slate-50 border-2 border-slate-100 rounded-xl px-4 py-3 text-[11px] font-black text-slate-900 focus:border-red-500 outline-none transition-all uppercase">
               <option value="">Seleccione lote...</option>
               {batches.map((l: any) => (
-                <option key={l.id} value={l.id}>{l.id} — {l.warehouse} — Exp: {new Date(l.expiry).toLocaleDateString()} — {formatQuantity(l.qty)}</option>
+                <option key={l.id} value={l.id}>{l.id} — {l.warehouse} — Exp: {formatDateVE(new Date(l.expiry))} — {formatQuantity(l.qty)}</option>
               ))}
             </select>
           </div>
@@ -2582,13 +2599,17 @@ function BatchDetailModal({ lote, productDescription, onClose, onSaved }: {
     }
   };
 
-  const currentProduct = useMemo(() => dataService.getStocks().find(p => p.lotes.some(l => String(l.id) === String(lote.id))), [lote.id]);
+  const stocksSnapshot = dataService.getStocks();
+  const currentProduct = useMemo(
+    () => stocksSnapshot.find(p => p.lotes.some(l => String(l.id) === String(lote.id))),
+    [lote.id, stocksSnapshot]
+  );
   const currentPriceUSD = currentProduct?.priceUSD ?? 0;
 
   const supportCount = Array.isArray(lote.supports) ? lote.supports.length : (lote.invoiceImage ? 1 : 0);
   const isExpiringSoon = lote.expiry && (new Date(lote.expiry).getTime() - Date.now()) < 30 * 24 * 60 * 60 * 1000;
   const costNum = Number(lote.costUSD ?? 0);
-  const totalLine = Number(lote.totalLineUSD ?? lote.qty * costNum);
+  const totalLine = (Number(lote.qty ?? 0) || 0) * costNum;
 
   const handleSavePrice = async () => {
     const val = parseFloat(newPrice.replace(',', '.'));
@@ -2649,7 +2670,7 @@ function BatchDetailModal({ lote, productDescription, onClose, onSaved }: {
   const formatDate = (v?: string | Date) => {
     if (!v) return '-';
     const d = v instanceof Date ? v : new Date(v);
-    return isNaN(d.getTime()) ? String(v) : d.toLocaleDateString();
+    return isNaN(d.getTime()) ? String(v) : formatDateVE(d);
   };
 
   const rows: { label: string; value: string; highlight?: string }[] = [
@@ -2667,7 +2688,7 @@ function BatchDetailModal({ lote, productDescription, onClose, onSaved }: {
     { label: 'Unidad', value: String(lote.unit ?? 'KG') },
     { label: 'Cantidad actual', value: `${Number(lote.qty ?? 0).toLocaleString('es-VE', { minimumFractionDigits: 3 })} ${lote.unit ?? 'KG'}` },
     { label: 'Factura total USD', value: `$ ${Number(lote.totalInvoiceUSD ?? 0).toFixed(2)}` },
-    { label: 'Total línea USD', value: `$ ${totalLine.toFixed(2)}` },
+    { label: 'Total línea actual USD', value: `$ ${totalLine.toFixed(2)}` },
     { label: 'Soportes adjuntos', value: String(supportCount) },
   ];
 

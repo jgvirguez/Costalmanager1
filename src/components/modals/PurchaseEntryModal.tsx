@@ -13,7 +13,7 @@ import {
   Upload,
   X
 } from 'lucide-react';
-import { dataService, ProductStock } from '../../services/dataService';
+import { dataService, ProductStock, type PurchaseOrder } from '../../services/dataService';
 import { supplierService, Supplier } from '../../services/supplierService';
 import { clientService } from '../../services/clientService';
 import { normalizeDocumentId } from '../../utils/idNormalization';
@@ -29,6 +29,9 @@ interface PurchaseEntryModalProps {
   warehouse?: string;
   title?: string;
   subtitle?: string;
+  /** CMP-03: recepción contra OC aprobada */
+  linkedPurchaseOrderId?: string | null;
+  linkedPurchaseOrder?: PurchaseOrder | null;
 }
 
 type CostCurrency = 'USD' | 'VES';
@@ -149,7 +152,9 @@ export function PurchaseEntryModal({
   onSaved,
   warehouse = 'Galpon D3',
   title = 'Registrar compra de mercancía',
-  subtitle = 'La compra entra al inventario y queda lista para facturar'
+  subtitle = 'La compra entra al inventario y queda lista para facturar',
+  linkedPurchaseOrderId = null,
+  linkedPurchaseOrder = null
 }: PurchaseEntryModalProps) {
   const [form, setForm] = useState({
     supplier: '',
@@ -247,6 +252,55 @@ export function PurchaseEntryModal({
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
   }, []);
+
+  const lastOcPrefill = React.useRef<string | null>(null);
+  React.useEffect(() => {
+    const oid = linkedPurchaseOrder?.id ?? '';
+    if (!oid || !linkedPurchaseOrder) {
+      lastOcPrefill.current = null;
+      return;
+    }
+    if (lastOcPrefill.current === oid) return;
+    lastOcPrefill.current = oid;
+    const po = linkedPurchaseOrder;
+    setSupplierSearch(po.supplier);
+    setForm((f) => ({
+      ...f,
+      supplier: po.supplier,
+      supplierDocument: po.supplierDocument ?? f.supplierDocument,
+      supplierPhone: po.supplierPhone ?? f.supplierPhone,
+      supplierAddress: po.supplierAddress ?? f.supplierAddress
+    }));
+    const defaultExpiry = new Date();
+    defaultExpiry.setMonth(defaultExpiry.getMonth() + 6);
+    const expStr = defaultExpiry.toISOString().split('T')[0];
+    const newItems: PurchaseLine[] = [];
+    for (const line of po.lines) {
+      const rem = roundTo(line.qtyOrdered - line.qtyReceived, 4);
+      if (!(rem > 0)) continue;
+      const p = products.find((pr) => String(pr.code ?? '').trim().toUpperCase() === line.sku);
+      if (!p) continue;
+      newItems.push({
+        id: `po-${line.id}-${Math.random().toString(36).slice(2, 9)}`,
+        mode: 'EXISTING',
+        sku: line.sku,
+        description: p.description,
+        unit: line.unit || p.unit,
+        qty: rem,
+        costUSD: 0,
+        expiry: expStr,
+        batch: '',
+        totalLineUSD: 0,
+        salePrices: buildSalePrices(0),
+        warehouse: line.warehouse
+      });
+    }
+    setItems(newItems);
+    setDraftLine(createDraftLine('EXISTING', warehouse));
+    if (newItems.length === 0) {
+      setError('Ningún renglón pendiente de la OC coincide con el catálogo. Revise SKUs y almacenes.');
+    }
+  }, [linkedPurchaseOrder, products, warehouse]);
 
   React.useEffect(() => {
     const invoiceNumber = String(form.invoiceNumber ?? '').trim();
@@ -727,6 +781,7 @@ export function PurchaseEntryModal({
         paymentType: form.paymentType,
         files,
         warehouse,
+        ...(linkedPurchaseOrderId ? { purchaseOrderId: linkedPurchaseOrderId } : {}),
         items: items.map((item) => ({
           sku: item.mode === 'EXISTING' ? item.sku : undefined,
           newProduct: item.mode === 'NEW'
@@ -766,7 +821,7 @@ export function PurchaseEntryModal({
 
   return (
     <>
-    <div className="fixed inset-0 z-[1200] bg-black/60 flex items-start justify-center p-1 sm:p-2 md:p-4 overflow-y-auto">
+    <div className={`fixed inset-0 ${linkedPurchaseOrderId ? 'z-[1280]' : 'z-[1200]'} bg-black/60 flex items-start justify-center p-1 sm:p-2 md:p-4 overflow-y-auto`}>
       <div className="w-full max-w-5xl bg-white rounded-2xl shadow-2xl overflow-hidden border border-slate-200 my-1 sm:my-2 flex flex-col" style={{ maxHeight: 'calc(100vh - 8px)' }}>
         <div className="p-4 md:p-5 md:p-2 border-b bg-slate-50/30 flex justify-between items-center gap-4 shrink-0">
           <div className="flex items-center gap-2.5 min-w-0">
@@ -791,11 +846,21 @@ export function PurchaseEntryModal({
             </div>
           )}
 
+          {linkedPurchaseOrderId && (
+            <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-amber-900 text-[10px] font-bold flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 shrink-0" />
+              <span>
+                Recepción contra OC: solo productos del catálogo; las cantidades no pueden exceder el pendiente por línea y almacén. Revise costos y lotes antes de confirmar.
+              </span>
+            </div>
+          )}
+
           <div className="grid grid-cols-1 md:grid-cols-3 md:grid-cols-12 gap-3 md:gap-1.5 items-stretch">
             <div className="relative flex flex-col md:col-span-1 md:col-span-5" ref={supplierRef}>
               <label className="text-[8px] font-black uppercase tracking-widest text-slate-400 mb-0.5 md:mb-0.5">Proveedor</label>
               <input
                 value={supplierSearch}
+                readOnly={!!linkedPurchaseOrderId}
                 onChange={(e) => {
                   setSupplierSearch(e.target.value);
                   updateForm({ supplier: e.target.value });
@@ -805,7 +870,7 @@ export function PurchaseEntryModal({
                 onFocus={() => setShowSupplierSuggestions(true)}
                 onKeyDown={handleSupplierKeyDown}
                 onBlur={() => setTimeout(() => { setShowSupplierSuggestions(false); setSelectedSupplierIndex(-1); }, 200)}
-                className="w-full bg-white border border-slate-200 rounded-lg lg:rounded px-3 md:px-1.5 py-2 md:py-0.5 text-[11px] md:text-xs font-bold outline-none uppercase h-[38px] md:h-8"
+                className={`w-full bg-white border border-slate-200 rounded-lg lg:rounded px-3 md:px-1.5 py-2 md:py-0.5 text-[11px] md:text-xs font-bold outline-none uppercase h-[38px] md:h-8 ${linkedPurchaseOrderId ? 'bg-slate-100 cursor-not-allowed' : ''}`}
                 placeholder="Nombre o RIF del proveedor"
               />
               {showSupplierSuggestions && filteredSuppliers.length > 0 && (
@@ -829,8 +894,9 @@ export function PurchaseEntryModal({
               <label className="text-[8px] font-black uppercase tracking-widest text-slate-400 mb-0.5 md:mb-0.5">RIF o CI</label>
               <input
                 value={form.supplierDocument}
+                readOnly={!!linkedPurchaseOrderId}
                 onChange={(e) => updateForm({ supplierDocument: e.target.value.toUpperCase() })}
-                className="w-full bg-white border border-slate-200 rounded-lg lg:rounded px-3 md:px-1.5 py-2 md:py-0.5 text-[11px] md:text-xs font-black uppercase outline-none h-[38px] md:h-8"
+                className={`w-full bg-white border border-slate-200 rounded-lg lg:rounded px-3 md:px-1.5 py-2 md:py-0.5 text-[11px] md:text-xs font-black uppercase outline-none h-[38px] md:h-8 ${linkedPurchaseOrderId ? 'bg-slate-100 cursor-not-allowed' : ''}`}
                 placeholder="Ej: J-12345678-9"
               />
             </div>
@@ -838,8 +904,9 @@ export function PurchaseEntryModal({
               <label className="text-[8px] font-black uppercase tracking-widest text-slate-400 mb-0.5 md:mb-0.5">Teléfono</label>
               <input
                 value={form.supplierPhone}
+                readOnly={!!linkedPurchaseOrderId}
                 onChange={(e) => updateForm({ supplierPhone: e.target.value })}
-                className="w-full bg-white border border-slate-200 rounded-lg lg:rounded px-3 md:px-1.5 py-2 md:py-0.5 text-[11px] md:text-xs font-bold outline-none h-[38px] md:h-8"
+                className={`w-full bg-white border border-slate-200 rounded-lg lg:rounded px-3 md:px-1.5 py-2 md:py-0.5 text-[11px] md:text-xs font-bold outline-none h-[38px] md:h-8 ${linkedPurchaseOrderId ? 'bg-slate-100 cursor-not-allowed' : ''}`}
                 placeholder="Número de contacto"
               />
             </div>
@@ -850,8 +917,9 @@ export function PurchaseEntryModal({
               <label className="text-[8px] font-black uppercase tracking-widest text-slate-400 mb-0.5 md:mb-0.5">Dirección</label>
               <input
                 value={form.supplierAddress}
+                readOnly={!!linkedPurchaseOrderId}
                 onChange={(e) => updateForm({ supplierAddress: e.target.value })}
-                className="w-full bg-white border border-slate-200 rounded-lg lg:rounded px-3 md:px-1.5 py-2 md:py-0.5 text-[11px] md:text-xs font-bold outline-none h-[38px] md:h-8"
+                className={`w-full bg-white border border-slate-200 rounded-lg lg:rounded px-3 md:px-1.5 py-2 md:py-0.5 text-[11px] md:text-xs font-bold outline-none h-[38px] md:h-8 ${linkedPurchaseOrderId ? 'bg-slate-100 cursor-not-allowed' : ''}`}
                 placeholder="Dirección fiscal o comercial del proveedor"
               />
             </div>
@@ -940,11 +1008,13 @@ export function PurchaseEntryModal({
                       onClick={() => setDraftLine(createDraftLine('EXISTING'))}
                       className={`px-3 md:px-1.5 py-1.5 md:py-0.5 rounded-lg lg:rounded text-[10px] md:text-xs font-black uppercase tracking-widest border transition-all ${draftLine.mode === 'EXISTING' ? 'bg-emerald-600 text-white border-emerald-600' : 'bg-white text-slate-500 border-slate-200'}`}
                     >Existente</button>
-                    <button
-                      type="button"
-                      onClick={() => setDraftLine(createDraftLine('NEW'))}
-                      className={`px-3 md:px-1.5 py-1.5 md:py-0.5 rounded-lg lg:rounded text-[10px] md:text-xs font-black uppercase tracking-widest border transition-all ${draftLine.mode === 'NEW' ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-slate-500 border-slate-200'}`}
-                    >Nuevo</button>
+                    {!linkedPurchaseOrderId && (
+                      <button
+                        type="button"
+                        onClick={() => setDraftLine(createDraftLine('NEW'))}
+                        className={`px-3 md:px-1.5 py-1.5 md:py-0.5 rounded-lg lg:rounded text-[10px] md:text-xs font-black uppercase tracking-widest border transition-all ${draftLine.mode === 'NEW' ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-slate-500 border-slate-200'}`}
+                      >Nuevo</button>
+                    )}
                   </div>
                 </div>
 

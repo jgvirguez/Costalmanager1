@@ -6,6 +6,7 @@
     "rules": "storage.rules"
   },
   "hosting": {
+    "site": "costalmanager",
     "public": "dist",
     "ignore": [
       "firebase.json",

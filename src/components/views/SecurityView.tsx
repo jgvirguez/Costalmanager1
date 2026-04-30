@@ -320,10 +320,14 @@ export function SecurityView() {
   const [loadingPinDiagnosis, setLoadingPinDiagnosis] = useState(false);
   const [showPinDiagnosis, setShowPinDiagnosis] = useState(false);
 
-  const handleDeleteUser = () => {
+  const handleDeleteUser = async () => {
     if (!deletingUser) return;
-    dataService.deleteUser(deletingUser.id);
-    setDeletingUser(null);
+    try {
+      await dataService.deleteUser(deletingUser.id);
+      setDeletingUser(null);
+    } catch (e: any) {
+      alert(`No se pudo eliminar usuario: ${e?.message ?? 'Error desconocido'}`);
+    }
   };
 
   const permissionLabelMap = new Map(dataService.getPermissionDefinitions().map((item) => [item.key, item.label]));

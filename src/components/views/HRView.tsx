@@ -14,13 +14,57 @@ import {
   Building2
 } from 'lucide-react';
 import {
-  dataService,
-  Employee,
-  HRAdvance,
-  PayrollRun,
-  PayFrequency,
-  EmployeeStatus
+  dataService
 } from '../../services/dataService';
+
+type PayFrequency = 'WEEKLY' | 'BIWEEKLY' | 'MONTHLY';
+type EmployeeStatus = 'ACTIVE' | 'INACTIVE' | 'SUSPENDED';
+
+type Employee = {
+  id: string;
+  createdAt: string;
+  name: string;
+  cedula: string;
+  position: string;
+  department: string;
+  salaryUSD: number;
+  payFrequency: PayFrequency;
+  startDate: string;
+  status: EmployeeStatus;
+  phone: string;
+  address: string;
+  bankAccount: string;
+  bankName: string;
+};
+
+type HRAdvance = {
+  id: string;
+  employeeId: string;
+  employeeName: string;
+  amountUSD: number;
+  reason: string;
+  date: string;
+  status: 'PENDING' | 'DISCOUNTED';
+};
+
+type PayrollRunLine = {
+  employeeName: string;
+  position: string;
+  grossUSD: number;
+  advancesDeducted: number;
+  netUSD: number;
+};
+
+type PayrollRun = {
+  id: string;
+  correlativo: string;
+  frequency: PayFrequency;
+  period: string;
+  totalUSD: number;
+  lines: PayrollRunLine[];
+};
+
+const hrApi = dataService as any;
 
 type HRTab = 'employees' | 'advances' | 'payroll';
 
@@ -84,9 +128,9 @@ export function HRView() {
     setLoading(true);
     try {
       const [emps, advs, runs] = await Promise.all([
-        dataService.getEmployees(),
-        dataService.getHRAdvances(),
-        dataService.getPayrollRuns()
+        Promise.resolve(typeof hrApi.getEmployees === 'function' ? hrApi.getEmployees() : []),
+        Promise.resolve(typeof hrApi.getHRAdvances === 'function' ? hrApi.getHRAdvances() : []),
+        Promise.resolve(typeof hrApi.getPayrollRuns === 'function' ? hrApi.getPayrollRuns() : [])
       ]);
       setEmployees(emps);
       setAdvances(advs);
@@ -110,7 +154,8 @@ export function HRView() {
     }
     setEmpSaving(true); setEmpError('');
     try {
-      await dataService.addEmployee(empForm);
+      if (typeof hrApi.addEmployee !== 'function') throw new Error('Modulo RRHH no habilitado en DataService.');
+      await hrApi.addEmployee(empForm);
       setShowAddEmp(false);
       setEmpForm({ ...emptyEmployee });
       await reload();
@@ -131,7 +176,8 @@ export function HRView() {
     if (!emp) { setAdvError('Empleado no encontrado.'); return; }
     setAdvSaving(true); setAdvError('');
     try {
-      await dataService.addHRAdvance({
+      if (typeof hrApi.addHRAdvance !== 'function') throw new Error('Modulo RRHH no habilitado en DataService.');
+      await hrApi.addHRAdvance({
         employeeId: emp.id,
         employeeName: emp.name,
         amountUSD: amt,
@@ -154,7 +200,8 @@ export function HRView() {
     if (eligible.length === 0) { setPayError(`No hay empleados activos con frecuencia ${FREQ_LABELS[payFreq]}.`); return; }
     setPayProcessing(true); setPayError('');
     try {
-      await dataService.processPayroll(payFreq, payPeriod, employees, advances);
+      if (typeof hrApi.processPayroll !== 'function') throw new Error('Modulo RRHH no habilitado en DataService.');
+      await hrApi.processPayroll(payFreq, payPeriod, employees, advances);
       setShowPayroll(false);
       await reload();
     } catch (e: any) {
@@ -168,7 +215,8 @@ export function HRView() {
     if (!editingEmp) return;
     setEditSaving(true);
     try {
-      await dataService.updateEmployee(editingEmp.id, editForm);
+      if (typeof hrApi.updateEmployee !== 'function') throw new Error('Modulo RRHH no habilitado en DataService.');
+      await hrApi.updateEmployee(editingEmp.id, editForm);
       setEditingEmp(null);
       await reload();
     } catch { /* ignore */ } finally {

@@ -7,6 +7,64 @@ import { dataService, CashBoxBreakdownLine, CashBoxSession, CashBoxSessionSummar
 interface BillEntry { denom: number; qty: number; }
 interface ElectronicLine { id: string; method: string; bankId: string; bankName: string; amountVES: number; amountUSD: number; othersType: string; note: string; }
 
+function sanitizeDecimalInput(value: string): string {
+  const cleaned = value.replace(/[^\d.,]/g, '');
+  const separatorIndex = cleaned.search(/[.,]/);
+  if (separatorIndex < 0) return cleaned;
+  const head = cleaned.slice(0, separatorIndex);
+  const separator = cleaned[separatorIndex];
+  const tail = cleaned.slice(separatorIndex + 1).replace(/[.,]/g, '');
+  return `${head}${separator}${tail}`;
+}
+
+function parseDecimalInput(value: string): number {
+  const parsed = Number(value.replace(',', '.'));
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+}
+
+function DecimalAmountInput({
+  value,
+  onChange,
+  placeholder = '0.00',
+  disabled,
+  className
+}: {
+  value: number;
+  onChange: (value: number) => void;
+  placeholder?: string;
+  disabled?: boolean;
+  className: string;
+}) {
+  const [text, setText] = useState(value > 0 ? String(value) : '');
+  const [focused, setFocused] = useState(false);
+
+  useEffect(() => {
+    if (!focused) setText(value > 0 ? value.toFixed(2) : '');
+  }, [focused, value]);
+
+  return (
+    <input
+      type="text"
+      inputMode="decimal"
+      value={text}
+      onFocus={() => setFocused(true)}
+      onBlur={() => {
+        setFocused(false);
+        const parsed = parseDecimalInput(text);
+        setText(parsed > 0 ? parsed.toFixed(2) : '');
+      }}
+      onChange={(e) => {
+        const next = sanitizeDecimalInput(e.target.value);
+        setText(next);
+        onChange(parseDecimalInput(next));
+      }}
+      placeholder={placeholder}
+      disabled={disabled}
+      className={className}
+    />
+  );
+}
+
 const METHOD_LABEL: Record<string, string> = {
   mobile: 'Pago Móvil',
   transfer: 'Transferencia',
@@ -433,8 +491,29 @@ export function ClosingView({ exchangeRateBCV = 0, exchangeRateParallel = 0, exc
       }
       return line;
     });
+    const normalizeBankForReconciliation = (l: any) => {
+      const method = String(l.method ?? '').trim().toLowerCase();
+      const raw = String(l.bank ?? '').trim() || String(l.accountLabel ?? '').trim();
+      if (method === 'others' && raw.toUpperCase() === 'CXP') return 'CxP';
+      const normalized = raw
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .toUpperCase()
+        .replace(/[^A-Z0-9 ]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (!normalized) return '';
+      if (normalized.includes('BANESCO')) return 'BANESCO';
+      if (normalized.includes('VENEZUELA')) return 'VENEZUELA';
+      if (normalized.includes('MERCANTIL')) return 'MERCANTIL';
+      if (normalized.includes('PROVINCIAL') || normalized.includes('BBVA')) return 'PROVINCIAL';
+      if (normalized.includes('BNC')) return 'BNC';
+      if (normalized.includes('BOD')) return 'BOD';
+      if (normalized.includes('BICENTENARIO')) return 'BICENTENARIO';
+      return normalized;
+    };
     const recKey = (l: any) =>
-      `${String(l.method ?? '').trim()}|${String(l.bank ?? '').trim()}|${String(l.currency ?? '').trim()}`;
+      `${String(l.method ?? '').trim()}|${normalizeBankForReconciliation(l)}|${String(l.currency ?? '').trim()}`;
 
     const sysMap = new Map<string, any>();
     for (const l of systemBd) {
@@ -485,7 +564,7 @@ export function ClosingView({ exchangeRateBCV = 0, exchangeRateParallel = 0, exc
         method: String(s?.method ?? d?.method ?? '').trim(),
         label: String(s?.label ?? d?.label ?? ''),
         currency,
-        bank: String(s?.bank ?? d?.bank ?? '').trim(),
+        bank: normalizeBankForReconciliation(s ?? d),
         accountId: String(s?.accountId ?? d?.accountId ?? '').trim(),
         accountLabel: String(s?.accountLabel ?? d?.accountLabel ?? '').trim(),
         posTerminalId: String(s?.posTerminalId ?? d?.posTerminalId ?? '').trim(),
@@ -537,6 +616,25 @@ export function ClosingView({ exchangeRateBCV = 0, exchangeRateParallel = 0, exc
         usd: grandTotalUSD + declaredCreditAmountUSD,
         ves: grandTotalVES
       };
+
+  const declaredDetailRows = useMemo(() => {
+    const rows = Array.isArray(liveReconciliation?.lines) ? liveReconciliation.lines : [];
+    return rows
+      .map((line) => {
+        const currency = String(line.currency ?? '').toUpperCase() === 'VES' ? 'VES' : 'USD';
+        const amount = currency === 'VES'
+          ? Number(line.declaredAmountVES ?? 0) || 0
+          : Number(line.declaredAmountUSD ?? 0) || 0;
+        return {
+          key: `${String(line.key ?? '')}|${currency}`,
+          label: String(line.label ?? '').trim() || 'Método',
+          currency,
+          amount
+        };
+      })
+      .filter((r) => Math.abs(r.amount) > 0.000001)
+      .sort((a, b) => a.label.localeCompare(b.label) || a.currency.localeCompare(b.currency));
+  }, [liveReconciliation]);
 
   const declaredDenominations = useMemo(() => {
     const toMap = (entries: BillEntry[]) => {
@@ -638,6 +736,21 @@ export function ClosingView({ exchangeRateBCV = 0, exchangeRateParallel = 0, exc
             <p className="text-slate-500 font-bold text-sm">Tu declaraci\u00f3n fue enviada correctamente al sistema.</p>
           </div>
           <div className="bg-slate-50 rounded-2xl p-5 text-left space-y-3">
+            {declaredDetailRows.length > 0 && (
+              <div className="space-y-2 pb-3 border-b border-slate-200">
+                <p className="text-[10px] font-black uppercase tracking-widest text-slate-500">Detalle declarado</p>
+                {declaredDetailRows.map((row) => (
+                  <div key={row.key} className="flex justify-between text-sm">
+                    <span className="font-bold text-slate-500">{row.label}</span>
+                    <span className="font-black text-slate-900 font-mono">
+                      {row.currency === 'VES'
+                        ? `Bs ${row.amount.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+                        : `$${row.amount.toFixed(2)}`}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
             <div className="flex justify-between text-sm">
               <span className="font-bold text-slate-500">Efectivo + Electr\u00f3nicos Bs</span>
               <span className="font-black text-slate-900 font-mono">Bs {grandTotalVES.toLocaleString('es-VE', {minimumFractionDigits: 2})}</span>
@@ -850,13 +963,13 @@ export function ClosingView({ exchangeRateBCV = 0, exchangeRateParallel = 0, exc
                   <div className="grid grid-cols-2 gap-3">
                     <div className="space-y-1">
                       <label className="text-[8px] font-black text-slate-400 uppercase tracking-widest">Efectivo inicial USD</label>
-                      <input type="number" min={0} step={0.01} value={newCashboxUSD || ''} onChange={e => setNewCashboxUSD(parseFloat(e.target.value) || 0)}
+                      <DecimalAmountInput value={newCashboxUSD} onChange={setNewCashboxUSD}
                         className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 text-[11px] font-mono text-slate-900 outline-none focus:border-indigo-400"
                         placeholder="0.00" />
                     </div>
                     <div className="space-y-1">
                       <label className="text-[8px] font-black text-slate-400 uppercase tracking-widest">Efectivo inicial Bs.</label>
-                      <input type="number" min={0} step={0.01} value={newCashboxVES || ''} onChange={e => setNewCashboxVES(parseFloat(e.target.value) || 0)}
+                      <DecimalAmountInput value={newCashboxVES} onChange={setNewCashboxVES}
                         className="w-full bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 text-[11px] font-mono text-slate-900 outline-none focus:border-indigo-400"
                         placeholder="0.00" />
                     </div>
@@ -1068,10 +1181,11 @@ export function ClosingView({ exchangeRateBCV = 0, exchangeRateParallel = 0, exc
                     <label className="text-[10px] font-black text-amber-700 uppercase tracking-wider">Monto Total USD</label>
                     <div className="relative">
                       <span className="absolute left-4 top-1/2 -translate-y-1/2 text-amber-500 font-black text-sm">$</span>
-                      <input type="number" min="0" step="0.01"
-                        value={declaredCreditAmountUSD || ''}
-                        onChange={(e) => setDeclaredCreditAmountUSD(Number(e.target.value) || 0)}
-                        placeholder="0.00" disabled={!canFinalize}
+                      <DecimalAmountInput
+                        value={declaredCreditAmountUSD}
+                        onChange={setDeclaredCreditAmountUSD}
+                        placeholder="0.00"
+                        disabled={!canFinalize}
                         className="w-full bg-white border-2 border-amber-200 rounded-xl pl-8 pr-4 py-3 text-xl font-black text-amber-900 text-right outline-none focus:border-amber-400 transition-all disabled:opacity-50"
                       />
                     </div>
@@ -2142,10 +2256,11 @@ function ElectronicLineInput({ line, banks, methodCurrency, methodLabel, methodI
         {(cMode === 'VES' || cMode === 'BOTH') && (
           <div className="relative">
             <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 font-black text-xs">Bs</span>
-            <input type="number" min="0" step="0.01"
-              value={line.amountVES || ''}
-              onChange={e => onChange({ amountVES: Number(e.target.value) || 0 })}
-              placeholder="0.00" disabled={disabled}
+            <DecimalAmountInput
+              value={line.amountVES}
+              onChange={(amountVES) => onChange({ amountVES })}
+              placeholder="0.00"
+              disabled={disabled}
               className="w-full bg-white border border-slate-200 rounded-xl pl-8 pr-3 py-2.5 text-sm font-black text-slate-900 text-right outline-none focus:border-emerald-400 transition-all"
             />
           </div>
@@ -2153,10 +2268,11 @@ function ElectronicLineInput({ line, banks, methodCurrency, methodLabel, methodI
         {(cMode === 'USD' || cMode === 'BOTH') && (
           <div className="relative">
             <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 font-black text-xs">$</span>
-            <input type="number" min="0" step="0.01"
-              value={line.amountUSD || ''}
-              onChange={e => onChange({ amountUSD: Number(e.target.value) || 0 })}
-              placeholder="0.00" disabled={disabled}
+            <DecimalAmountInput
+              value={line.amountUSD}
+              onChange={(amountUSD) => onChange({ amountUSD })}
+              placeholder="0.00"
+              disabled={disabled}
               className="w-full bg-white border border-slate-200 rounded-xl pl-7 pr-3 py-2.5 text-sm font-black text-slate-900 text-right outline-none focus:border-emerald-400 transition-all"
             />
           </div>

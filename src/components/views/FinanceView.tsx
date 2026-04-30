@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { 
   Landmark, 
   ArrowUpRight, 
@@ -36,22 +36,48 @@ import {
   ReceiptText,
   UserCheck
 } from 'lucide-react';
-import { dataService, ClientAdvance, SupplierAdvance, ExpenseCategory, EXPENSE_CATEGORIES, OperationalExpense } from '../../services/dataService';
+import { dataService, ClientAdvance, SupplierAdvance, ExpenseCategory, EXPENSE_CATEGORIES, OperationalExpense, PurchaseInvoiceHistoryEntry, CompanyLoan, type MayorCuentaMovimientoRow } from '../../services/dataService';
 import { clientService } from '../../services/clientService';
 import { supplierService } from '../../services/supplierService';
 import { reportService } from '../../services/reportService';
 import { printService } from '../../services/printService';
+import { buildExcelFriendlyCsv } from '../../utils/csvExport';
 import { PurchaseEntryModal } from '../modals/PurchaseEntryModal';
 import { ConfirmModal } from '../ConfirmModal';
 import { BillingClient } from '../../types/billing';
 
-export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exchangeRate?: number, onStartARCollection?: (data: { active: boolean; arEntryId: string; customerId: string; customerName: string; balanceUSD: number; balanceVES: number; description: string; saleCorrelativo: string; }) => void }) {
+const formatInvoiceProductDetails = (lines: any[]): string => {
+  const list = Array.isArray(lines) ? lines : [];
+  if (list.length === 0) return 'Sin detalle de productos';
+  return list.map((line: any, index: number) => {
+    const qty = Number(line?.qty ?? 0) || 0;
+    const unit = String(line?.unit ?? '').trim();
+    const name = String(line?.productDescription ?? line?.description ?? line?.sku ?? line?.code ?? `Producto ${index + 1}`).trim();
+    return `${index + 1}) ${name} - ${qty.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}${unit ? ` ${unit}` : ''}`;
+  }).join(' | ');
+};
+
+export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARCollection }: { exchangeRate?: number, internalRate?: number, onStartARCollection?: (data: { active: boolean; arEntryId: string; customerId: string; customerName: string; balanceUSD: number; balanceVES: number; description: string; saleCorrelativo: string; }) => void }) {
   // SEC-08: Helper de permisos
   const hasPermission = (key: string) => dataService.hasPermission(key as any);
   const canEditFinance = hasPermission('FINANCE_VIEW') || hasPermission('ALL');
+  const financeInternalRate = Number(internalRate) > 0 ? Number(internalRate) : (Number(exchangeRate) > 0 ? Number(exchangeRate) : 1);
   const canEditBanks = hasPermission('FINANCE_VIEW') || hasPermission('ALL');
   
-  const [activeSubTab, setActiveSubTab] = useState<'indicators' | 'ar' | 'ap' | 'ledger' | 'expenses' | 'banks' | 'credit' | 'calendar' | 'advances'>('indicators');
+  const [activeSubTab, setActiveSubTab] = useState<'indicators' | 'invoices' | 'ar' | 'ap' | 'ledger' | 'expenses' | 'banks' | 'credit' | 'calendar' | 'advances' | 'approvals'>('indicators');
+  const [poAlerts, setPoAlerts] = useState<Array<{ id: string; purchaseOrderId: string; purchaseOrderCorrelativo: string; supplier: string; createdAt: string }>>([]);
+  const [loadingPoAlerts, setLoadingPoAlerts] = useState(false);
+  const [expandedApprovalOcId, setExpandedApprovalOcId] = useState<string | null>(null);
+  const [invoiceHistoryLoading, setInvoiceHistoryLoading] = useState(false);
+  const [invoiceHistorySearch, setInvoiceHistorySearch] = useState('');
+  /** Filtros estructurados: Historial Facturas (Finanzas) */
+  const [invoiceHistoryKind, setInvoiceHistoryKind] = useState<'ALL' | 'SALES' | 'PURCHASES'>('ALL');
+  const [invoiceHistoryDateFrom, setInvoiceHistoryDateFrom] = useState('');
+  const [invoiceHistoryDateTo, setInvoiceHistoryDateTo] = useState('');
+  const [invoiceHistoryParty, setInvoiceHistoryParty] = useState('');
+  const [purchaseInvoiceHistory, setPurchaseInvoiceHistory] = useState<PurchaseInvoiceHistoryEntry[]>([]);
+  const [expandedSaleInvoiceId, setExpandedSaleInvoiceId] = useState<string | null>(null);
+  const [expandedPurchaseInvoiceId, setExpandedPurchaseInvoiceId] = useState<string | null>(null);
 
   // FIN-08: Advances management state
   const [advancesData, setAdvancesData] = useState<ClientAdvance[]>([]);
@@ -99,6 +125,10 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
   };
 
   const loadAdvances = async (includeApplied: boolean) => {
+    const realtimeList = dataService.getClientAdvancesSnapshot(includeApplied);
+    if (realtimeList.length > 0 || !includeApplied) {
+      setAdvancesData(realtimeList);
+    }
     setLoadingAdvances(true);
     try {
       const list = await dataService.getAllClientAdvancesForAdmin(includeApplied);
@@ -121,6 +151,7 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
   const expensesList = dataService.getExpenses();
   const apEntries = dataService.getAPEntries();
   const arEntries = dataService.getAREntries();
+  const companyLoans = dataService.getCompanyLoans();
   const ledger = dataService.getConsolidatedLedger();
   const banks = dataService.getBanks();
   const posTerminals = dataService.getPOSTerminals();
@@ -128,6 +159,11 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
   const clients = clientService.getClients();
   const users = dataService.getUsers();
   const currentUser = dataService.getCurrentUser();
+  const purchaseOrders = dataService.getPurchaseOrders();
+  const approvablePurchaseOrders = useMemo(
+    () => purchaseOrders.filter((o) => o.status === 'SUBMITTED'),
+    [purchaseOrders]
+  );
 
   const fmt = (value: any, decimals: number = 2) =>
     (Number(value ?? 0) || 0).toLocaleString('es-VE', {
@@ -142,6 +178,146 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
     acc[method] = (acc[method] || 0) + s.totalUSD;
     return acc;
   }, {}), [sales]);
+
+  const parseDayBoundary = (yyyyMmDd: string, endOfDay: boolean) => {
+    const s = String(yyyyMmDd ?? '').trim();
+    if (!s) return null;
+    const d = new Date(s.length >= 10 ? `${s.slice(0, 10)}T${endOfDay ? '23:59:59.999' : '00:00:00.000'}` : s);
+    return Number.isNaN(d.getTime()) ? null : d;
+  };
+
+  const getPurchaseRowDate = (entry: PurchaseInvoiceHistoryEntry): Date | null => {
+    const raw = entry.invoiceDate || entry.createdAt;
+    if (!raw || !String(raw).trim()) return null;
+    const t = new Date(String(raw).includes('T') ? raw : `${String(raw).slice(0, 10)}T12:00:00`);
+    return Number.isNaN(t.getTime()) ? null : t;
+  };
+
+  const filteredSalesInvoices = useMemo(() => {
+    let rows = (sales as any[]).filter((sale: any) => !(sale as any)?.voided && String((sale as any)?.status ?? '').toUpperCase() !== 'VOID');
+
+    const from = parseDayBoundary(invoiceHistoryDateFrom, false);
+    const to = parseDayBoundary(invoiceHistoryDateTo, true);
+    const getSaleTs = (sale: any): Date | null => {
+      const t = sale?.timestamp;
+      if (t instanceof Date && !Number.isNaN(t.getTime())) return t;
+      const d = new Date(t ?? '');
+      return Number.isNaN(d.getTime()) ? null : d;
+    };
+    if (from) {
+      rows = rows.filter((sale: any) => {
+        const d = getSaleTs(sale);
+        return d ? d >= from : false;
+      });
+    }
+    if (to) {
+      rows = rows.filter((sale: any) => {
+        const d = getSaleTs(sale);
+        return d ? d <= to : false;
+      });
+    }
+
+    const party = invoiceHistoryParty.trim().toLowerCase();
+    if (party) {
+      rows = rows.filter((sale: any) => {
+        const name = String(sale?.client?.name ?? '').toLowerCase();
+        const id = String(sale?.client?.id ?? '').toLowerCase();
+        return name.includes(party) || id.includes(party);
+      });
+    }
+
+    const q = invoiceHistorySearch.trim().toLowerCase();
+    if (!q) return rows;
+    return rows.filter((sale: any) => {
+      const correlativo = String(sale?.correlativo ?? '').toLowerCase();
+      const customer = String(sale?.client?.name ?? '').toLowerCase();
+      const dateLabel = sale?.timestamp instanceof Date ? sale.timestamp.toLocaleDateString('es-VE') : '';
+      return correlativo.includes(q) || customer.includes(q) || dateLabel.includes(q);
+    });
+  }, [
+    sales,
+    invoiceHistorySearch,
+    invoiceHistoryDateFrom,
+    invoiceHistoryDateTo,
+    invoiceHistoryParty
+  ]);
+
+  const filteredPurchaseInvoices = useMemo(() => {
+    let rows = [...purchaseInvoiceHistory];
+
+    const from = parseDayBoundary(invoiceHistoryDateFrom, false);
+    const to = parseDayBoundary(invoiceHistoryDateTo, true);
+    if (from) {
+      rows = rows.filter((entry) => {
+        const d = getPurchaseRowDate(entry);
+        return d ? d >= from : false;
+      });
+    }
+    if (to) {
+      rows = rows.filter((entry) => {
+        const d = getPurchaseRowDate(entry);
+        return d ? d <= to : false;
+      });
+    }
+
+    const party = invoiceHistoryParty.trim().toLowerCase();
+    if (party) {
+      rows = rows.filter((entry) => {
+        const sup = String(entry.supplier ?? '').toLowerCase();
+        const doc = String(entry.supplierDocument ?? '').toLowerCase();
+        const inv = String(entry.invoiceNumber ?? entry.invoiceGroupId ?? '').toLowerCase();
+        return sup.includes(party) || doc.includes(party) || inv.includes(party);
+      });
+    }
+
+    const q = invoiceHistorySearch.trim().toLowerCase();
+    if (!q) return rows;
+    return rows.filter((entry) => {
+      const invoice = String(entry.invoiceNumber ?? '').toLowerCase();
+      const supplier = String(entry.supplier ?? '').toLowerCase();
+      const dateLabel = entry.invoiceDate ? new Date(entry.invoiceDate).toLocaleDateString('es-VE') : '';
+      return invoice.includes(q) || supplier.includes(q) || dateLabel.includes(q);
+    });
+  }, [
+    purchaseInvoiceHistory,
+    invoiceHistorySearch,
+    invoiceHistoryDateFrom,
+    invoiceHistoryDateTo,
+    invoiceHistoryParty
+  ]);
+
+  const invoiceHistoryExportRows = useMemo(() => {
+    const rows: Array<{ tipo: string; fecha: string; factura: string; tercero: string; documento: string; detalle_productos: string; totalUSD: number; estado: string }> = [];
+    if (invoiceHistoryKind !== 'PURCHASES') {
+      filteredSalesInvoices.forEach((sale: any) => {
+        rows.push({
+          tipo: 'VENTA',
+          fecha: sale?.timestamp instanceof Date ? sale.timestamp.toLocaleDateString('es-VE') : '',
+          factura: String(sale?.correlativo ?? ''),
+          tercero: String(sale?.client?.name ?? ''),
+          documento: String(sale?.client?.id ?? ''),
+          detalle_productos: formatInvoiceProductDetails(Array.isArray(sale?.items) ? sale.items : []),
+          totalUSD: Number(sale?.totalUSD ?? 0) || 0,
+          estado: String(sale?.status ?? 'COMPLETED')
+        });
+      });
+    }
+    if (invoiceHistoryKind !== 'SALES') {
+      filteredPurchaseInvoices.forEach((entry) => {
+        rows.push({
+          tipo: 'COMPRA',
+          fecha: entry.invoiceDate ? new Date(entry.invoiceDate).toLocaleDateString('es-VE') : '',
+          factura: entry.invoiceNumber || entry.invoiceGroupId,
+          tercero: entry.supplier || '',
+          documento: entry.supplierDocument || '',
+          detalle_productos: formatInvoiceProductDetails(entry.lines),
+          totalUSD: Number(entry.totalInvoiceUSD ?? 0) || 0,
+          estado: entry.status
+        });
+      });
+    }
+    return rows;
+  }, [filteredSalesInvoices, filteredPurchaseInvoices, invoiceHistoryKind]);
 
   const totalAR = useMemo(() => 
     arEntries.filter(e => e.status !== 'PAID').reduce((acc, e) => acc + e.balanceUSD, 0),
@@ -165,11 +341,29 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
     allClientAdvances.reduce((acc, a) => acc + a.balanceUSD, 0),
   [allClientAdvances]);
 
-  // Calcular mayor analítico de bancos
-  const getBankAnalytics = (bankId: string) => {
+  /** Cuentas registradas: solo USD (Zelle, etc.), solo Bs, mixto, o sin cuentas. */
+  const getBankCurrencyProfile = (b: any): 'USD_ONLY' | 'VES_ONLY' | 'MIXED' | 'UNKNOWN' => {
+    const accs = Array.isArray(b?.accounts) ? b.accounts : [];
+    if (accs.length === 0) return 'UNKNOWN';
+    const hasU = accs.some((a: any) => String(a?.currency ?? '').toUpperCase() === 'USD');
+    const hasV = accs.some((a: any) => String(a?.currency ?? '').toUpperCase() === 'VES');
+    if (hasU && hasV) return 'MIXED';
+    if (hasU) return 'USD_ONLY';
+    return 'VES_ONLY';
+  };
+
+  // Calcular mayor analítico de bancos (filtrado por moneda si el banco es solo USD o solo Bs)
+  const getBankAnalytics = (bankId: string, bank?: any) => {
     try {
       const bankTransactions = allBankTransactions;
-      const bankTx = bankTransactions.filter(tx => String(tx.bankId) === String(bankId));
+      const bankTxAll = bankTransactions.filter(tx => String(tx.bankId) === String(bankId));
+      const profile = bank ? getBankCurrencyProfile(bank) : 'UNKNOWN';
+      const bankTx =
+        profile === 'USD_ONLY'
+          ? bankTxAll.filter((tx) => String(tx?.currency ?? 'USD').toUpperCase() === 'USD')
+          : profile === 'VES_ONLY'
+            ? bankTxAll.filter((tx) => String(tx?.currency ?? '').toUpperCase() === 'VES')
+            : bankTxAll;
       
       const totalInUSD = bankTx
         .filter(tx => tx && typeof tx.amountUSD === 'number' && tx.amountUSD > 0)
@@ -217,7 +411,8 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
         balanceVES,
         transactionCount,
         lastTransaction,
-        methodBreakdown
+        methodBreakdown,
+        currencyProfile: profile
       };
     } catch (error) {
       console.error('Error calculating bank analytics:', error);
@@ -230,7 +425,8 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
         balanceVES: 0,
         transactionCount: 0,
         lastTransaction: null,
-        methodBreakdown: {}
+        methodBreakdown: {},
+        currencyProfile: 'UNKNOWN' as const
       };
     }
   };
@@ -244,6 +440,45 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
       unsubscribeClients();
     };
   }, []);
+
+  useEffect(() => {
+    if (activeSubTab !== 'advances' || advancesSubTab !== 'client') return;
+    setAdvancesData(dataService.getClientAdvancesSnapshot(advShowApplied));
+  }, [activeSubTab, advancesSubTab, advShowApplied, tick]);
+
+  const loadPOAlerts = useCallback(async () => {
+    setLoadingPoAlerts(true);
+    try {
+      const list = await dataService.getPurchaseOrderApprovalAlerts(true);
+      setPoAlerts(Array.isArray(list) ? (list as any) : []);
+    } finally {
+      setLoadingPoAlerts(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (activeSubTab !== 'approvals') return;
+    void loadPOAlerts();
+  }, [activeSubTab, tick, currentUser?.id, loadPOAlerts]);
+
+  useEffect(() => {
+    if (activeSubTab !== 'invoices') return;
+    let active = true;
+    setInvoiceHistoryLoading(true);
+    dataService.getPurchaseInvoiceHistory()
+      .then((rows) => {
+        if (!active) return;
+        setPurchaseInvoiceHistory(Array.isArray(rows) ? rows : []);
+      })
+      .catch((error) => {
+        console.error('Error cargando historial de facturas de compra:', error);
+        if (active) setPurchaseInvoiceHistory([]);
+      })
+      .finally(() => {
+        if (active) setInvoiceHistoryLoading(false);
+      });
+    return () => { active = false; };
+  }, [activeSubTab, tick]);
 
   useEffect(() => {
     let active = true;
@@ -262,12 +497,12 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
 
   // FIN-02: Date filters
   const [arDateRange, setArDateRange] = useState({ start: '', end: '' });
-  const [arStatusFilter, setArStatusFilter] = useState<'ALL' | 'PENDING' | 'OVERDUE' | 'PAID'>('ALL');
+  const [arStatusFilter, setArStatusFilter] = useState<'ALL' | 'OPEN' | 'PENDING' | 'OVERDUE' | 'PAID' | 'LOANS'>('ALL');
   const [arSearch, setArSearch] = useState('');
   const [arViewMode, setArViewMode] = useState<'GROUPED' | 'ROWS'>('GROUPED');
   const [expandedARCustomerKey, setExpandedARCustomerKey] = useState<string | null>(null);
   const [apDateRange, setApDateRange] = useState({ start: '', end: '' });
-  const [apStatusFilter, setApStatusFilter] = useState<'ALL' | 'PENDING' | 'OVERDUE' | 'PAID'>('ALL');
+  const [apStatusFilter, setApStatusFilter] = useState<'ALL' | 'OPEN' | 'PENDING' | 'OVERDUE' | 'PAID'>('ALL');
   const [apSearch, setApSearch] = useState('');
   const [expandedAPSupplierKey, setExpandedAPSupplierKey] = useState<string | null>(null);
   const [ledgerDateRange, setLedgerDateRange] = useState({ start: '', end: '' });
@@ -276,6 +511,10 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
   const [arPage, setArPage] = useState(0);
   const [apPage, setApPage] = useState(0);
   const [ledgerPage, setLedgerPage] = useState(0);
+  const [mayorRows, setMayorRows] = useState<MayorCuentaMovimientoRow[]>([]);
+  const [mayorLoading, setMayorLoading] = useState(false);
+  const [ledgerAccountFilter, setLedgerAccountFilter] = useState('');
+  const [cuentaOptionsMayor, setCuentaOptionsMayor] = useState<Array<{ codigo: string; nombre: string }>>([]);
   // FIN-04: Manual bank movement modal
   const [showManualTxModal, setShowManualTxModal] = useState(false);
   const [manualTx, setManualTx] = useState({ bankId: '', concept: '', reference: '', amountUSD: '', amountVES: '', type: 'IN' as 'IN' | 'OUT' });
@@ -326,6 +565,23 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
   const [arCollectSubmitting, setArCollectSubmitting] = useState(false);
   const [arCollectError, setArCollectError] = useState('');
   const [arCollectLastReceipt, setArCollectLastReceipt] = useState<any>(null);
+  /** Saldo total anticipos del cliente (para método Otros en cobro CxC). */
+  const [arCollectAdvanceBalance, setArCollectAdvanceBalance] = useState<number | null>(null);
+  const [showCreateLoanModal, setShowCreateLoanModal] = useState(false);
+  const [loanSubmitting, setLoanSubmitting] = useState(false);
+  const [loanError, setLoanError] = useState('');
+  const [loanForm, setLoanForm] = useState({
+    beneficiaryType: 'EMPLOYEE' as 'EMPLOYEE' | 'PARTNER',
+    beneficiaryName: '',
+    beneficiaryId: '',
+    description: '',
+    amountUSD: '',
+    daysToPay: '30',
+    sourceMethod: 'Transferencia',
+    sourceBankName: '',
+    reference: '',
+    note: ''
+  });
   const [showAPPaymentModal, setShowAPPaymentModal] = useState(false);
   const [apPayTargetId, setApPayTargetId] = useState('');
   const [apPayTarget, setApPayTarget] = useState<any>(null);
@@ -349,6 +605,13 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
   const [apPayments, setApPayments] = useState<any[]>([]);
   const [apPaymentsLoading, setApPaymentsLoading] = useState(false);
   const [apPaymentsError, setApPaymentsError] = useState<string>('');
+  const [apPaymentsVisibleCount, setApPaymentsVisibleCount] = useState(25);
+  const AP_PAYMENTS_PAGE_SIZE = 25;
+  const visibleAPPayments = useMemo(
+    () => apPayments.slice(0, apPaymentsVisibleCount),
+    [apPayments, apPaymentsVisibleCount]
+  );
+  const hasMoreAPPayments = apPayments.length > apPaymentsVisibleCount;
 
   const handleViewARPayments = async (ar: any) => {
     setShowARPaymentsModal(true);
@@ -581,6 +844,15 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
     return value;
   };
 
+  /** Equivalente en USD usando tasa interna del sistema para movimientos en Bs. */
+  const bankTxVesToEquivUsd = (t: any): number => {
+    const cur = String(t?.currency ?? '').toUpperCase();
+    if (cur === 'USD') return Number(t?.amountUSD ?? 0) || 0;
+    const v = Number(t?.amountVES ?? 0) || 0;
+    if (cur === 'VES') return v / financeInternalRate;
+    return 0;
+  };
+
   const formatTraceDate = (value?: string) => {
     const raw = String(value ?? '').trim();
     if (!raw) return '-';
@@ -669,6 +941,13 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
       .reduce((acc: number, tx: any) => acc + Number(currency === 'VES' ? tx?.amountVES ?? 0 : tx?.amountUSD ?? 0), 0);
   };
 
+  const getManualTxBankBalance = (bankId: string, currency: 'USD' | 'VES') => {
+    if (!bankId) return 0;
+    return allBankTransactions
+      .filter((tx: any) => String(tx?.bankId ?? '') === String(bankId))
+      .reduce((acc: number, tx: any) => acc + Number(currency === 'VES' ? tx?.amountVES ?? 0 : tx?.amountUSD ?? 0), 0);
+  };
+
   const apPayTotalUSD = React.useMemo(
     () => apPayLines.reduce((acc, line) => acc + (Number((line.amountUSD || '').replace(',', '.')) || 0), 0),
     [apPayLines]
@@ -713,6 +992,7 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
     setShowAPPaymentsModal(true);
     setApPaymentsTarget(ap);
     setApPayments([]);
+    setApPaymentsVisibleCount(AP_PAYMENTS_PAGE_SIZE);
     setApPaymentsError('');
     setApPaymentsLoading(true);
     try {
@@ -1026,7 +1306,13 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
     setBankTxError('');
     try {
       const allTx = await dataService.getBankTransactions();
-      const tx = allTx.filter((t: any) => String(t.bankId) === String(bank.id));
+      let tx = allTx.filter((t: any) => String(t.bankId) === String(bank.id));
+      const bprof = getBankCurrencyProfile(bank);
+      if (bprof === 'USD_ONLY') {
+        tx = tx.filter((t: any) => String(t?.currency ?? 'USD').toUpperCase() === 'USD');
+      } else if (bprof === 'VES_ONLY') {
+        tx = tx.filter((t: any) => String(t?.currency ?? '').toUpperCase() === 'VES');
+      }
       setBankTxList(tx);
     } catch (e: any) {
       setBankTxError(String(e?.message ?? 'Error cargando movimientos'));
@@ -1075,13 +1361,14 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
         runningBalanceUSD += amountUSD;
         runningBalanceVES += amountVES;
 
+        const srcKey = String(transaction.source ?? '').trim().toUpperCase();
+        const isManualOut = srcKey === 'MANUAL_ENTRY' && (amountUSD < 0 || amountVES < 0);
         const srcLabel: Record<string, string> = {
           SALE_PAYMENT: 'Cobro de venta', CREDIT_DOWN: 'Abono a crédito',
           AR_PAYMENT: 'Cobro CxC', AP_PAYMENT: 'Pago CxP',
           PURCHASE_PAYMENT: 'Pago de compra', SALE_RETURN: 'Devolución de venta',
-          MANUAL_ENTRY: 'Entrada manual',
+          MANUAL_ENTRY: isManualOut ? 'Salida manual' : 'Entrada manual',
         };
-        const srcKey = String(transaction.source ?? '').trim().toUpperCase();
         const descripcion = transaction.note || srcLabel[srcKey] || transaction.source || '';
         return {
           fecha: new Date(transaction.createdAt).toLocaleDateString(),
@@ -1222,15 +1509,23 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
   };
 
 
+  const isCompanyLoanAREntry = (ar: any) => {
+    const metaKind = String(ar?.meta?.kind ?? '').toUpperCase();
+    if (metaKind === 'COMPANY_LOAN') return true;
+    return String(ar?.saleCorrelativo ?? '').trim().toUpperCase().startsWith('PREST-');
+  };
+
   // FIN-02: Filtered AR/AP/Ledger
   const filteredAR = React.useMemo(() => {
     const now = new Date();
     const q = arSearch.trim().toUpperCase();
     return arEntries.filter(e => {
       if (arStatusFilter !== 'ALL') {
+        if (arStatusFilter === 'OPEN' && e.status === 'PAID') return false;
         if (arStatusFilter === 'OVERDUE' && !(e.status !== 'PAID' && new Date(e.dueDate) < now)) return false;
         if (arStatusFilter === 'PENDING' && !(e.status !== 'PAID' && new Date(e.dueDate) >= now)) return false;
         if (arStatusFilter === 'PAID' && e.status !== 'PAID') return false;
+        if (arStatusFilter === 'LOANS' && !isCompanyLoanAREntry(e)) return false;
       }
       if (arDateRange.start) { const d = e.timestamp.toISOString().split('T')[0]; if (d < arDateRange.start) return false; }
       if (arDateRange.end)   { const d = e.timestamp.toISOString().split('T')[0]; if (d > arDateRange.end) return false; }
@@ -1245,11 +1540,37 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
     });
   }, [arEntries, arStatusFilter, arDateRange, arSearch]);
 
+  const arStatementFilterNote = React.useMemo(() => {
+    const parts: string[] = [];
+    if (arStatusFilter === 'OPEN') parts.push('Pendientes + vencidas');
+    else if (arStatusFilter === 'PENDING') parts.push('Solo pendientes (no vencidas)');
+    else if (arStatusFilter === 'OVERDUE') parts.push('Solo vencidas');
+    else if (arStatusFilter === 'PAID') parts.push('Solo liquidadas');
+    else if (arStatusFilter === 'LOANS') parts.push('Solo préstamos internos');
+    if (arDateRange.start || arDateRange.end) {
+      parts.push(`Documento del ${arDateRange.start || '…'} al ${arDateRange.end || '…'}`);
+    }
+    if (arSearch.trim()) parts.push(`Búsqueda: «${arSearch.trim()}»`);
+    return parts.length ? parts.join(' · ') : '';
+  }, [arStatusFilter, arDateRange, arSearch]);
+
+  const exportARStatementForCustomer = useCallback(
+    (customerId: string) => {
+      const entries = filteredAR.filter((e) => String(e.customerId) === String(customerId));
+      const note = arStatementFilterNote.trim() || undefined;
+      void reportService
+        .exportARStatementToPDF(customerId, { entries, filterNote: note })
+        .catch((err) => console.error('Estado de cuenta PDF', err));
+    },
+    [filteredAR, arStatementFilterNote]
+  );
+
   const filteredAP = React.useMemo(() => {
     const now = new Date();
     const q = apSearch.trim().toUpperCase();
     return apEntries.filter(ap => {
       if (apStatusFilter !== 'ALL') {
+        if (apStatusFilter === 'OPEN' && ap.status === 'PAID') return false;
         if (apStatusFilter === 'OVERDUE' && !(ap.status !== 'PAID' && new Date(ap.dueDate) < now)) return false;
         if (apStatusFilter === 'PENDING' && !(ap.status !== 'PAID' && new Date(ap.dueDate) >= now)) return false;
         if (apStatusFilter === 'PAID' && ap.status !== 'PAID') return false;
@@ -1266,6 +1587,67 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
       return true;
     });
   }, [apEntries, apStatusFilter, apDateRange, apSearch]);
+
+  const exportARFilteredExcel = useCallback(() => {
+    const headers = ['Cliente', 'Documento', 'Vencimiento', 'Monto USD', 'Saldo USD', 'Estado'];
+    const rows = filteredAR.map((e: any) => {
+      const isOverdue = e.status !== 'PAID' && new Date(e.dueDate) < new Date();
+      const state = isOverdue ? 'VENCIDO' : (e.status === 'PAID' ? 'PAGADO' : 'PENDIENTE');
+      return [
+        String(e.customerName ?? ''),
+        String(e.saleCorrelativo ?? ''),
+        e.dueDate ? new Date(e.dueDate).toLocaleDateString('es-VE') : '',
+        Number(e.amountUSD ?? 0).toFixed(2),
+        Number(e.balanceUSD ?? 0).toFixed(2),
+        state
+      ];
+    });
+    const preambleRows = [
+      ['Reporte', 'CxC filtradas'],
+      ['Filtro estado', arStatusFilter],
+      ['Filtro fecha inicio', arDateRange.start || '-'],
+      ['Filtro fecha fin', arDateRange.end || '-'],
+      ['Busqueda', arSearch || '-']
+    ];
+    const csv = buildExcelFriendlyCsv(headers, rows, { preambleRows });
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `cxc_filtradas_${new Date().toISOString().split('T')[0]}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [filteredAR, arStatusFilter, arDateRange.start, arDateRange.end, arSearch]);
+
+  const exportAPFilteredExcel = useCallback(() => {
+    const headers = ['Proveedor', 'ID', 'Vencimiento', 'Saldo USD', 'Estado'];
+    const rows = filteredAP.map((e: any) => {
+      const isOverdue = e.status !== 'PAID' && new Date(e.dueDate) < new Date();
+      const state = isOverdue ? 'VENCIDO' : (e.status === 'PAID' ? 'PAGADO' : 'PENDIENTE');
+      return [
+        String(e.supplier ?? ''),
+        String(e.id ?? ''),
+        e.dueDate ? new Date(e.dueDate).toLocaleDateString('es-VE') : '',
+        Number(e.balanceUSD ?? 0).toFixed(2),
+        state
+      ];
+    });
+    const preambleRows = [
+      ['Reporte', 'CxP filtradas'],
+      ['Filtro estado', apStatusFilter],
+      ['Filtro fecha inicio', apDateRange.start || '-'],
+      ['Filtro fecha fin', apDateRange.end || '-'],
+      ['Busqueda', apSearch || '-']
+    ];
+    const csv = buildExcelFriendlyCsv(headers, rows, { preambleRows });
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `cxp_filtradas_${new Date().toISOString().split('T')[0]}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [filteredAP, apStatusFilter, apDateRange.start, apDateRange.end, apSearch]);
 
   const groupedAR = React.useMemo(() => {
     const now = new Date();
@@ -1295,7 +1677,10 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
       };
       const isOverdue = item.status !== 'PAID' && new Date(item.dueDate) < now;
       existing.entries.push(item);
-      existing.totalBalanceUSD += Number(item.balanceUSD ?? 0) || 0;
+      // Sincronizar Concentración con deuda real pendiente:
+      // solo suma saldo de documentos no pagados y saldo positivo.
+      const openBalance = item.status === 'PAID' ? 0 : Math.max(0, Number(item.balanceUSD ?? 0) || 0);
+      existing.totalBalanceUSD += openBalance;
       existing.totalOriginalUSD += Number(item.amountUSD ?? 0) || 0;
       if (item.status === 'PAID') existing.paidCount += 1;
       else if (isOverdue) existing.overdueCount += 1;
@@ -1342,7 +1727,10 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
       };
       const isOverdue = item.status !== 'PAID' && new Date(item.dueDate) < now;
       existing.entries.push(item);
-      existing.totalBalanceUSD += Number(item.balanceUSD ?? 0) || 0;
+      // Sincronizar Concentración con deuda real pendiente:
+      // solo suma saldo de documentos no pagados y saldo positivo.
+      const openBalance = item.status === 'PAID' ? 0 : Math.max(0, Number(item.balanceUSD ?? 0) || 0);
+      existing.totalBalanceUSD += openBalance;
       if (item.status === 'PAID') existing.paidCount += 1;
       else if (isOverdue) existing.overdueCount += 1;
       else existing.pendingCount += 1;
@@ -1400,22 +1788,77 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
   }, [allClientAdvances]);
 
   const filteredLedger = React.useMemo(() => {
+    const dayStr = (e: any) => {
+      const t = e?.timestamp;
+      if (t instanceof Date && !Number.isNaN(t.getTime())) return t.toISOString().slice(0, 10);
+      if (e?.date) return String(e.date).slice(0, 10);
+      return String(t ?? '').slice(0, 10);
+    };
     return ledger.filter((e: any) => {
-      if (ledgerDateRange.start) { const d = String(e.date ?? e.timestamp ?? '').slice(0,10); if (d < ledgerDateRange.start) return false; }
-      if (ledgerDateRange.end)   { const d = String(e.date ?? e.timestamp ?? '').slice(0,10); if (d > ledgerDateRange.end) return false; }
+      if (ledgerDateRange.start) {
+        const d = dayStr(e);
+        if (d < ledgerDateRange.start) return false;
+      }
+      if (ledgerDateRange.end) {
+        const d = dayStr(e);
+        if (d > ledgerDateRange.end) return false;
+      }
       return true;
     });
   }, [ledger, ledgerDateRange]);
 
+  useEffect(() => {
+    if (activeSubTab !== 'ledger') return;
+    let cancelled = false;
+    setMayorLoading(true);
+    (async () => {
+      const opts = await dataService.listCuentasContablesMayor();
+      if (!cancelled) setCuentaOptionsMayor(opts);
+      const rows = await dataService.fetchMayorCuentaSaldo({
+        fechaDesde: ledgerDateRange.start?.trim() || null,
+        fechaHasta: ledgerDateRange.end?.trim() || null,
+        cuentaCodigo: ledgerAccountFilter.trim() || null
+      });
+      if (!cancelled) {
+        setMayorRows(Array.isArray(rows) ? rows : []);
+        setMayorLoading(false);
+      }
+    })().catch(() => {
+      if (!cancelled) {
+        setMayorRows([]);
+        setMayorLoading(false);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeSubTab, ledgerDateRange.start, ledgerDateRange.end, ledgerAccountFilter, tick]);
+
   // FIN-04: Manual bank transaction handler
   const handleManualBankTx = async () => {
     if (!manualTx.bankId || !manualTx.concept) { setManualTxError('Banco y concepto son obligatorios'); return; }
-    const amtUSD = parseFloat(manualTx.amountUSD || '0');
-    const amtVES = parseFloat(manualTx.amountVES || '0');
+    const rawUSD = parseFloat((manualTx.amountUSD || '0').replace(',', '.'));
+    const rawVES = parseFloat((manualTx.amountVES || '0').replace(',', '.'));
+    const amtUSD = Number.isFinite(rawUSD) ? Math.abs(rawUSD) : 0;
+    const amtVES = Number.isFinite(rawVES) ? Math.abs(rawVES) : 0;
     if (amtUSD === 0 && amtVES === 0) { setManualTxError('Ingrese al menos un monto'); return; }
+    if (manualTx.type === 'OUT') {
+      const availableUSD = getManualTxBankBalance(manualTx.bankId, 'USD');
+      const availableVES = getManualTxBankBalance(manualTx.bankId, 'VES');
+      if (amtUSD > 0 && (availableUSD + 0.005) < amtUSD) {
+        setManualTxError(`Saldo insuficiente en USD. Disponible: $ ${availableUSD.toFixed(2)}.`);
+        return;
+      }
+      if (amtVES > 0 && (availableVES + 0.005) < amtVES) {
+        setManualTxError(`Saldo insuficiente en Bs. Disponible: Bs ${availableVES.toFixed(2)}.`);
+        return;
+      }
+    }
     setManualTxSaving(true);
     setManualTxError('');
     try {
+      // Mantener separación estricta por moneda en movimientos manuales:
+      // no convertir automáticamente Bs<->USD aquí para evitar salidas "mixtas" no deseadas.
       const sign = manualTx.type === 'OUT' ? -1 : 1;
       await dataService.addManualBankTransaction({
         bankId: manualTx.bankId,
@@ -1443,7 +1886,59 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
     setArCollectNote('');
     setArCollectError('');
     setArCollectLastReceipt(null);
+    setArCollectAdvanceBalance(null);
+    const cid = String(ar?.customerId ?? '').trim();
+    if (cid) {
+      void dataService
+        .getClientAdvanceBalance(cid)
+        .then((b) => setArCollectAdvanceBalance(Number(b) || 0))
+        .catch(() => setArCollectAdvanceBalance(0));
+    } else {
+      setArCollectAdvanceBalance(0);
+    }
     setShowARCollectModal(true);
+  };
+
+  const handleCreateLoan = async () => {
+    const amount = Number.parseFloat(String(loanForm.amountUSD || '0').replace(',', '.'));
+    const days = Number.parseInt(String(loanForm.daysToPay || '0'), 10);
+    if (!loanForm.beneficiaryName.trim()) { setLoanError('Indica el nombre del beneficiario.'); return; }
+    if (!loanForm.description.trim()) { setLoanError('Indica la descripción del préstamo.'); return; }
+    if (!Number.isFinite(amount) || amount <= 0) { setLoanError('Monto inválido.'); return; }
+    if (!Number.isFinite(days) || days <= 0) { setLoanError('Plazo inválido (días).'); return; }
+    setLoanSubmitting(true);
+    setLoanError('');
+    try {
+      await dataService.createCompanyLoan({
+        beneficiaryType: loanForm.beneficiaryType,
+        beneficiaryName: loanForm.beneficiaryName.trim(),
+        beneficiaryId: loanForm.beneficiaryId.trim(),
+        description: loanForm.description.trim(),
+        amountUSD: amount,
+        daysToPay: days,
+        sourceMethod: loanForm.sourceMethod.trim(),
+        sourceBankName: loanForm.sourceBankName.trim(),
+        reference: loanForm.reference.trim(),
+        note: loanForm.note.trim()
+      });
+      setShowCreateLoanModal(false);
+      setLoanForm({
+        beneficiaryType: 'EMPLOYEE',
+        beneficiaryName: '',
+        beneficiaryId: '',
+        description: '',
+        amountUSD: '',
+        daysToPay: '30',
+        sourceMethod: 'Transferencia',
+        sourceBankName: '',
+        reference: '',
+        note: ''
+      });
+    } catch (e: any) {
+      setLoanError(String(e?.message ?? 'No se pudo registrar el préstamo.'));
+    } finally {
+      setLoanSubmitting(false);
+    }
   };
 
   const handleARCollectSubmit = async () => {
@@ -1454,38 +1949,115 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
     setArCollectSubmitting(true);
     setArCollectError('');
     try {
-      await dataService.registerARPaymentWithSupport(arCollectTarget.id, amt, {
-        method: arCollectMethod,
-        bank: arCollectBank || undefined,
-        reference: arCollectRef || undefined,
-        note: arCollectNote || undefined,
-        currency: 'USD',
-        amountVES: 0,
-        rateUsed: 0
-      });
-      const newBalance = Math.max(0, balance - amt);
-      const receiptData = {
-        receiptNumber: `REC-${arCollectTarget.saleCorrelativo}-${Date.now().toString(36).toUpperCase()}`,
-        customerName: arCollectTarget.customerName,
-        customerId: arCollectTarget.customerId || '',
-        saleCorrelativo: arCollectTarget.saleCorrelativo,
-        amountUSD: amt,
-        method: arCollectMethod,
-        bank: arCollectBank || undefined,
-        reference: arCollectRef || undefined,
-        note: arCollectNote || undefined,
-        operatorName: dataService.getCurrentUser()?.name || 'Sistema',
-        balanceAfterUSD: newBalance,
-        originalAmountUSD: Number(arCollectTarget.amountUSD ?? 0),
-        timestamp: new Date()
-      };
-      setArCollectLastReceipt(receiptData);
+      if (arCollectMethod === 'Otros') {
+        const cid = String(arCollectTarget.customerId ?? '').trim();
+        if (!cid) {
+          setArCollectError('El registro CxC no tiene cliente asociado.');
+          return;
+        }
+        let advBal = arCollectAdvanceBalance;
+        if (advBal == null || Number.isNaN(advBal)) {
+          advBal = await dataService.getClientAdvanceBalance(cid);
+          setArCollectAdvanceBalance(advBal);
+        }
+        if (advBal + 0.005 < amt) {
+          setArCollectError(
+            `Saldo de anticipos insuficiente. Disponible: $${(Number(advBal) || 0).toFixed(2)}. Reduzca el monto o use transferencia/efectivo en caja.`
+          );
+          return;
+        }
+        const applied = await dataService.applyClientAdvance({
+          customerId: cid,
+          amountToApplyUSD: amt,
+          appliedInCorrelativo: String(arCollectTarget.saleCorrelativo ?? ''),
+          appliedInSaleId: String(arCollectTarget.id ?? arCollectTarget.saleCorrelativo ?? '')
+        });
+        if (applied + 0.02 < amt) {
+          setArCollectError(
+            `No se pudo cruzar el monto completo contra anticipos (aplicado: $${applied.toFixed(2)}). Verifique Finanzas → Anticipos y reintente.`
+          );
+          return;
+        }
+        const noteParts = [arCollectNote?.trim(), 'Abono CxC vía anticipo (Otros · Finanzas)'].filter(Boolean);
+        await dataService.registerARPaymentWithSupport(arCollectTarget.id, amt, {
+          method: 'Otros (anticipo)',
+          bank: '',
+          reference: arCollectRef?.trim() || `Anticipo → ${arCollectTarget.saleCorrelativo}`,
+          note: noteParts.join(' · '),
+          currency: 'USD',
+          amountVES: 0,
+          rateUsed: 0
+        });
+        const newBalance = Math.max(0, balance - amt);
+        const receiptData = {
+          receiptNumber: `REC-${arCollectTarget.saleCorrelativo}-${Date.now().toString(36).toUpperCase()}`,
+          customerName: arCollectTarget.customerName,
+          customerId: arCollectTarget.customerId || '',
+          saleCorrelativo: arCollectTarget.saleCorrelativo,
+          amountUSD: amt,
+          method: 'Otros (anticipo)',
+          bank: undefined,
+          reference: arCollectRef?.trim() || undefined,
+          note: arCollectNote?.trim() || undefined,
+          operatorName: dataService.getCurrentUser()?.name || 'Sistema',
+          balanceAfterUSD: newBalance,
+          originalAmountUSD: Number(arCollectTarget.amountUSD ?? 0),
+          timestamp: new Date()
+        };
+        setArCollectLastReceipt(receiptData);
+        void dataService.getClientAdvanceBalance(cid).then((b) => setArCollectAdvanceBalance(Number(b) || 0));
+      } else {
+        const isLoan = isCompanyLoanAREntry(arCollectTarget);
+        if (isLoan) {
+          const loanId = String(arCollectTarget?.meta?.loanId ?? '').trim();
+          if (!loanId) throw new Error('El préstamo no tiene vínculo de auditoría (loanId).');
+          await dataService.registerCompanyLoanPayment(loanId, amt, {
+            method: arCollectMethod,
+            bank: arCollectBank || undefined,
+            reference: arCollectRef || undefined,
+            note: arCollectNote || undefined,
+            currency: 'USD',
+            amountVES: 0,
+            rateUsed: 0
+          });
+        } else {
+          await dataService.registerARPaymentWithSupport(arCollectTarget.id, amt, {
+            method: arCollectMethod,
+            bank: arCollectBank || undefined,
+            reference: arCollectRef || undefined,
+            note: arCollectNote || undefined,
+            currency: 'USD',
+            amountVES: 0,
+            rateUsed: 0
+          });
+        }
+        const newBalance = Math.max(0, balance - amt);
+        const receiptData = {
+          receiptNumber: `REC-${arCollectTarget.saleCorrelativo}-${Date.now().toString(36).toUpperCase()}`,
+          customerName: arCollectTarget.customerName,
+          customerId: arCollectTarget.customerId || '',
+          saleCorrelativo: arCollectTarget.saleCorrelativo,
+          amountUSD: amt,
+          method: arCollectMethod,
+          bank: arCollectBank || undefined,
+          reference: arCollectRef || undefined,
+          note: arCollectNote || undefined,
+          operatorName: dataService.getCurrentUser()?.name || 'Sistema',
+          balanceAfterUSD: newBalance,
+          originalAmountUSD: Number(arCollectTarget.amountUSD ?? 0),
+          timestamp: new Date()
+        };
+        setArCollectLastReceipt(receiptData);
+      }
     } catch (e: any) {
       setArCollectError(e?.message || 'Error al registrar el pago.');
     } finally {
       setArCollectSubmitting(false);
     }
   };
+
+  const bankTxModalProfile =
+    showBankTxModal && bankTxTarget ? getBankCurrencyProfile(bankTxTarget) : 'UNKNOWN';
 
   return (
     <div className="space-y-8 animate-in fade-in slide-in-from-bottom-6 duration-700 pb-16">
@@ -1504,6 +2076,8 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
         <div className="flex flex-wrap bg-slate-100 p-1.5 rounded-[1.5rem] border border-slate-200 shadow-inner gap-1 w-full lg:w-auto">
            {[
              { id: 'indicators', label: 'Dashboard', icon: Wallet },
+             { id: 'invoices', label: 'Historial Facturas', icon: ReceiptText },
+             { id: 'approvals', label: 'Aprobaciones OC', icon: UserCheck },
              { id: 'credit', label: 'Crédito', icon: Scale },
              { id: 'expenses', label: 'Gastos', icon: AlertCircle },
              { id: 'ar', label: 'Cuentas x Cobrar', icon: ArrowUpRight },
@@ -1827,6 +2401,463 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
         </div>
       )}
 
+      {activeSubTab === 'invoices' && (
+        <div className="space-y-6 animate-in zoom-in-95 duration-500">
+          <div className="bg-white rounded-[2rem] border border-slate-200 p-5 md:p-7 shadow-sm space-y-5">
+            <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-4">
+              <div>
+                <h3 className="text-lg md:text-xl font-black tracking-tight text-slate-900">Historial consolidado de facturas</h3>
+                <p className="text-[10px] font-bold uppercase tracking-widest text-slate-400 mt-1">
+                  Ventas y compras con el mismo nivel de detalle; elija qué incluir en el reporte y acote por fecha y contraparte
+                </p>
+              </div>
+              <div className="relative w-full md:w-96 shrink-0">
+                <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                <input
+                  value={invoiceHistorySearch}
+                  onChange={(e) => setInvoiceHistorySearch(e.target.value)}
+                  placeholder="Búsqueda rápida: Nº factura, texto libre..."
+                  className="w-full rounded-xl border border-slate-200 bg-slate-50 pl-10 pr-3 py-2 text-[11px] font-bold text-slate-700 outline-none focus:ring-2 focus:ring-emerald-500/30"
+                />
+              </div>
+            </div>
+
+            <div className="rounded-2xl border border-slate-100 bg-slate-50/80 p-4 md:p-5 space-y-4">
+              <p className="text-[9px] font-black uppercase tracking-widest text-slate-500">Filtros del reporte</p>
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 md:gap-4">
+                <label className="flex flex-col gap-1.5">
+                  <span className="text-[9px] font-black uppercase tracking-wider text-slate-500">Incluir en el reporte</span>
+                  <select
+                    value={invoiceHistoryKind}
+                    onChange={(e) => setInvoiceHistoryKind(e.target.value as 'ALL' | 'SALES' | 'PURCHASES')}
+                    className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-[11px] font-black text-slate-800 outline-none focus:ring-2 focus:ring-emerald-500/30"
+                  >
+                    <option value="ALL">Facturas ventas + compras</option>
+                    <option value="SALES">Solo ventas</option>
+                    <option value="PURCHASES">Solo compras</option>
+                  </select>
+                </label>
+                <label className="flex flex-col gap-1.5">
+                  <span className="text-[9px] font-black uppercase tracking-wider text-slate-500">Fecha desde</span>
+                  <input
+                    type="date"
+                    value={invoiceHistoryDateFrom}
+                    onChange={(e) => setInvoiceHistoryDateFrom(e.target.value)}
+                    className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-[11px] font-bold text-slate-800 outline-none focus:ring-2 focus:ring-emerald-500/30"
+                  />
+                </label>
+                <label className="flex flex-col gap-1.5">
+                  <span className="text-[9px] font-black uppercase tracking-wider text-slate-500">Fecha hasta</span>
+                  <input
+                    type="date"
+                    value={invoiceHistoryDateTo}
+                    onChange={(e) => setInvoiceHistoryDateTo(e.target.value)}
+                    className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-[11px] font-bold text-slate-800 outline-none focus:ring-2 focus:ring-emerald-500/30"
+                  />
+                </label>
+                <label className="flex flex-col gap-1.5 sm:col-span-2 lg:col-span-1">
+                  <span className="text-[9px] font-black uppercase tracking-wider text-slate-500">Cliente / Proveedor</span>
+                  <input
+                    type="text"
+                    value={invoiceHistoryParty}
+                    onChange={(e) => setInvoiceHistoryParty(e.target.value)}
+                    placeholder="Nombre o RIF..."
+                    className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-[11px] font-bold text-slate-800 outline-none focus:ring-2 focus:ring-emerald-500/30 placeholder:text-slate-400"
+                  />
+                </label>
+              </div>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p className="text-[10px] text-slate-500 font-bold leading-snug max-w-xl">
+                  Las fechas aplican por fecha de venta (ticket) y por fecha de factura / registro de compra (compras sin fecha documento quedan fuera si filtra solo por período).
+                </p>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={invoiceHistoryExportRows.length === 0}
+                    onClick={() => reportService.exportInvoiceHistoryToPDF(invoiceHistoryExportRows, {
+                      title: 'HISTORIAL DE FACTURAS',
+                      filterLabel: `Tipo: ${invoiceHistoryKind} | Desde: ${invoiceHistoryDateFrom || 'Inicio'} | Hasta: ${invoiceHistoryDateTo || 'Hoy'} | Tercero: ${invoiceHistoryParty || 'Todos'} | Busqueda: ${invoiceHistorySearch || 'Todos'}`
+                    })}
+                    className="shrink-0 inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-emerald-900 text-white text-[10px] font-black uppercase tracking-wider hover:bg-emerald-800 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    <Download className="w-3 h-3" /> PDF
+                  </button>
+                  <button
+                    type="button"
+                    disabled={invoiceHistoryExportRows.length === 0}
+                    onClick={() => {
+                      const headers = ['tipo', 'fecha', 'factura', 'tercero', 'documento', 'detalle_productos', 'totalUSD', 'estado'];
+                      const preambleRows = [
+                        ['REPORTE', 'Historial de facturas'],
+                        ['TIPO', invoiceHistoryKind],
+                        ['FECHA_DESDE', invoiceHistoryDateFrom || '-'],
+                        ['FECHA_HASTA', invoiceHistoryDateTo || '-'],
+                        ['TERCERO', invoiceHistoryParty || '-'],
+                        ['BUSQUEDA', invoiceHistorySearch || '-'],
+                        ['GENERADO', new Date().toLocaleString('es-VE')],
+                        Array.from({ length: headers.length }, () => '')
+                      ];
+                      const csv = buildExcelFriendlyCsv(headers, invoiceHistoryExportRows, { preambleRows });
+                      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+                      const url = URL.createObjectURL(blob);
+                      const a = document.createElement('a');
+                      a.href = url;
+                      a.download = `historial_facturas_${new Date().toISOString().split('T')[0]}.csv`;
+                      a.click();
+                      URL.revokeObjectURL(url);
+                    }}
+                    className="shrink-0 inline-flex items-center gap-2 px-4 py-2 rounded-xl bg-slate-900 text-white text-[10px] font-black uppercase tracking-wider hover:bg-slate-800 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    <Download className="w-3 h-3" /> Excel
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setInvoiceHistoryKind('ALL');
+                      setInvoiceHistoryDateFrom('');
+                      setInvoiceHistoryDateTo('');
+                      setInvoiceHistoryParty('');
+                      setInvoiceHistorySearch('');
+                    }}
+                    className="shrink-0 px-4 py-2 rounded-xl border border-slate-200 bg-white text-[10px] font-black uppercase tracking-wider text-slate-600 hover:bg-slate-100 transition-colors"
+                  >
+                    Limpiar filtros
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {invoiceHistoryKind !== 'PURCHASES' && (
+          <div className="bg-white rounded-[2rem] border border-slate-200 p-5 md:p-7 shadow-sm space-y-4">
+            <div className="flex items-center justify-between">
+              <h4 className="text-[12px] md:text-sm font-black uppercase tracking-widest text-emerald-700">Facturas de venta</h4>
+              <span className="text-[10px] font-black text-slate-500">{filteredSalesInvoices.length} registro(s)</span>
+            </div>
+            <div className="overflow-auto rounded-2xl border border-slate-100">
+              <table className="w-full min-w-[980px]">
+                <thead className="bg-slate-50">
+                  <tr>
+                    <th className="px-3 py-2 text-left text-[9px] font-black uppercase tracking-wider text-slate-500">Factura</th>
+                    <th className="px-3 py-2 text-left text-[9px] font-black uppercase tracking-wider text-slate-500">Cliente</th>
+                    <th className="px-3 py-2 text-left text-[9px] font-black uppercase tracking-wider text-slate-500">Fecha</th>
+                    <th className="px-3 py-2 text-right text-[9px] font-black uppercase tracking-wider text-slate-500">Total USD</th>
+                    <th className="px-3 py-2 text-left text-[9px] font-black uppercase tracking-wider text-slate-500">Cobro</th>
+                    <th className="px-3 py-2 text-center text-[9px] font-black uppercase tracking-wider text-slate-500">Detalle</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredSalesInvoices.length === 0 && (
+                    <tr><td colSpan={6} className="px-3 py-6 text-center text-[10px] font-bold text-slate-400">Sin facturas de venta para el filtro actual.</td></tr>
+                  )}
+                  {filteredSalesInvoices.map((sale: any) => {
+                    const saleId = String(sale?.id ?? sale?.correlativo ?? Math.random());
+                    const expanded = expandedSaleInvoiceId === saleId;
+                    const dateLabel = sale?.timestamp instanceof Date ? sale.timestamp.toLocaleDateString('es-VE') : '—';
+                    const payments = Array.isArray(sale?.payments) ? sale.payments : [];
+                    const paymentLabel = payments.length > 0
+                      ? Array.from(new Set(payments.map((p: any) => String(p?.method ?? 'MIXTO').toUpperCase()))).join(', ')
+                      : String(sale?.paymentMethod ?? 'MIXTO').toUpperCase();
+                    return (
+                      <React.Fragment key={saleId}>
+                        <tr className="border-t border-slate-100">
+                          <td className="px-3 py-2 text-[10px] font-black text-slate-800">{String(sale?.correlativo ?? '-')}</td>
+                          <td className="px-3 py-2 text-[10px] font-bold text-slate-700">{String(sale?.client?.name ?? '-')}</td>
+                          <td className="px-3 py-2 text-[10px] font-mono text-slate-500">{dateLabel}</td>
+                          <td className="px-3 py-2 text-right text-[10px] font-black text-slate-900">${Number(sale?.totalUSD ?? 0).toFixed(2)}</td>
+                          <td className="px-3 py-2 text-[10px] font-bold text-slate-700">{paymentLabel || '—'}</td>
+                          <td className="px-3 py-2 text-center">
+                            <button onClick={() => setExpandedSaleInvoiceId(expanded ? null : saleId)} className="text-[9px] font-black uppercase tracking-widest text-emerald-700 hover:text-emerald-900">
+                              {expanded ? 'Ocultar' : 'Ver'}
+                            </button>
+                          </td>
+                        </tr>
+                        {expanded && (
+                          <tr className="bg-slate-50/60">
+                            <td colSpan={6} className="px-4 py-3">
+                              <div className="text-[9px] font-black uppercase tracking-widest text-slate-500 mb-2">Productos facturados</div>
+                              <div className="space-y-1">
+                                {(Array.isArray(sale?.items) ? sale.items : []).map((it: any, idx: number) => (
+                                  <div key={`${saleId}-line-${idx}`} className="flex items-center justify-between text-[10px]">
+                                    <span className="font-bold text-slate-700">{String(it?.description ?? it?.code ?? 'Producto')}</span>
+                                    <span className="font-mono text-slate-500">{Number(it?.qty ?? 0).toFixed(2)} {String(it?.unit ?? '')} × ${Number(it?.priceUSD ?? 0).toFixed(2)}</span>
+                                  </div>
+                                ))}
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                      </React.Fragment>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+          )}
+
+          {invoiceHistoryKind !== 'SALES' && (
+          <div className="bg-white rounded-[2rem] border border-slate-200 p-5 md:p-7 shadow-sm space-y-4">
+            <div className="flex items-center justify-between">
+              <h4 className="text-[12px] md:text-sm font-black uppercase tracking-widest text-indigo-700">Facturas de compra</h4>
+              <span className="text-[10px] font-black text-slate-500">
+                {invoiceHistoryLoading ? 'Cargando...' : `${filteredPurchaseInvoices.length} registro(s)`}
+              </span>
+            </div>
+            <div className="overflow-auto rounded-2xl border border-slate-100">
+              <table className="w-full min-w-[1100px]">
+                <thead className="bg-slate-50">
+                  <tr>
+                    <th className="px-3 py-2 text-left text-[9px] font-black uppercase tracking-wider text-slate-500">Factura</th>
+                    <th className="px-3 py-2 text-left text-[9px] font-black uppercase tracking-wider text-slate-500">Proveedor</th>
+                    <th className="px-3 py-2 text-left text-[9px] font-black uppercase tracking-wider text-slate-500">Fecha</th>
+                    <th className="px-3 py-2 text-right text-[9px] font-black uppercase tracking-wider text-slate-500">Total USD</th>
+                    <th className="px-3 py-2 text-right text-[9px] font-black uppercase tracking-wider text-slate-500">Pagado USD</th>
+                    <th className="px-3 py-2 text-left text-[9px] font-black uppercase tracking-wider text-slate-500">Tipo pago</th>
+                    <th className="px-3 py-2 text-center text-[9px] font-black uppercase tracking-wider text-slate-500">Detalle</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {!invoiceHistoryLoading && filteredPurchaseInvoices.length === 0 && (
+                    <tr><td colSpan={7} className="px-3 py-6 text-center text-[10px] font-bold text-slate-400">Sin facturas de compra para el filtro actual.</td></tr>
+                  )}
+                  {invoiceHistoryLoading && (
+                    <tr><td colSpan={7} className="px-3 py-6 text-center text-[10px] font-bold text-slate-400">Cargando historial de compras...</td></tr>
+                  )}
+                  {filteredPurchaseInvoices.map((entry) => {
+                    const expanded = expandedPurchaseInvoiceId === entry.id;
+                    const invoiceDateLabel = entry.invoiceDate ? new Date(entry.invoiceDate).toLocaleDateString('es-VE') : '—';
+                    const paidUSD = Number(entry.paidUSD ?? 0) || 0;
+                    return (
+                      <React.Fragment key={entry.id}>
+                        <tr className="border-t border-slate-100">
+                          <td className="px-3 py-2 text-[10px] font-black text-slate-800">{entry.invoiceNumber || entry.invoiceGroupId}</td>
+                          <td className="px-3 py-2 text-[10px] font-bold text-slate-700">{entry.supplier || '-'}</td>
+                          <td className="px-3 py-2 text-[10px] font-mono text-slate-500">{invoiceDateLabel}</td>
+                          <td className="px-3 py-2 text-right text-[10px] font-black text-slate-900">${Number(entry.totalInvoiceUSD ?? 0).toFixed(2)}</td>
+                          <td className="px-3 py-2 text-right text-[10px] font-black text-emerald-700">${paidUSD.toFixed(2)}</td>
+                          <td className="px-3 py-2 text-[10px] font-bold text-slate-700">{entry.paymentType}</td>
+                          <td className="px-3 py-2 text-center">
+                            <button onClick={() => setExpandedPurchaseInvoiceId(expanded ? null : entry.id)} className="text-[9px] font-black uppercase tracking-widest text-indigo-700 hover:text-indigo-900">
+                              {expanded ? 'Ocultar' : 'Ver'}
+                            </button>
+                          </td>
+                        </tr>
+                        {expanded && (
+                          <tr className="bg-slate-50/60">
+                            <td colSpan={7} className="px-4 py-3 space-y-3">
+                              <div>
+                                <div className="text-[9px] font-black uppercase tracking-widest text-slate-500 mb-2">Productos comprados</div>
+                                <div className="space-y-1">
+                                  {entry.lines.map((line) => (
+                                    <div key={`${entry.id}-${line.id}-${line.lineNumber}`} className="flex items-center justify-between text-[10px]">
+                                      <span className="font-bold text-slate-700">{line.productDescription || line.sku}</span>
+                                      <span className="font-mono text-slate-500">{Number(line.qty ?? 0).toFixed(2)} {line.unit || ''} × ${Number(line.costUSD ?? 0).toFixed(2)} = ${Number(line.totalLineUSD ?? 0).toFixed(2)}</span>
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                                <div className="rounded-xl border border-slate-200 bg-white p-3">
+                                  <div className="text-[8px] font-black uppercase tracking-widest text-slate-400">Saldo CxP</div>
+                                  <div className="mt-1 text-[12px] font-black text-slate-900">
+                                    {entry.apBalanceUSD != null ? `$${Number(entry.apBalanceUSD).toFixed(2)}` : '—'}
+                                  </div>
+                                </div>
+                                <div className="rounded-xl border border-slate-200 bg-white p-3">
+                                  <div className="text-[8px] font-black uppercase tracking-widest text-slate-400">Métodos de pago</div>
+                                  <div className="mt-1 text-[11px] font-black text-slate-900">{entry.paymentMethods.length > 0 ? entry.paymentMethods.join(', ') : '—'}</div>
+                                </div>
+                                <div className="rounded-xl border border-slate-200 bg-white p-3">
+                                  <div className="text-[8px] font-black uppercase tracking-widest text-slate-400">Soportes</div>
+                                  <div className="mt-1 text-[11px] font-black text-slate-900">{entry.supports.length}</div>
+                                </div>
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                      </React.Fragment>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+          )}
+        </div>
+      )}
+
+      {activeSubTab === 'approvals' && (
+        <div className="space-y-6 animate-in slide-in-from-right-4 duration-500">
+          <div className="bg-white rounded-[2.5rem] border border-slate-200 overflow-hidden shadow-sm">
+            <div className="p-8 border-b border-slate-100 bg-[#f8fafc]/50">
+              <div className="flex flex-wrap justify-between items-center gap-3">
+                <h3 className="font-headline font-black text-lg uppercase tracking-tight">Bandeja de Aprobación de Órdenes de Compra</h3>
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] font-black text-amber-700 bg-amber-50 px-4 py-1.5 rounded-full uppercase">
+                    Pendientes: {approvablePurchaseOrders.length}
+                  </span>
+                  <span className="text-[10px] font-black text-blue-700 bg-blue-50 px-4 py-1.5 rounded-full uppercase">
+                    Alertas: {poAlerts.length}
+                  </span>
+                  <button
+                    onClick={() => void loadPOAlerts()}
+                    className="px-3 py-1.5 bg-slate-900 text-white rounded-xl text-[9px] font-black uppercase hover:bg-slate-700 transition-all"
+                  >
+                    Recargar
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div className="p-6 space-y-4">
+              {loadingPoAlerts ? (
+                <div className="p-6 text-center text-[11px] font-black uppercase text-slate-400">Cargando alertas...</div>
+              ) : poAlerts.length === 0 ? (
+                <div className="p-6 text-center text-[11px] font-black uppercase text-slate-400">Sin alertas pendientes.</div>
+              ) : (
+                <div className="space-y-2">
+                  {poAlerts.map((a) => (
+                    <div key={a.id} className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-100 bg-amber-50/60 px-4 py-3">
+                      <div>
+                        <div className="text-[10px] font-black uppercase text-slate-900">
+                          {a.purchaseOrderCorrelativo || a.purchaseOrderId} · {a.supplier}
+                        </div>
+                        <div className="text-[9px] font-bold text-slate-500">
+                          Enviada: {a.createdAt ? new Date(a.createdAt).toLocaleString('es-VE') : '-'}
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => void dataService.markPurchaseOrderApprovalAlertRead(a.id).then(() => loadPOAlerts())}
+                        className="px-3 py-1.5 bg-white border border-slate-200 rounded-lg text-[9px] font-black uppercase hover:bg-slate-50"
+                      >
+                        Marcar leída
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              <div className="rounded-2xl border border-slate-200 overflow-x-auto">
+                <table className="w-full text-left">
+                  <thead>
+                    <tr className="bg-slate-50/50 text-[8px] font-black uppercase text-slate-400 border-b border-slate-100">
+                      <th className="px-6 py-4">OC</th>
+                      <th className="px-6 py-4">Proveedor</th>
+                      <th className="px-6 py-4">Líneas</th>
+                      <th className="px-6 py-4">Enviada</th>
+                      <th className="px-6 py-4 text-right">Acciones</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {approvablePurchaseOrders.length === 0 && (
+                      <tr>
+                        <td colSpan={5} className="px-6 py-10 text-center text-[10px] font-black uppercase text-slate-400">
+                          No hay OC pendientes de aprobación.
+                        </td>
+                      </tr>
+                    )}
+                    {approvablePurchaseOrders.map((oc) => {
+                      const isExpanded = expandedApprovalOcId === oc.id;
+                      return (
+                        <React.Fragment key={oc.id}>
+                          <tr className="border-b border-slate-100">
+                            <td className="px-6 py-4 text-[10px] font-black text-slate-900 font-mono">{oc.correlativo}</td>
+                            <td className="px-6 py-4 text-[10px] font-bold text-slate-700 uppercase">{oc.supplier}</td>
+                            <td className="px-6 py-4 text-[10px] font-bold text-slate-500">{oc.lines.length}</td>
+                            <td className="px-6 py-4 text-[10px] font-bold text-slate-500">
+                              {oc.submittedAt ? new Date(oc.submittedAt).toLocaleString('es-VE') : '-'}
+                            </td>
+                            <td className="px-6 py-4 text-right space-x-2">
+                              <button
+                                onClick={() => setExpandedApprovalOcId((prev) => (prev === oc.id ? null : oc.id))}
+                                className="px-3 py-1.5 bg-slate-100 text-slate-700 rounded-lg text-[9px] font-black uppercase hover:bg-slate-200 inline-flex items-center gap-1"
+                              >
+                                {isExpanded ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                                Detalle
+                              </button>
+                              <button
+                                disabled={!canEditFinance}
+                                onClick={async () => {
+                                  try {
+                                    await dataService.approvePurchaseOrder(oc.id);
+                                    await dataService.markPurchaseOrderApprovalAlertsReadByOrder(oc.id);
+                                    await loadPOAlerts();
+                                  } catch (e: any) {
+                                    alert(e?.message ?? 'No se pudo aprobar la OC.');
+                                  }
+                                }}
+                                className="px-3 py-1.5 bg-emerald-600 text-white rounded-lg text-[9px] font-black uppercase hover:bg-emerald-700 disabled:opacity-50"
+                              >
+                                Aprobar
+                              </button>
+                            </td>
+                          </tr>
+                          {isExpanded && (
+                            <tr className="border-b border-slate-100 bg-slate-50/40">
+                              <td colSpan={5} className="px-6 py-5">
+                                <div className="grid grid-cols-1 md:grid-cols-4 gap-3 mb-4">
+                                  <div className="rounded-xl border border-slate-200 bg-white px-3 py-2">
+                                    <div className="text-[8px] font-black uppercase tracking-widest text-slate-400">Proveedor</div>
+                                    <div className="text-[10px] font-black text-slate-900 uppercase mt-1">{oc.supplier}</div>
+                                  </div>
+                                  <div className="rounded-xl border border-slate-200 bg-white px-3 py-2">
+                                    <div className="text-[8px] font-black uppercase tracking-widest text-slate-400">Documento</div>
+                                    <div className="text-[10px] font-black text-slate-700 mt-1">{oc.supplierDocument || '-'}</div>
+                                  </div>
+                                  <div className="rounded-xl border border-slate-200 bg-white px-3 py-2">
+                                    <div className="text-[8px] font-black uppercase tracking-widest text-slate-400">Creada por</div>
+                                    <div className="text-[10px] font-black text-slate-700 mt-1">{oc.createdBy || '-'}</div>
+                                  </div>
+                                  <div className="rounded-xl border border-slate-200 bg-white px-3 py-2">
+                                    <div className="text-[8px] font-black uppercase tracking-widest text-slate-400">Nota</div>
+                                    <div className="text-[10px] font-bold text-slate-700 mt-1">{oc.note || 'Sin nota'}</div>
+                                  </div>
+                                </div>
+
+                                <div className="rounded-xl border border-slate-200 overflow-hidden bg-white">
+                                  <table className="w-full text-left">
+                                    <thead>
+                                      <tr className="bg-slate-50 text-[8px] font-black uppercase text-slate-400 border-b border-slate-100">
+                                        <th className="px-3 py-2">SKU</th>
+                                        <th className="px-3 py-2">Producto</th>
+                                        <th className="px-3 py-2">Almacén</th>
+                                        <th className="px-3 py-2 text-right">Cant. OC</th>
+                                        <th className="px-3 py-2 text-right">Recibido</th>
+                                        <th className="px-3 py-2 text-right">Pendiente</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {oc.lines.map((line) => {
+                                        const pending = Math.max(0, Number(line.qtyOrdered ?? 0) - Number(line.qtyReceived ?? 0));
+                                        return (
+                                          <tr key={line.id} className="border-b border-slate-100 last:border-b-0 text-[10px]">
+                                            <td className="px-3 py-2 font-mono font-black text-slate-900">{line.sku}</td>
+                                            <td className="px-3 py-2 font-bold text-slate-700 uppercase">{line.productDescription}</td>
+                                            <td className="px-3 py-2 font-bold text-slate-500">{line.warehouse}</td>
+                                            <td className="px-3 py-2 text-right font-black text-slate-700">{Number(line.qtyOrdered ?? 0).toFixed(4)}</td>
+                                            <td className="px-3 py-2 text-right font-black text-blue-700">{Number(line.qtyReceived ?? 0).toFixed(4)}</td>
+                                            <td className="px-3 py-2 text-right font-black text-amber-700">{pending.toFixed(4)}</td>
+                                          </tr>
+                                        );
+                                      })}
+                                    </tbody>
+                                  </table>
+                                </div>
+                              </td>
+                            </tr>
+                          )}
+                        </React.Fragment>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {activeSubTab === 'credit' && (
         <div className="space-y-6 animate-in fade-in slide-in-from-top-4 duration-500">
           <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
@@ -1852,8 +2883,8 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
             </div>
           </div>
 
-          <div className="grid grid-cols-1 xl:grid-cols-12 gap-6">
-            <div className="xl:col-span-5 bg-white rounded-[2rem] border border-slate-200 overflow-hidden shadow-sm">
+          <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
+            <div className="xl:col-span-5 bg-white rounded-[2rem] border border-slate-200 overflow-hidden shadow-sm flex flex-col">
               <div className="p-6 border-b bg-slate-50/40">
                 <div className="flex items-center gap-3">
                   <div className="p-3 rounded-2xl bg-slate-900 text-white">
@@ -1875,7 +2906,7 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
                   <Filter className="absolute right-4 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-300" />
                 </div>
               </div>
-              <div className="max-h-[38rem] overflow-y-auto p-3 space-y-2">
+              <div className="max-h-[70vh] overflow-y-auto p-3 space-y-2">
                 {filteredCreditClients.length === 0 ? (
                   <div className="p-10 text-center text-[10px] font-black uppercase tracking-widest text-slate-300">Sin clientes para el filtro actual</div>
                 ) : (
@@ -2151,10 +3182,48 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
                       <span className="text-[10px] font-black text-amber-700 bg-amber-50 px-4 py-1.5 rounded-full uppercase">Anticipos: - $ {totalAdvances.toFixed(2)}</span>
                     )}
                     <span className="text-[10px] font-black text-emerald-600 bg-emerald-50 px-4 py-1.5 rounded-full uppercase">Neto: $ {Math.max(0, totalAR - totalAdvances).toFixed(2)}</span>
-                    <button onClick={() => reportService.exportARGlobalToPDF(filteredAR)}
+                    <button onClick={() => reportService.exportARGlobalToPDF(filteredAR, { filterLabel: arStatementFilterNote || 'Sin filtros adicionales' })}
                       className="flex items-center gap-1 px-3 py-1.5 bg-slate-900 text-white rounded-xl text-[9px] font-black uppercase hover:bg-slate-700 transition-all">
                       <Download className="w-3 h-3" /> PDF
                     </button>
+                    <button onClick={exportARFilteredExcel}
+                      className="flex items-center gap-1 px-3 py-1.5 bg-emerald-700 text-white rounded-xl text-[9px] font-black uppercase hover:bg-emerald-800 transition-all">
+                      <Download className="w-3 h-3" /> Excel
+                    </button>
+                    <button
+                      onClick={() => reportService.exportCompanyLoansToPDF(companyLoans, filteredAR.filter((e) => isCompanyLoanAREntry(e)))}
+                      className="flex items-center gap-1 px-3 py-1.5 bg-blue-700 text-white rounded-xl text-[9px] font-black uppercase hover:bg-blue-800 transition-all"
+                    >
+                      <Download className="w-3 h-3" /> PDF Préstamos
+                    </button>
+                    {canEditFinance && (
+                      <button
+                        onClick={() => { setLoanError(''); setShowCreateLoanModal(true); }}
+                        className="flex items-center gap-1 px-3 py-1.5 bg-emerald-600 text-white rounded-xl text-[9px] font-black uppercase hover:bg-emerald-700 transition-all"
+                      >
+                        <Plus className="w-3 h-3" /> Nuevo préstamo
+                      </button>
+                    )}
+                  </div>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-2 mb-3">
+                  <div className="rounded-xl border border-emerald-100 bg-emerald-50/50 px-3 py-2">
+                    <div className="text-[8px] font-black uppercase tracking-widest text-emerald-700">Préstamos activos</div>
+                    <div className="text-[14px] font-black text-emerald-800">
+                      {companyLoans.filter((l) => l.status !== 'PAID' && l.status !== 'VOID').length}
+                    </div>
+                  </div>
+                  <div className="rounded-xl border border-blue-100 bg-blue-50/50 px-3 py-2">
+                    <div className="text-[8px] font-black uppercase tracking-widest text-blue-700">Saldo préstamos</div>
+                    <div className="text-[14px] font-black text-blue-800">
+                      $ {companyLoans.filter((l) => l.status !== 'PAID' && l.status !== 'VOID').reduce((s, l) => s + Number(l.balanceUSD ?? 0), 0).toFixed(2)}
+                    </div>
+                  </div>
+                  <div className="rounded-xl border border-slate-200 bg-slate-50/80 px-3 py-2">
+                    <div className="text-[8px] font-black uppercase tracking-widest text-slate-500">Emitidos (histórico)</div>
+                    <div className="text-[14px] font-black text-slate-800">
+                      {companyLoans.length}
+                    </div>
                   </div>
                 </div>
                 <div className="flex flex-wrap gap-2 items-center">
@@ -2167,10 +3236,10 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
                       className="bg-transparent border-0 text-[10px] font-black text-slate-700 focus:ring-0 w-32" />
                   </div>
                   <div className="flex bg-slate-100 rounded-xl overflow-hidden border border-slate-200 text-[9px] font-black uppercase">
-                    {(['ALL','PENDING','OVERDUE','PAID'] as const).map(s => (
+                    {(['ALL','OPEN','PENDING','OVERDUE','PAID','LOANS'] as const).map(s => (
                       <button key={s} onClick={() => { setArStatusFilter(s); setArPage(0); }}
                         className={`px-3 py-1.5 transition-all ${arStatusFilter === s ? 'bg-slate-900 text-white' : 'text-slate-500 hover:bg-slate-200'}`}>
-                        {s === 'ALL' ? 'Todos' : s === 'PENDING' ? 'Pendiente' : s === 'OVERDUE' ? 'Vencido' : 'Pagado'}
+                        {s === 'ALL' ? 'Todos' : s === 'OPEN' ? 'Pend.+Venc.' : s === 'PENDING' ? 'Pendiente' : s === 'OVERDUE' ? 'Vencido' : s === 'PAID' ? 'Pagado' : 'Préstamos'}
                       </button>
                     ))}
                   </div>
@@ -2220,7 +3289,7 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
                           >
                             <div>
                               <div className="text-[13px] font-black text-slate-900 uppercase">{group.customerName}</div>
-                              <div className="text-[9px] font-bold text-slate-400 font-mono">{group.customerId} · {group.entries.length} factura(s)</div>
+                              <div className="text-[9px] font-bold text-slate-400 font-mono">{group.customerId} · {group.entries.length} documento(s)</div>
                             </div>
                             <div className="flex items-center gap-2 flex-wrap justify-end">
                               {group.overdueCount > 0 && <span className="px-2 py-1 rounded-full text-[8px] font-black uppercase bg-red-100 text-red-700">{group.overdueCount} vencida(s)</span>}
@@ -2259,11 +3328,14 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
                               )}
                               {group.entries.map((ar) => {
                                 const isOverdue = ar.status !== 'PAID' && new Date() > ar.dueDate;
+                                const isLoan = isCompanyLoanAREntry(ar);
                                 return (
                                   <div key={ar.id} className={`px-5 py-4 border-b border-slate-100 last:border-b-0 ${isOverdue ? 'bg-red-50/40' : 'bg-white'}`}>
                                     <div className="flex items-start justify-between gap-4">
                                       <div>
-                                        <div className="text-[11px] font-black text-slate-900 uppercase">Factura {ar.saleCorrelativo}</div>
+                                        <div className="text-[11px] font-black text-slate-900 uppercase">
+                                          {isLoan ? 'Préstamo' : 'Factura'} {ar.saleCorrelativo}
+                                        </div>
                                         <div className="text-[9px] font-bold text-slate-400 font-mono">{ar.description}</div>
                                         <div className={`text-[9px] font-black mt-1 ${isOverdue ? 'text-red-600' : 'text-slate-500'}`}>Vence: {ar.dueDate.toLocaleDateString()}</div>
                                       </div>
@@ -2291,7 +3363,7 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
                                           </>
                                         )}
                                         <button onClick={() => handleViewARPayments(ar)} className="p-2 bg-slate-100 text-slate-500 rounded-lg hover:bg-emerald-600 hover:text-white transition-all" title="Historial de Pagos"><History className="w-4 h-4" /></button>
-                                        <button onClick={() => reportService.exportARStatementToPDF(ar.customerId)} className="p-2 bg-slate-100 text-slate-500 rounded-lg hover:bg-slate-900 hover:text-white transition-all" title="Estado de Cuenta"><FileText className="w-4 h-4" /></button>
+                                        <button onClick={() => exportARStatementForCustomer(ar.customerId)} className="p-2 bg-slate-100 text-slate-500 rounded-lg hover:bg-slate-900 hover:text-white transition-all" title="Estado de Cuenta"><FileText className="w-4 h-4" /></button>
                                       </div>
                                     </div>
                                   </div>
@@ -2377,11 +3449,12 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
                          ))}
                          {filteredAR.slice(arPage * FIN_PAGE_SIZE, (arPage + 1) * FIN_PAGE_SIZE).map((ar) => {
                            const isOverdue = ar.status !== 'PAID' && new Date() > ar.dueDate;
+                          const isLoan = isCompanyLoanAREntry(ar);
                            return (
                            <tr key={ar.id} className={`border-b transition-colors group ${isOverdue ? 'bg-red-50/60 border-red-100 hover:bg-red-50' : 'border-slate-50 hover:bg-slate-50'}`}>
                               <td className="px-8 py-5">
                                  <div className="font-black text-slate-900 uppercase">{ar.customerName}</div>
-                                 <div className="text-[8px] text-slate-400 font-mono">Fact: {ar.saleCorrelativo} | ID: {ar.customerId}</div>
+                                 <div className="text-[8px] text-slate-400 font-mono">{isLoan ? 'Préstamo' : 'Fact'}: {ar.saleCorrelativo} | ID: {ar.customerId}</div>
                               </td>
                               <td className="px-8 py-5">
                                  <div className={`font-bold ${new Date() > ar.dueDate && ar.status !== 'PAID' ? 'text-red-500' : 'text-slate-500'}`}>
@@ -2448,7 +3521,7 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
                                      <History className="w-4 h-4" />
                                    </button>
                                    <button 
-                                     onClick={() => reportService.exportARStatementToPDF(ar.customerId)}
+                                     onClick={() => exportARStatementForCustomer(ar.customerId)}
                                      className="p-2 bg-slate-100 text-slate-500 rounded-lg hover:bg-slate-900 hover:text-white transition-all"
                                      title="Estado de Cuenta"
                                    >
@@ -2482,12 +3555,12 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
            </div>
 
            {showARPaymentsModal && (
-             <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-6">
-               <div className="w-full max-w-4xl bg-white rounded-[2rem] shadow-2xl overflow-hidden border border-slate-200">
-                 <div className="p-8 border-b bg-slate-50/30 flex justify-between items-start">
+            <div className="fixed inset-0 z-50 bg-black/40 overflow-y-auto p-3 md:p-4">
+              <div className="w-full max-w-5xl max-h-[94vh] my-2 mx-auto bg-white rounded-[1.4rem] shadow-2xl overflow-hidden border border-slate-200 flex flex-col">
+                <div className="p-4 md:p-5 border-b bg-slate-50/70 flex justify-between items-start shrink-0 sticky top-0 z-10">
                    <div>
-                     <h4 className="font-headline font-black text-lg uppercase tracking-tight">Historial de Pagos AR</h4>
-                     <div className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mt-1">
+                    <h4 className="font-headline font-black text-sm md:text-base uppercase tracking-tight">Historial de Pagos AR</h4>
+                    <div className="text-[9px] text-slate-400 font-bold uppercase tracking-widest mt-1">
                        {arPaymentsTarget ? `${arPaymentsTarget.customerName} • Fact: ${arPaymentsTarget.saleCorrelativo}` : ''}
                      </div>
                    </div>
@@ -2499,11 +3572,11 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
                        setArPaymentsError('');
                        setArPaymentsLoading(false);
                      }}
-                     className="px-4 py-2 bg-slate-900 text-white rounded-xl text-[9px] font-black uppercase"
+                    className="px-3 py-1.5 bg-slate-900 text-white rounded-xl text-[9px] font-black uppercase"
                    >Cerrar</button>
                  </div>
 
-                 <div className="p-8">
+                <div className="p-4 md:p-5 overflow-y-auto flex-1 min-h-0">
                    {arPaymentsLoading ? (
                      <div className="p-12 text-center opacity-40 font-black uppercase tracking-widest text-[10px]">Cargando...</div>
                    ) : arPaymentsError ? (
@@ -2513,40 +3586,40 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
                    ) : arPayments.length === 0 ? (
                      <div className="p-12 text-center opacity-30 font-black uppercase tracking-widest text-[10px]">Sin pagos registrados</div>
                    ) : (
-                     <div className="space-y-4">
+                    <div className="space-y-2.5">
                        {arPayments.map((p: any) => (
-                         <div key={p.id} className="p-5 rounded-2xl border border-slate-200 bg-white">
+                        <div key={p.id} className="p-3.5 rounded-xl border border-slate-200 bg-white">
                            <div className="flex justify-between gap-6 items-start">
                              <div>
-                               <div className="text-[11px] font-black uppercase text-slate-900">
+                              <div className="text-[10px] font-black uppercase text-slate-900">
                                  {String(p.method ?? '').toUpperCase()} • {String(p.currency ?? 'USD')}
                                </div>
-                               <div className="text-[10px] text-slate-400 font-mono mt-1">
+                              <div className="text-[9px] text-slate-400 font-mono mt-0.5">
                                  {p.createdAt ? new Date(p.createdAt).toLocaleString() : ''}
                                </div>
                              </div>
                              <div className="text-right">
-                               <div className="text-[13px] font-black text-emerald-700 font-mono">
+                              <div className="text-[12px] font-black text-emerald-700 font-mono">
                                  $ {Number(p.amountUSD ?? 0).toFixed(2)}
                                </div>
                                {String(p.currency ?? '') === 'VES' && (
-                                 <div className="text-[11px] font-black text-slate-700 font-mono">
+                                <div className="text-[10px] font-black text-slate-700 font-mono">
                                    Bs {Number(p.amountVES ?? 0).toFixed(2)} @ {Number(p.rateUsed ?? 0).toFixed(2)}
                                  </div>
                                )}
                              </div>
                            </div>
 
-                           <div className="mt-3 grid grid-cols-1 md:grid-cols-3 gap-3">
-                             <div className="text-[10px]">
+                          <div className="mt-2.5 grid grid-cols-1 md:grid-cols-3 gap-2">
+                            <div className="text-[9px]">
                                <div className="text-[8px] font-black uppercase tracking-widest text-slate-400">Banco</div>
                                <div className="font-bold text-slate-700 uppercase">{String(p.bank ?? '') || '-'}</div>
                              </div>
-                             <div className="text-[10px]">
+                            <div className="text-[9px]">
                                <div className="text-[8px] font-black uppercase tracking-widest text-slate-400">Referencia</div>
                                <div className="font-bold text-slate-700">{String(p.reference ?? '') || '-'}</div>
                              </div>
-                             <div className="text-[10px]">
+                            <div className="text-[9px]">
                                <div className="text-[8px] font-black uppercase tracking-widest text-slate-400">Actor</div>
                                <div className="font-bold text-slate-700 uppercase">{String(p.actor ?? '') || '-'}</div>
                              </div>
@@ -2593,9 +3666,13 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
                   </div>
                   <div className="flex items-center gap-2 flex-wrap">
                     <span className="text-[10px] font-black text-red-600 bg-red-50 px-4 py-1.5 rounded-full uppercase">Total Deuda: {usd(totalAP)}</span>
-                    <button onClick={() => reportService.exportAPGlobalToPDF(filteredAP)}
+                    <button onClick={() => reportService.exportAPGlobalToPDF(filteredAP, { filterLabel: apStatusFilter === 'OPEN' ? 'Pendientes + vencidas' : apStatusFilter })}
                       className="flex items-center gap-1 px-3 py-1.5 bg-slate-800 text-white rounded-xl text-[9px] font-black uppercase hover:bg-slate-700 transition-all">
                       <Download className="w-3 h-3" /> PDF
+                    </button>
+                    <button onClick={exportAPFilteredExcel}
+                      className="flex items-center gap-1 px-3 py-1.5 bg-emerald-700 text-white rounded-xl text-[9px] font-black uppercase hover:bg-emerald-800 transition-all">
+                      <Download className="w-3 h-3" /> Excel
                     </button>
                     <button onClick={() => setShowPurchaseModal(true)}
                       className="px-4 py-2 bg-emerald-600 text-white rounded-xl text-[9px] font-black uppercase shadow-xl shadow-emerald-600/20">
@@ -2613,10 +3690,10 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
                       className="bg-transparent border-0 text-[10px] font-black text-slate-700 focus:ring-0 w-32" />
                   </div>
                   <div className="flex bg-slate-100 rounded-xl overflow-hidden border border-slate-200 text-[9px] font-black uppercase">
-                    {(['ALL','PENDING','OVERDUE','PAID'] as const).map(s => (
+                    {(['ALL','OPEN','PENDING','OVERDUE','PAID'] as const).map(s => (
                       <button key={s} onClick={() => { setApStatusFilter(s); setApPage(0); }}
                         className={`px-3 py-1.5 transition-all ${apStatusFilter === s ? 'bg-slate-900 text-white' : 'text-slate-500 hover:bg-slate-200'}`}>
-                        {s === 'ALL' ? 'Todos' : s === 'PENDING' ? 'Pendiente' : s === 'OVERDUE' ? 'Vencido' : 'Pagado'}
+                        {s === 'ALL' ? 'Todos' : s === 'OPEN' ? 'Pend.+Venc.' : s === 'PENDING' ? 'Pendiente' : s === 'OVERDUE' ? 'Vencido' : 'Pagado'}
                       </button>
                     ))}
                   </div>
@@ -2698,7 +3775,14 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
                                      title="Historial de pagos">
                                      <History className="w-4 h-4" />
                                    </button>
-                                   <button onClick={() => reportService.exportAPStatementToPDF(ap.supplierId ?? ap.supplier, ap.supplier)}
+                                  <button onClick={() => reportService.exportAPStatementToPDF(
+                                    ap.supplierId ?? ap.supplier,
+                                    ap.supplier,
+                                    {
+                                      startDate: apDateRange.start,
+                                      endDate: apDateRange.end
+                                    }
+                                  )}
                                      className="p-2 bg-red-50 text-red-600 rounded-lg hover:bg-red-600 hover:text-white transition-all"
                                      title="Estado de cuenta proveedor PDF">
                                      <Download className="w-4 h-4" />
@@ -3053,12 +4137,12 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
            )}
 
            {showAPPaymentsModal && (
-             <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-6">
-               <div className="w-full max-w-4xl bg-white rounded-[2rem] shadow-2xl overflow-hidden border border-slate-200">
-                 <div className="p-8 border-b bg-slate-50/30 flex justify-between items-start">
+            <div className="fixed inset-0 z-50 bg-black/40 overflow-y-auto p-3 md:p-4">
+              <div className="w-full max-w-5xl max-h-[94vh] my-2 mx-auto bg-white rounded-[1.4rem] shadow-2xl overflow-hidden border border-slate-200 flex flex-col">
+                <div className="p-4 md:p-5 border-b bg-slate-50/70 flex justify-between items-start shrink-0 sticky top-0 z-10">
                    <div>
-                     <h4 className="font-headline font-black text-lg uppercase tracking-tight">Historial de Pagos AP</h4>
-                     <div className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mt-1">
+                    <h4 className="font-headline font-black text-sm md:text-base uppercase tracking-tight">Historial de Pagos AP</h4>
+                    <div className="text-[9px] text-slate-400 font-bold uppercase tracking-widest mt-1">
                        {apPaymentsTarget ? `${apPaymentsTarget.supplier} • ID: ${apPaymentsTarget.id}` : ''}
                      </div>
                    </div>
@@ -3067,14 +4151,15 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
                        setShowAPPaymentsModal(false);
                        setApPaymentsTarget(null);
                        setApPayments([]);
+                      setApPaymentsVisibleCount(AP_PAYMENTS_PAGE_SIZE);
                        setApPaymentsError('');
                        setApPaymentsLoading(false);
                      }}
-                     className="px-4 py-2 bg-slate-900 text-white rounded-xl text-[9px] font-black uppercase"
+                    className="px-3 py-1.5 bg-slate-900 text-white rounded-xl text-[9px] font-black uppercase"
                    >Cerrar</button>
                  </div>
 
-                 <div className="p-8">
+                <div className="p-4 md:p-5 overflow-y-auto flex-1 min-h-0">
                    {apPaymentsLoading ? (
                      <div className="p-12 text-center opacity-40 font-black uppercase tracking-widest text-[10px]">Cargando...</div>
                    ) : apPaymentsError ? (
@@ -3084,50 +4169,54 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
                    ) : apPayments.length === 0 ? (
                      <div className="p-12 text-center opacity-30 font-black uppercase tracking-widest text-[10px]">Sin pagos registrados</div>
                    ) : (
-                     <div className="space-y-4">
-                       {apPayments.map((p: any) => (
-                         <div key={p.id} className="p-5 rounded-2xl border border-slate-200 bg-white">
+                    <div className="space-y-2.5">
+                      {visibleAPPayments.map((p: any) => (
+                        <div key={p.id} className="p-3.5 rounded-xl border border-slate-200 bg-white">
                            <div className="flex justify-between gap-6 items-start">
                              <div>
-                               <div className="text-[11px] font-black uppercase text-slate-900">
+                              <div className="text-[10px] font-black uppercase text-slate-900">
                                  {String(p.method ?? '').toUpperCase()} • {String(p.currency ?? 'USD')}
                                </div>
-                               <div className="text-[10px] text-slate-400 font-mono mt-1">
+                              <div className="text-[9px] text-slate-400 font-mono mt-0.5">
                                  {p.createdAt ? new Date(p.createdAt).toLocaleString() : ''}
                                </div>
                              </div>
                              <div className="text-right">
-                               <div className="text-[13px] font-black text-red-600 font-mono">
+                              <div className="text-[12px] font-black text-red-600 font-mono">
                                  $ {Number(p.amountUSD ?? 0).toFixed(2)}
                                </div>
                                {String(p.currency ?? '') === 'VES' && (
-                                 <div className="text-[11px] font-black text-slate-700 font-mono">
+                                <div className="text-[10px] font-black text-slate-700 font-mono">
                                    Bs {Number(p.amountVES ?? 0).toFixed(2)} @ {Number(p.rateUsed ?? 0).toFixed(2)}
                                  </div>
                                )}
                              </div>
                            </div>
 
-                           <div className="mt-3 grid grid-cols-1 md:grid-cols-3 gap-3">
-                             <div className="text-[10px]">
+                          <div className="mt-2.5 grid grid-cols-1 md:grid-cols-4 gap-2">
+                            <div className="text-[9px]">
                                <div className="text-[8px] font-black uppercase tracking-widest text-slate-400">Banco</div>
                                <div className="mt-1 font-black text-slate-900">{String(p.bank ?? 'N/D').toUpperCase()}</div>
                                {!!String(p.accountLabel ?? '').trim() && (
                                  <div className="mt-1 text-slate-500 font-mono">Cuenta: {String(p.accountLabel ?? '')}</div>
                                )}
                              </div>
-                             <div className="text-[10px]">
+                            <div className="text-[9px]">
                                <div className="text-[8px] font-black uppercase tracking-widest text-slate-400">Referencia</div>
                                <div className="mt-1 font-black text-slate-900">{String(p.reference ?? '').trim() || 'Sin referencia'}</div>
                              </div>
-                             <div className="text-[10px]">
+                            <div className="text-[9px]">
+                              <div className="text-[8px] font-black uppercase tracking-widest text-slate-400">Operador</div>
+                              <div className="mt-1 font-black text-slate-900 uppercase">{String(p.actor ?? 'SISTEMA')}</div>
+                            </div>
+                            <div className="text-[9px]">
                                <div className="text-[8px] font-black uppercase tracking-widest text-slate-400">Comprobante</div>
                                <div className="mt-1 flex items-center gap-2">
                                  <span className="font-black text-slate-900">{Array.isArray(p.supports) ? p.supports.length : 0} archivo(s)</span>
                                  {Array.isArray(p.supports) && p.supports.length > 0 && (
                                    <button
                                      onClick={() => openBankSupportPreview(p.supports, 0)}
-                                     className="px-3 py-1 bg-emerald-50 text-emerald-700 rounded-lg text-[9px] font-black uppercase"
+                                    className="px-2.5 py-1 bg-emerald-50 text-emerald-700 rounded-lg text-[8px] font-black uppercase"
                                    >Ver</button>
                                  )}
                                </div>
@@ -3135,12 +4224,22 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
                            </div>
 
                            {!!String(p.note ?? '').trim() && (
-                             <div className="mt-3 p-3 rounded-xl bg-slate-50 text-[10px] text-slate-600 font-bold">
+                            <div className="mt-2.5 p-2.5 rounded-xl bg-slate-50 text-[9px] text-slate-600 font-bold">
                                {String(p.note ?? '')}
                              </div>
                            )}
                          </div>
                        ))}
+                      {hasMoreAPPayments && (
+                        <div className="pt-1 flex items-center justify-center">
+                          <button
+                            onClick={() => setApPaymentsVisibleCount((prev) => prev + AP_PAYMENTS_PAGE_SIZE)}
+                            className="px-4 py-2 rounded-xl border border-slate-300 bg-white hover:bg-slate-50 text-[9px] font-black uppercase tracking-widest text-slate-700"
+                          >
+                            Cargar mas movimientos
+                          </button>
+                        </div>
+                      )}
                      </div>
                    )}
                  </div>
@@ -3172,18 +4271,60 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
         }).sort((a,b) => b.timestamp.getTime() - a.timestamp.getTime());
 
         const exportCSV = () => {
-          const rows = [['Fecha','Descripción','Categoría','Proveedor','Moneda','Monto USD','Monto Bs','Método Pago','Referencia','Estado','Registrado por']];
-          filtered.forEach(e => rows.push([
-            e.timestamp.toLocaleDateString('es-VE'), e.description,
-            EXPENSE_CATEGORIES[e.category] ?? e.category, e.supplier ?? '',
-            e.currency, e.amountUSD.toFixed(2), (e.amountVES ?? 0).toFixed(2),
-            e.paymentMethod ?? '', e.reference ?? '', e.status, e.createdBy ?? ''
-          ]));
-          const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g,'""')}"`).join(',')).join('\n');
-          const blob = new Blob(['\uFEFF'+csv], { type: 'text/csv;charset=utf-8;' });
+          const headers = ['Fecha','Descripción','Categoría','Proveedor','Moneda','Monto USD','Monto Bs','Método Pago','Referencia','Estado','Registrado por'];
+          const csvRows: Record<string, string>[] = filtered.map((e) => ({
+            'Fecha': e.timestamp.toLocaleDateString('es-VE'),
+            'Descripción': e.description,
+            'Categoría': EXPENSE_CATEGORIES[e.category] ?? e.category,
+            'Proveedor': e.supplier ?? '',
+            'Moneda': String(e.currency ?? ''),
+            'Monto USD': Number(e.amountUSD ?? 0).toFixed(2),
+            'Monto Bs': Number(e.amountVES ?? 0).toFixed(2),
+            'Método Pago': e.paymentMethod ?? '',
+            'Referencia': e.reference ?? '',
+            'Estado': String(e.status ?? ''),
+            'Registrado por': e.createdBy ?? ''
+          }));
+          const totalUSD = filtered.reduce((sum, e) => sum + (Number(e.amountUSD ?? 0) || 0), 0);
+          const totalVES = filtered.reduce((sum, e) => sum + (Number(e.amountVES ?? 0) || 0), 0);
+          csvRows.push({
+            'Fecha': 'TOTAL',
+            'Descripción': '',
+            'Categoría': '',
+            'Proveedor': '',
+            'Moneda': '',
+            'Monto USD': totalUSD.toFixed(2),
+            'Monto Bs': totalVES.toFixed(2),
+            'Método Pago': '',
+            'Referencia': '',
+            'Estado': '',
+            'Registrado por': ''
+          });
+          const preambleRows: string[][] = [
+            ['TIPO_REPORTE', 'Libro de Egresos (Finanzas)'],
+            ['FILTROS_APLICADOS', [
+              `Estado: ${expenseStatusFilter}`,
+              `Categoria: ${expenseCatFilter}`,
+              `Mes: ${expenseMonthFilter || 'Todos'}`,
+              `Busqueda: ${expenseSearch || 'Todos'}`
+            ].join(' | ')],
+            ['GENERADO_POR', String(dataService.getCurrentUser()?.name ?? dataService.getCurrentUser()?.email ?? 'Sistema')],
+            ['FECHA_GENERACION', new Date().toLocaleString('es-VE')],
+            Array.from({ length: headers.length }, () => '')
+          ];
+          const csv = buildExcelFriendlyCsv(headers, csvRows, { preambleRows });
+          const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
           const url = URL.createObjectURL(blob);
           const a = document.createElement('a'); a.href = url; a.download = `gastos_${new Date().toISOString().split('T')[0]}.csv`; a.click();
           URL.revokeObjectURL(url);
+          const generatedAt = new Date().toLocaleString('es-VE');
+          const detail = [
+            'Exportacion CSV',
+            'Reporte: Libro de Egresos (Finanzas)',
+            `Filtros: Estado=${expenseStatusFilter}; Categoria=${expenseCatFilter}; Mes=${expenseMonthFilter || 'Todos'}; Busqueda=${expenseSearch || 'Todos'}`,
+            `Fecha: ${generatedAt}`
+          ].join(' | ');
+          void dataService.addAuditEntry('REPORTS', 'EXPORT', detail).catch(() => {});
         };
 
         return (
@@ -3191,8 +4332,8 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
             {/* KPI cards */}
             <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
               {[
-                { label: 'Gasto del Mes', value: `$${totalMTD.toFixed(2)}`, color: 'red' },
-                { label: 'Gasto Total', value: `$${totalAll.toFixed(2)}`, color: 'slate' },
+                { label: 'Gasto del Mes', value: usd(totalMTD), color: 'red' },
+                { label: 'Gasto Total', value: usd(totalAll), color: 'slate' },
                 { label: 'Egresos Activos', value: String(activeExpenses.length), color: 'amber' },
                 { label: 'Categorías Usadas', value: String(byCategory.length), color: 'indigo' },
               ].map(c => (
@@ -3411,92 +4552,239 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
 
       {activeSubTab === 'ledger' && (
         <div className="animate-in fade-in slide-in-from-bottom-4 duration-500 space-y-6">
-           <div className="bg-white rounded-[2.5rem] border border-slate-200 overflow-hidden shadow-sm">
-              <div className="p-10 border-b bg-[#f8fafc]/50">
-                <div className="flex justify-between items-center mb-4">
-                  <div>
-                    <h3 className="font-headline font-black text-2xl tracking-tighter uppercase text-slate-900">Libro Mayor Analítico</h3>
-                    <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mt-1">Consolido de Transacciones Operativas</p>
-                  </div>
-                  <button onClick={() => reportService.exportLedgerToPDF()}
-                    className="flex items-center gap-2 px-6 py-3 bg-slate-900 text-white rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-slate-800 transition-all shadow-xl shadow-slate-900/10">
-                    <Download className="w-4 h-4" /> Exportar PDF
+          <div className="bg-white rounded-[2.5rem] border border-slate-200 overflow-hidden shadow-sm">
+            <div className="p-10 border-b bg-[#f8fafc]/50">
+              <div className="flex flex-col lg:flex-row lg:justify-between gap-4 mb-4">
+                <div>
+                  <h3 className="font-headline font-black text-2xl tracking-tighter uppercase text-slate-900">Libro Mayor Analítico</h3>
+                  <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mt-1">Por cuenta contable: debe, haber y saldo acumulado (Supabase)</p>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      reportService.exportMayorCuentaToPDF(mayorRows, {
+                        fechaDesde: ledgerDateRange.start,
+                        fechaHasta: ledgerDateRange.end,
+                        cuentaCodigo: ledgerAccountFilter
+                      })
+                    }
+                    className="flex items-center gap-2 px-5 py-3 bg-slate-900 text-white rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-slate-800 transition-all shadow-xl shadow-slate-900/10"
+                  >
+                    <Download className="w-4 h-4" /> PDF Mayor (cuentas)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => reportService.exportLedgerToPDF()}
+                    className="flex items-center gap-2 px-5 py-3 bg-slate-100 text-slate-800 rounded-2xl text-[10px] font-black uppercase tracking-widest hover:bg-slate-200 border border-slate-200"
+                  >
+                    <Download className="w-4 h-4" /> PDF Resumen I/E
                   </button>
                 </div>
+              </div>
+              <div className="flex flex-col xl:flex-row xl:items-end gap-4">
                 <div className="flex items-center gap-1 bg-slate-100 px-3 py-1.5 rounded-xl border border-slate-200 w-fit">
                   <Calendar className="w-3 h-3 text-slate-400" />
-                  <input type="date" value={ledgerDateRange.start} onChange={e => { setLedgerDateRange(p => ({...p, start: e.target.value})); setLedgerPage(0); }}
-                    className="bg-transparent border-0 text-[10px] font-black text-slate-700 focus:ring-0 w-32" />
+                  <input
+                    type="date"
+                    value={ledgerDateRange.start}
+                    onChange={(e) => {
+                      setLedgerDateRange((p) => ({ ...p, start: e.target.value }));
+                      setLedgerPage(0);
+                    }}
+                    className="bg-transparent border-0 text-[10px] font-black text-slate-700 focus:ring-0 w-32"
+                  />
                   <span className="text-slate-300 text-[10px]">—</span>
-                  <input type="date" value={ledgerDateRange.end} onChange={e => { setLedgerDateRange(p => ({...p, end: e.target.value})); setLedgerPage(0); }}
-                    className="bg-transparent border-0 text-[10px] font-black text-slate-700 focus:ring-0 w-32" />
+                  <input
+                    type="date"
+                    value={ledgerDateRange.end}
+                    onChange={(e) => {
+                      setLedgerDateRange((p) => ({ ...p, end: e.target.value }));
+                      setLedgerPage(0);
+                    }}
+                    className="bg-transparent border-0 text-[10px] font-black text-slate-700 focus:ring-0 w-32"
+                  />
+                </div>
+                <div className="flex flex-col gap-1 min-w-0 max-w-md">
+                  <span className="text-[8px] font-black uppercase text-slate-400 tracking-widest">Cuenta contable</span>
+                  <select
+                    value={ledgerAccountFilter}
+                    onChange={(e) => {
+                      setLedgerAccountFilter(e.target.value);
+                      setLedgerPage(0);
+                    }}
+                    className="w-full text-[10px] font-black text-slate-800 border border-slate-200 rounded-xl px-3 py-2 bg-white"
+                  >
+                    <option value="">Todas las cuentas</option>
+                    {cuentaOptionsMayor.map((c) => (
+                      <option key={c.codigo} value={c.codigo}>
+                        {c.codigo} — {c.nombre}
+                      </option>
+                    ))}
+                  </select>
                 </div>
               </div>
-              <div className="overflow-x-auto">
-                 <table className="w-full text-left">
-                    <thead>
-                       <tr className="bg-slate-50 text-[8px] font-black uppercase text-slate-400 border-b">
-                          <th className="px-10 py-5">Fecha / Hora</th>
-                          <th className="px-10 py-5">Tipo</th>
-                          <th className="px-10 py-5">Categoría</th>
-                          <th className="px-10 py-5">Descripción de la Operación</th>
-                          <th className="px-10 py-5 text-right">Monto (USD)</th>
-                       </tr>
-                    </thead>
-                    <tbody className="text-[11px]">
-                       {filteredLedger.length === 0 ? (
-                         <tr><td colSpan={5} className="p-32 text-center opacity-20 font-black uppercase text-xs tracking-[0.3em]">No hay actividad en el libro mayor</td></tr>
-                       ) : (
-                         filteredLedger.slice(ledgerPage * FIN_PAGE_SIZE, (ledgerPage + 1) * FIN_PAGE_SIZE).map((entry, idx) => (
-                           <tr key={idx} className="border-b border-slate-50 hover:bg-slate-50/50 transition-colors group">
-                              <td className="px-10 py-5">
-                                 <div className="font-bold text-slate-500">{entry.timestamp.toLocaleDateString()}</div>
-                                 <div className="text-[9px] text-slate-300 font-mono uppercase">{entry.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</div>
-                              </td>
-                              <td className="px-10 py-5">
-                                 <span className={`px-3 py-1 rounded-full text-[8px] font-black uppercase ${entry.type === 'INCOME' ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-700'}`}>
-                                    {entry.type === 'INCOME' ? 'Ingreso' : 'Egreso'}
-                                 </span>
-                              </td>
-                              <td className="px-10 py-5 font-black text-slate-400 uppercase tracking-widest text-[9px]">{entry.category}</td>
-                              <td className="px-10 py-5 font-black text-slate-800 uppercase tracking-tighter">{entry.description}</td>
-                              <td className={`px-10 py-5 text-right font-black text-[13px] ${entry.type === 'INCOME' ? 'text-emerald-700' : 'text-red-600'}`}>
-                                 {entry.type === 'INCOME' ? '+' : '-'} $ {entry.amountUSD.toFixed(2)}
-                              </td>
-                           </tr>
-                         ))
-                       )}
-                    </tbody>
-                 </table>
-              </div>
-              {filteredLedger.length > FIN_PAGE_SIZE && (
-                <div className="px-10 py-4 border-t border-slate-100 flex items-center justify-between">
-                  <span className="text-[10px] font-black text-slate-400 uppercase">
-                    {ledgerPage * FIN_PAGE_SIZE + 1}–{Math.min((ledgerPage + 1) * FIN_PAGE_SIZE, filteredLedger.length)} de {filteredLedger.length}
-                  </span>
-                  <div className="flex gap-2">
-                    <button onClick={() => setLedgerPage(p => Math.max(0, p - 1))} disabled={ledgerPage === 0}
-                      className="p-2 rounded-xl bg-slate-100 text-slate-600 hover:bg-slate-200 disabled:opacity-30"><ChevronLeft className="w-4 h-4" /></button>
-                    <button onClick={() => setLedgerPage(p => p + 1)} disabled={(ledgerPage + 1) * FIN_PAGE_SIZE >= filteredLedger.length}
-                      className="p-2 rounded-xl bg-slate-100 text-slate-600 hover:bg-slate-200 disabled:opacity-30"><ChevronRight className="w-4 h-4" /></button>
-                  </div>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left">
+                <thead>
+                  <tr className="bg-slate-50 text-[8px] font-black uppercase text-slate-400 border-b">
+                    <th className="px-4 py-4 lg:px-8">Cuenta</th>
+                    <th className="px-4 py-4 hidden md:table-cell">Nombre</th>
+                    <th className="px-4 py-4">Fecha</th>
+                    <th className="px-4 py-4">Tipo op.</th>
+                    <th className="px-4 py-4 min-w-[160px]">Descripción (asiento)</th>
+                    <th className="px-4 py-4 text-right">Debe</th>
+                    <th className="px-4 py-4 text-right">Haber</th>
+                    <th className="px-4 py-4 text-right">Saldo acum.</th>
+                  </tr>
+                </thead>
+                <tbody className="text-[10px]">
+                  {mayorLoading ? (
+                    <tr>
+                      <td colSpan={8} className="p-16 text-center text-slate-400 font-bold">
+                        <Loader2 className="w-6 h-6 inline animate-spin mr-2" /> Cargando mayor por cuenta…
+                      </td>
+                    </tr>
+                  ) : mayorRows.length === 0 ? (
+                    <tr>
+                      <td colSpan={8} className="p-12 text-center text-slate-400 font-bold leading-relaxed max-w-2xl mx-auto">
+                        No hay movimientos contables con el filtro indicado, o aún no existe la función{' '}
+                        <code className="text-slate-600">public.mayor_por_cuenta_saldo</code> en Supabase. Ejecute el script{' '}
+                        <code className="text-slate-600">Comandos Base de datos/RPC mayor_por_cuenta_saldo.sql</code>.
+                      </td>
+                    </tr>
+                  ) : (
+                    mayorRows
+                      .slice(ledgerPage * FIN_PAGE_SIZE, (ledgerPage + 1) * FIN_PAGE_SIZE)
+                      .map((r, idx) => (
+                        <tr key={`${r.asientoId}-${r.lineNumber}-${idx}`} className="border-b border-slate-50 hover:bg-slate-50/50">
+                          <td className="px-4 py-3 lg:px-8 font-mono font-bold text-slate-700">{r.cuentaContableCodigo}</td>
+                          <td className="px-4 py-3 hidden md:table-cell text-slate-500 uppercase text-[9px]">{r.cuentaContableNombre}</td>
+                          <td className="px-4 py-3 text-slate-600 whitespace-nowrap">{r.fecha.toLocaleString('es-VE')}</td>
+                          <td className="px-4 py-3 font-bold text-slate-500 text-[9px]">{r.tipoOperacion || '—'}</td>
+                          <td className="px-4 py-3 text-slate-800 uppercase text-[9px]">{r.descripcionAsiento || '—'}</td>
+                          <td className="px-4 py-3 text-right font-mono text-slate-700">{r.debe > 0 ? r.debe.toLocaleString('es-VE', { minimumFractionDigits: 2 }) : '—'}</td>
+                          <td className="px-4 py-3 text-right font-mono text-slate-700">{r.haber > 0 ? r.haber.toLocaleString('es-VE', { minimumFractionDigits: 2 }) : '—'}</td>
+                          <td className="px-4 py-3 text-right font-black text-slate-900">{r.saldoAcumulado.toLocaleString('es-VE', { minimumFractionDigits: 2 })}</td>
+                        </tr>
+                      ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+            {!mayorLoading && mayorRows.length > FIN_PAGE_SIZE && (
+              <div className="px-6 lg:px-10 py-4 border-t border-slate-100 flex items-center justify-between">
+                <span className="text-[10px] font-black text-slate-400 uppercase">
+                  {ledgerPage * FIN_PAGE_SIZE + 1}–{Math.min((ledgerPage + 1) * FIN_PAGE_SIZE, mayorRows.length)} de {mayorRows.length}
+                </span>
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setLedgerPage((p) => Math.max(0, p - 1))}
+                    disabled={ledgerPage === 0}
+                    className="p-2 rounded-xl bg-slate-100 text-slate-600 hover:bg-slate-200 disabled:opacity-30"
+                  >
+                    <ChevronLeft className="w-4 h-4" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setLedgerPage((p) => p + 1)}
+                    disabled={(ledgerPage + 1) * FIN_PAGE_SIZE >= mayorRows.length}
+                    className="p-2 rounded-xl bg-slate-100 text-slate-600 hover:bg-slate-200 disabled:opacity-30"
+                  >
+                    <ChevronRight className="w-4 h-4" />
+                  </button>
                 </div>
-              )}
-              <div className="p-10 bg-slate-50/30 border-t flex justify-end gap-10">
-                 <div className="text-right">
-                    <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1">Total Ingresos (filtro)</p>
-                    <p className="text-2xl font-black font-headline tracking-tighter text-emerald-600">$ {filteredLedger.filter((e: any) => e.type === 'INCOME').reduce((a: number, b: any) => a + b.amountUSD, 0).toLocaleString()}</p>
-                 </div>
-                 <div className="text-right border-l pl-10">
-                    <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1">Total Egresos (filtro)</p>
-                    <p className="text-2xl font-black font-headline tracking-tighter text-red-600">$ {filteredLedger.filter((e: any) => e.type === 'EXPENSE').reduce((a: number, b: any) => a + b.amountUSD, 0).toLocaleString()}</p>
-                 </div>
-                 <div className="text-right border-l pl-10">
-                    <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1">Balance Neto</p>
-                    <p className="text-3xl font-black font-headline tracking-tighter text-slate-900">$ {(filteredLedger.filter((e: any) => e.type === 'INCOME').reduce((a: number, b: any) => a + b.amountUSD, 0) - filteredLedger.filter((e: any) => e.type === 'EXPENSE').reduce((a: number, b: any) => a + b.amountUSD, 0)).toLocaleString()}</p>
-                 </div>
               </div>
-           </div>
+            )}
+            <div className="p-8 lg:p-10 bg-slate-50/30 border-t flex flex-col sm:flex-row flex-wrap justify-end gap-6">
+              <div className="text-right">
+                <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1">Suma Debe (filtro)</p>
+                <p className="text-xl font-black font-headline text-slate-800">
+                  {mayorRows.reduce((a, r) => a + r.debe, 0).toLocaleString('es-VE', { minimumFractionDigits: 2 })}
+                </p>
+              </div>
+              <div className="text-right sm:border-l sm:pl-6">
+                <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1">Suma Haber (filtro)</p>
+                <p className="text-xl font-black font-headline text-slate-800">
+                  {mayorRows.reduce((a, r) => a + r.haber, 0).toLocaleString('es-VE', { minimumFractionDigits: 2 })}
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <div className="bg-white rounded-[2rem] border border-slate-200 overflow-hidden shadow-sm">
+            <div className="p-6 border-b bg-slate-50/30">
+              <h4 className="font-headline font-black text-sm uppercase text-slate-700">Vista resumen (operativa)</h4>
+              <p className="text-[9px] text-slate-400 font-bold mt-1 uppercase tracking-widest">Ingresos/egresos aprox. (ventas, gastos, notas) — no reemplaza el mayor contable</p>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-left">
+                <thead>
+                  <tr className="bg-slate-50 text-[8px] font-black uppercase text-slate-400 border-b">
+                    <th className="px-6 py-4">Fecha / Hora</th>
+                    <th className="px-6 py-4">Tipo</th>
+                    <th className="px-6 py-4">Categoría</th>
+                    <th className="px-6 py-4">Descripción</th>
+                    <th className="px-6 py-4 text-right">Monto (USD)</th>
+                  </tr>
+                </thead>
+                <tbody className="text-[11px]">
+                  {filteredLedger.length === 0 ? (
+                    <tr>
+                      <td colSpan={5} className="p-12 text-center opacity-30 font-black uppercase text-xs">
+                        Sin movimientos en resumen
+                      </td>
+                    </tr>
+                  ) : (
+                    filteredLedger.map((entry, idx) => (
+                      <tr key={idx} className="border-b border-slate-50">
+                        <td className="px-6 py-4">
+                          <div className="font-bold text-slate-500">{entry.timestamp.toLocaleDateString()}</div>
+                          <div className="text-[9px] text-slate-300 font-mono uppercase">
+                            {entry.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                          </div>
+                        </td>
+                        <td className="px-6 py-4">
+                          <span
+                            className={`px-2 py-1 rounded-full text-[8px] font-black uppercase ${
+                              entry.type === 'INCOME' ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-700'
+                            }`}
+                          >
+                            {entry.type === 'INCOME' ? 'Ingreso' : 'Egreso'}
+                          </span>
+                        </td>
+                        <td className="px-6 py-4 font-black text-slate-400 uppercase text-[9px]">{entry.category}</td>
+                        <td className="px-6 py-4 text-slate-800 uppercase text-[9px]">{entry.description}</td>
+                        <td
+                          className={`px-6 py-4 text-right font-black text-[12px] ${
+                            entry.type === 'INCOME' ? 'text-emerald-700' : 'text-red-600'
+                          }`}
+                        >
+                          {entry.type === 'INCOME' ? '+' : '-'} $ {entry.amountUSD.toFixed(2)}
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+            <div className="p-6 bg-slate-50/20 border-t flex flex-wrap justify-end gap-6">
+              <div className="text-right">
+                <p className="text-[9px] font-black text-slate-400 uppercase">Total ingresos (filtro fechas resumen)</p>
+                <p className="text-lg font-black text-emerald-600">
+                  $ {filteredLedger.filter((e: any) => e.type === 'INCOME').reduce((a: number, b: any) => a + b.amountUSD, 0).toFixed(2)}
+                </p>
+              </div>
+              <div className="text-right">
+                <p className="text-[9px] font-black text-slate-400 uppercase">Total egresos</p>
+                <p className="text-lg font-black text-red-600">
+                  $ {filteredLedger.filter((e: any) => e.type === 'EXPENSE').reduce((a: number, b: any) => a + b.amountUSD, 0).toFixed(2)}
+                </p>
+              </div>
+            </div>
+          </div>
         </div>
       )}
 
@@ -3519,7 +4807,8 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
                 <div className="p-10 text-center opacity-30 font-black uppercase tracking-widest text-[10px]">Sin bancos</div>
               ) : (
                 banks.map((b: any) => {
-                  const analytics = getBankAnalytics(b.id);
+                  const analytics = getBankAnalytics(b.id, b);
+                  const prof = analytics.currencyProfile ?? 'UNKNOWN';
                   return (
                     <div
                       key={b.id}
@@ -3533,36 +4822,76 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
                           </div>
                           <div className="text-[9px] text-slate-400 font-mono mt-1">{(b.accounts || []).length} cuentas • {posTerminals.filter((t: any) => String(t?.bankId ?? '') === String(b.id ?? '')).length} POS • {(b.supportedMethods || []).length} métodos</div>
                           
-                          {/* Mayor Analítico */}
+                          {/* Mayor analítico: bancos solo-USD (Zelle, Efectivo USD, etc.) sin saldo equivalente en Bs */}
                           <div className="mt-3 p-3 bg-slate-50 rounded-xl space-y-2">
-                            <div className="grid grid-cols-2 gap-3 text-[10px]">
+                            {prof === 'USD_ONLY' && (
                               <div>
-                                <div className="text-slate-400 uppercase tracking-wider">Saldo USD</div>
-                                <div className={`font-black ${analytics.balanceUSD >= 0 ? 'text-emerald-600' : 'text-red-600'}`}>
-                                  ${analytics.balanceUSD.toFixed(2)}
+                                <div className="text-slate-400 uppercase tracking-wider text-[10px]">Saldo (USD)</div>
+                                <div className={`font-black text-[13px] ${analytics.balanceUSD >= 0 ? 'text-emerald-600' : 'text-red-600'}`}>
+                                  {usd(analytics.balanceUSD, 2)}
+                                </div>
+                                <div className="text-[8px] text-slate-400 font-bold uppercase tracking-wider mt-0.5">Cuentas en dólares — sin Bs</div>
+                              </div>
+                            )}
+                            {prof === 'VES_ONLY' && (
+                              <div>
+                                <div className="text-slate-400 uppercase tracking-wider text-[10px]">Saldo (Bs)</div>
+                                <div className={`font-black text-[13px] ${analytics.balanceVES >= 0 ? 'text-emerald-600' : 'text-red-600'}`}>
+                                  {bs(analytics.balanceVES, 2)}
+                                </div>
+                                <div className="text-[8px] text-slate-400 font-bold uppercase tracking-wider mt-0.5">Cuentas en bolívares — sin USD</div>
+                              </div>
+                            )}
+                            {(prof === 'MIXED' || prof === 'UNKNOWN') && (
+                              <div className="grid grid-cols-2 gap-3 text-[10px]">
+                                <div>
+                                  <div className="text-slate-400 uppercase tracking-wider">Saldo USD</div>
+                                  <div className={`font-black ${analytics.balanceUSD >= 0 ? 'text-emerald-600' : 'text-red-600'}`}>
+                                    ${fmt(analytics.balanceUSD, 2)}
+                                  </div>
+                                </div>
+                                <div>
+                                  <div className="text-slate-400 uppercase tracking-wider">Saldo Bs</div>
+                                  <div className={`font-black ${analytics.balanceVES >= 0 ? 'text-emerald-600' : 'text-red-600'}`}>
+                                    {bs(analytics.balanceVES, 2)}
+                                  </div>
                                 </div>
                               </div>
-                              <div>
-                                <div className="text-slate-400 uppercase tracking-wider">Saldo Bs</div>
-                                <div className={`font-black ${analytics.balanceVES >= 0 ? 'text-emerald-600' : 'text-red-600'}`}>
-                                  Bs {analytics.balanceVES.toFixed(2)}
-                                </div>
-                              </div>
-                            </div>
+                            )}
                             <div className="grid grid-cols-3 gap-2 text-[9px] text-slate-500">
-                              <div>
-                                <div className="uppercase">Ingresos</div>
-                                <div className="font-bold text-emerald-600">${analytics.totalInUSD.toFixed(2)}</div>
-                              </div>
-                              <div>
-                                <div className="uppercase">Egresos</div>
-                                <div className="font-bold text-red-600">${analytics.totalOutUSD.toFixed(2)}</div>
-                              </div>
+                              {prof === 'VES_ONLY' ? (
+                                <>
+                                  <div>
+                                    <div className="uppercase">Ingresos</div>
+                                    <div className="font-bold text-emerald-600">{bs(analytics.totalInVES, 2)}</div>
+                                  </div>
+                                  <div>
+                                    <div className="uppercase">Egresos</div>
+                                    <div className="font-bold text-red-600">{bs(analytics.totalOutVES, 2)}</div>
+                                  </div>
+                                </>
+                              ) : (
+                                <>
+                                  <div>
+                                    <div className="uppercase">Ingresos</div>
+                                    <div className="font-bold text-emerald-600">${fmt(analytics.totalInUSD, 2)}</div>
+                                  </div>
+                                  <div>
+                                    <div className="uppercase">Egresos</div>
+                                    <div className="font-bold text-red-600">${fmt(analytics.totalOutUSD, 2)}</div>
+                                  </div>
+                                </>
+                              )}
                               <div>
                                 <div className="uppercase">Movs</div>
                                 <div className="font-bold">{analytics.transactionCount}</div>
                               </div>
                             </div>
+                            {prof === 'MIXED' && (analytics.totalInVES + analytics.totalOutVES > 0.01) && (
+                              <div className="text-[9px] text-slate-500 font-mono">
+                                Flujo Bs: +{fmt(analytics.totalInVES, 2)} / −{fmt(Math.abs(analytics.totalOutVES), 2)}
+                              </div>
+                            )}
                             {analytics.lastTransaction && (
                               <div className="text-[8px] text-slate-400">
                                 Último: {analytics.lastTransaction.toLocaleDateString()}
@@ -3873,39 +5202,92 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
                 </div>
               ) : (
                 <>
-                  <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
-                    <div className="p-5 rounded-2xl border border-slate-200 bg-slate-50/40">
-                      <div className="text-[9px] font-black uppercase tracking-widest text-slate-400">Total USD</div>
-                      <div className="text-2xl font-black font-mono text-emerald-700">
-                        $ {bankTxList.reduce((a: number, b: any) => a + Number(b.amountUSD ?? 0), 0).toFixed(2)}
+                  {bankTxModalProfile === 'USD_ONLY' && (
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+                      <div className="p-5 rounded-2xl border border-slate-200 bg-slate-50/40">
+                        <div className="text-[9px] font-black uppercase tracking-widest text-slate-400">Total USD</div>
+                        <div className="text-2xl font-black font-mono text-emerald-700">
+                          {usd(bankTxList.reduce((a: number, b: any) => a + Number(b.amountUSD ?? 0), 0), 2)}
+                        </div>
+                        <div className="text-[8px] text-slate-400 font-bold uppercase tracking-widest mt-1">Solo dólares</div>
+                      </div>
+                      <div className="p-5 rounded-2xl border border-emerald-200 bg-emerald-50/40">
+                        <div className="text-[9px] font-black uppercase tracking-widest text-emerald-600">Conciliado</div>
+                        <div className="text-2xl font-black font-mono text-emerald-700">
+                          {usd(bankTxList.filter((b: any) => b.reconciled).reduce((a: number, b: any) => a + Number(b.amountUSD ?? 0), 0), 2)}
+                        </div>
+                        <div className="text-[9px] text-emerald-500 font-bold mt-1">{bankTxList.filter((b: any) => b.reconciled).length} / {bankTxList.length} movimientos</div>
+                      </div>
+                      <div className="p-5 rounded-2xl border border-amber-200 bg-amber-50/40">
+                        <div className="text-[9px] font-black uppercase tracking-widest text-amber-600">Sin conciliar</div>
+                        <div className="text-2xl font-black font-mono text-amber-700">
+                          {usd(bankTxList.filter((b: any) => !b.reconciled).reduce((a: number, b: any) => a + Number(b.amountUSD ?? 0), 0), 2)}
+                        </div>
                       </div>
                     </div>
-                    <div className="p-5 rounded-2xl border border-emerald-200 bg-emerald-50/40">
-                      <div className="text-[9px] font-black uppercase tracking-widest text-emerald-600">Conciliado</div>
-                      <div className="text-2xl font-black font-mono text-emerald-700">
-                        $ {bankTxList.filter((b: any) => b.reconciled).reduce((a: number, b: any) => a + Number(b.amountUSD ?? 0), 0).toFixed(2)}
+                  )}
+                  {bankTxModalProfile === 'VES_ONLY' && (
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+                      <div className="p-5 rounded-2xl border border-slate-200 bg-slate-50/40">
+                        <div className="text-[9px] font-black uppercase tracking-widest text-slate-400">Total Bs</div>
+                        <div className="text-2xl font-black font-mono text-slate-900">
+                          {bs(bankTxList.reduce((a: number, b: any) => a + Number(b.amountVES ?? 0), 0), 2)}
+                        </div>
                       </div>
-                      <div className="text-[9px] text-emerald-500 font-bold mt-1">{bankTxList.filter((b: any) => b.reconciled).length} / {bankTxList.length} movimientos</div>
-                    </div>
-                    <div className="p-5 rounded-2xl border border-amber-200 bg-amber-50/40">
-                      <div className="text-[9px] font-black uppercase tracking-widest text-amber-600">Sin Conciliar</div>
-                      <div className="text-2xl font-black font-mono text-amber-700">
-                        $ {bankTxList.filter((b: any) => !b.reconciled).reduce((a: number, b: any) => a + Number(b.amountUSD ?? 0), 0).toFixed(2)}
+                      <div className="p-5 rounded-2xl border border-emerald-200 bg-emerald-50/40">
+                        <div className="text-[9px] font-black uppercase tracking-widest text-emerald-600">Conciliado (Bs)</div>
+                        <div className="text-2xl font-black font-mono text-emerald-700">
+                          {bs(bankTxList.filter((b: any) => b.reconciled).reduce((a: number, b: any) => a + Number(b.amountVES ?? 0), 0), 2)}
+                        </div>
+                        <div className="text-[9px] text-emerald-500 font-bold mt-1">{bankTxList.filter((b: any) => b.reconciled).length} / {bankTxList.length} movimientos</div>
+                      </div>
+                      <div className="p-5 rounded-2xl border border-amber-200 bg-amber-50/40">
+                        <div className="text-[9px] font-black uppercase tracking-widest text-amber-600">Sin conciliar (Bs)</div>
+                        <div className="text-2xl font-black font-mono text-amber-700">
+                          {bs(bankTxList.filter((b: any) => !b.reconciled).reduce((a: number, b: any) => a + Number(b.amountVES ?? 0), 0), 2)}
+                        </div>
+                      </div>
+                      <div className="p-5 rounded-2xl border border-blue-200 bg-blue-50/40">
+                        <div className="text-[9px] font-black uppercase tracking-widest text-blue-600">Equiv. USD (Σ mov.)</div>
+                        <div className="text-2xl font-black font-mono text-blue-800">
+                          {usd(
+                            (bankTxList.reduce((a: number, b: any) => a + Number(b.amountVES ?? 0), 0)) / financeInternalRate,
+                            2
+                          )}
+                        </div>
+                        <div className="text-[8px] text-blue-500 font-bold mt-1">Según tasa interna del sistema</div>
                       </div>
                     </div>
-                    <div className="p-5 rounded-2xl border border-slate-200 bg-slate-50/40">
-                      <div className="text-[9px] font-black uppercase tracking-widest text-slate-400">Total Bs</div>
-                      <div className="text-2xl font-black font-mono text-slate-900">
-                        Bs {bankTxList.reduce((a: number, b: any) => a + Number(b.amountVES ?? 0), 0).toFixed(2)}
+                  )}
+                  {(bankTxModalProfile === 'MIXED' || bankTxModalProfile === 'UNKNOWN') && (
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+                      <div className="p-5 rounded-2xl border border-slate-200 bg-slate-50/40">
+                        <div className="text-[9px] font-black uppercase tracking-widest text-slate-400">Total USD</div>
+                        <div className="text-2xl font-black font-mono text-emerald-700">
+                          {usd(bankTxList.reduce((a: number, b: any) => a + Number(b.amountUSD ?? 0), 0), 2)}
+                        </div>
+                      </div>
+                      <div className="p-5 rounded-2xl border border-emerald-200 bg-emerald-50/40">
+                        <div className="text-[9px] font-black uppercase tracking-widest text-emerald-600">Conciliado</div>
+                        <div className="text-2xl font-black font-mono text-emerald-700">
+                          {usd(bankTxList.filter((b: any) => b.reconciled).reduce((a: number, b: any) => a + Number(b.amountUSD ?? 0), 0), 2)}
+                        </div>
+                        <div className="text-[9px] text-emerald-500 font-bold mt-1">{bankTxList.filter((b: any) => b.reconciled).length} / {bankTxList.length} movimientos</div>
+                      </div>
+                      <div className="p-5 rounded-2xl border border-amber-200 bg-amber-50/40">
+                        <div className="text-[9px] font-black uppercase tracking-widest text-amber-600">Sin conciliar</div>
+                        <div className="text-2xl font-black font-mono text-amber-700">
+                          {usd(bankTxList.filter((b: any) => !b.reconciled).reduce((a: number, b: any) => a + Number(b.amountUSD ?? 0), 0), 2)}
+                        </div>
+                      </div>
+                      <div className="p-5 rounded-2xl border border-slate-200 bg-slate-50/40">
+                        <div className="text-[9px] font-black uppercase tracking-widest text-slate-400">Total Bs</div>
+                        <div className="text-2xl font-black font-mono text-slate-900">
+                          {bs(bankTxList.reduce((a: number, b: any) => a + Number(b.amountVES ?? 0), 0), 2)}
+                        </div>
                       </div>
                     </div>
-                    <div className="p-5 rounded-2xl border border-slate-200 bg-slate-50/40 hidden">
-                      <div className="text-[9px] font-black uppercase tracking-widest text-slate-400">Operaciones</div>
-                      <div className="text-2xl font-black font-mono text-slate-900">
-                        {bankTxList.length}
-                      </div>
-                    </div>
-                  </div>
+                  )}
 
                   {bankTxList.length === 0 ? (
                     <div className="p-12 text-center opacity-30 font-black uppercase tracking-widest text-[10px]">Sin movimientos</div>
@@ -3914,7 +5296,10 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
                       {bankTxList.map((t: any) => {
                         const src = String(t.source ?? '').trim().toUpperCase();
                         const isPurchaseTx = src === 'PURCHASE_PAYMENT';
-                        const isEgreso = src === 'PURCHASE_PAYMENT' || src === 'AP_PAYMENT' || src === 'SALE_RETURN' || Number(t.amountUSD ?? 0) < 0;
+                        const isEgreso =
+                          src === 'PURCHASE_PAYMENT' || src === 'AP_PAYMENT' || src === 'SALE_RETURN'
+                          || Number(t.amountUSD ?? 0) < 0
+                          || (String(t.currency ?? '').toUpperCase() === 'VES' && Number(t.amountVES ?? 0) < 0);
                         const sourceLabelMap: Record<string, string> = {
                           SALE_PAYMENT: 'Cobro de venta',
                           CREDIT_DOWN: 'Abono a crédito',
@@ -3922,7 +5307,7 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
                           AP_PAYMENT: 'Pago CxP',
                           PURCHASE_PAYMENT: 'Pago de compra',
                           SALE_RETURN: 'Devolución de venta',
-                          MANUAL_ENTRY: 'Entrada manual',
+                          MANUAL_ENTRY: isEgreso ? 'Salida manual' : 'Entrada manual',
                         };
                         const sourceLabel = sourceLabelMap[src] ?? src;
                         const supplierName = String(t.customerName ?? '').trim();
@@ -3992,17 +5377,61 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
                                 )}
                               </div>
                               <div className="text-right shrink-0 flex flex-col items-end gap-2">
-                                <div className={`text-[13px] font-black font-mono ${Number(t.amountUSD ?? 0) < 0 ? 'text-red-600' : 'text-emerald-700'}`}>$ {Number(t.amountUSD ?? 0).toFixed(2)}</div>
-                                {String(t.currency ?? '') === 'VES' && (
-                                  <div className={`text-[11px] font-black font-mono ${Number(t.amountVES ?? 0) < 0 ? 'text-red-500' : 'text-slate-700'}`}>Bs {Number(t.amountVES ?? 0).toFixed(2)} @ {Number(t.rateUsed ?? 0).toFixed(2)}</div>
+                                {bankTxModalProfile === 'USD_ONLY' && (
+                                  <div className={`text-[13px] font-black font-mono ${Number(t.amountUSD ?? 0) < 0 ? 'text-red-600' : 'text-emerald-700'}`}>
+                                    {usd(Number(t.amountUSD ?? 0), 2)}
+                                  </div>
+                                )}
+                                {bankTxModalProfile === 'VES_ONLY' && (
+                                  <>
+                                    <div className={`text-[13px] font-black font-mono ${Number(t.amountVES ?? 0) < 0 ? 'text-red-600' : 'text-slate-900'}`}>
+                                      {bs(Number(t.amountVES ?? 0), 2)}
+                                    </div>
+                                    <div className="text-[10px] font-bold text-slate-500 max-w-[220px]">
+                                      ≈ {usd(bankTxVesToEquivUsd(t), 2)}
+                                      {Number(t.rateUsed ?? 0) > 0 && (
+                                        <span className="text-slate-400 font-mono block sm:inline sm:ml-1">
+                                          (Tasa {Number(t.rateUsed).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 4 })})
+                                        </span>
+                                      )}
+                                    </div>
+                                  </>
+                                )}
+                                {(bankTxModalProfile === 'MIXED' || bankTxModalProfile === 'UNKNOWN') && (
+                                  <>
+                                    <div className={`text-[13px] font-black font-mono ${Number(t.amountUSD ?? 0) < 0 ? 'text-red-600' : 'text-emerald-700'}`}>
+                                      {usd(Number(t.amountUSD ?? 0), 2)}
+                                    </div>
+                                    {String(t.currency ?? '').toUpperCase() === 'VES' && (
+                                      <>
+                                        <div className={`text-[11px] font-black font-mono ${Number(t.amountVES ?? 0) < 0 ? 'text-red-500' : 'text-slate-700'}`}>
+                                          {bs(Number(t.amountVES ?? 0), 2)} @ {Number(t.rateUsed ?? 0).toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                        </div>
+                                        <div className="text-[9px] font-bold text-slate-500">
+                                          ≈ {usd(bankTxVesToEquivUsd(t), 2)} ref. mov.
+                                        </div>
+                                      </>
+                                    )}
+                                  </>
                                 )}
                                 <button
                                   onClick={async (e) => {
                                     e.stopPropagation();
                                     if (!t.id) return;
+                                    const isUnreconcile = !!t.reconciled;
+                                    let approvalPin = '';
+                                    if (isUnreconcile) {
+                                      const inputPin = window.prompt('Para desconciliar ingrese clave de Presidente o Gerente:') ?? '';
+                                      approvalPin = String(inputPin).trim();
+                                      if (!approvalPin) return;
+                                    }
                                     setBankTxList(prev => prev.map(tx => tx.id === t.id ? { ...tx, reconciled: !tx.reconciled } : tx));
-                                    try { await dataService.toggleBankTransactionReconciled(t.id, !!t.reconciled); }
-                                    catch { setBankTxList(prev => prev.map(tx => tx.id === t.id ? { ...tx, reconciled: !!t.reconciled } : tx)); }
+                                    try {
+                                      await dataService.toggleBankTransactionReconciled(t.id, !!t.reconciled, approvalPin);
+                                    } catch (err: any) {
+                                      setBankTxList(prev => prev.map(tx => tx.id === t.id ? { ...tx, reconciled: !!t.reconciled } : tx));
+                                      alert(String(err?.message ?? 'No se pudo actualizar la conciliación.'));
+                                    }
                                   }}
                                   className={`flex items-center gap-1 px-2 py-1 rounded-lg text-[8px] font-black uppercase transition-all border ${
                                     t.reconciled
@@ -5154,21 +6583,48 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
                   <label className="text-[8px] font-black uppercase tracking-widest text-slate-400 block mb-1">Método</label>
                   <select
                     value={arCollectMethod}
-                    onChange={e => setArCollectMethod(e.target.value)}
+                    onChange={async (e) => {
+                      const v = e.target.value;
+                      setArCollectMethod(v);
+                      if (v === 'Otros' && arCollectTarget?.customerId) {
+                        setArCollectAdvanceBalance(null);
+                        try {
+                          const b = await dataService.getClientAdvanceBalance(String(arCollectTarget.customerId));
+                          setArCollectAdvanceBalance(Number(b) || 0);
+                        } catch {
+                          setArCollectAdvanceBalance(0);
+                        }
+                      }
+                    }}
                     className="w-full bg-slate-50 border-2 border-slate-200 focus:border-emerald-400 rounded-xl px-3 py-2.5 text-[11px] font-black outline-none"
                   >
-                    {['Transferencia','Pago Móvil','Efectivo USD','Efectivo Bs','Zelle','Cheque','Débito'].map(m => (
+                    {['Transferencia','Pago Móvil','Efectivo USD','Efectivo Bs','Zelle','Cheque','Débito','Otros'].map(m => (
                       <option key={m} value={m}>{m}</option>
                     ))}
                   </select>
                 </div>
               </div>
+              {arCollectMethod === 'Otros' && (
+                <div className="rounded-xl border border-amber-200 bg-amber-50/90 px-3 py-2.5 text-[10px] text-amber-950 space-y-1">
+                  <p className="font-black uppercase tracking-widest text-[9px] text-amber-800">Otros — cruce con anticipo del cliente</p>
+                  <p className="font-bold leading-snug">
+                    {arCollectAdvanceBalance === null
+                      ? 'Consultando saldo a favor…'
+                      : (arCollectAdvanceBalance ?? 0) < 0.01
+                        ? 'Este cliente no tiene anticipos disponibles. Use otro método o registre un anticipo en Finanzas → Anticipos.'
+                        : `Saldo anticipos disponible: $${(arCollectAdvanceBalance ?? 0).toFixed(2)} · Se descontará de anticipos y se abonará a esta factura (sin movimiento de caja).`}
+                  </p>
+                </div>
+              )}
               <div>
-                <label className="text-[8px] font-black uppercase tracking-widest text-slate-400 block mb-1">Banco / Entidad</label>
+                <label className="text-[8px] font-black uppercase tracking-widest text-slate-400 block mb-1">
+                  Banco / Entidad {arCollectMethod === 'Otros' ? <span className="text-slate-400 font-bold normal-case">(opcional)</span> : null}
+                </label>
                 <input
                   type="text" value={arCollectBank} onChange={e => setArCollectBank(e.target.value)}
-                  placeholder="Ej: Banesco, Mercantil..."
-                  className="w-full bg-slate-50 border-2 border-slate-200 focus:border-emerald-400 rounded-xl px-3 py-2 text-[11px] font-black outline-none"
+                  placeholder={arCollectMethod === 'Otros' ? 'No requiere banco al usar anticipo' : 'Ej: Banesco, Mercantil...'}
+                  disabled={arCollectMethod === 'Otros'}
+                  className="w-full bg-slate-50 border-2 border-slate-200 focus:border-emerald-400 rounded-xl px-3 py-2 text-[11px] font-black outline-none disabled:opacity-50 disabled:cursor-not-allowed"
                 />
               </div>
               <div>
@@ -5192,13 +6648,21 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
               )}
               <div className="flex gap-2 pt-1">
                 <button
-                  onClick={() => { setShowARCollectModal(false); setArCollectTarget(null); }}
+                  onClick={() => {
+                    setShowARCollectModal(false);
+                    setArCollectTarget(null);
+                    setArCollectAdvanceBalance(null);
+                  }}
                   disabled={arCollectSubmitting}
                   className="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-600 rounded-2xl text-[10px] font-black uppercase tracking-widest transition-all"
                 >Cancelar</button>
                 <button
                   onClick={handleARCollectSubmit}
-                  disabled={arCollectSubmitting || !arCollectAmount}
+                  disabled={
+                    arCollectSubmitting ||
+                    !arCollectAmount ||
+                    (arCollectMethod === 'Otros' && (arCollectAdvanceBalance ?? 0) < 0.01)
+                  }
                   className="flex-1 py-2.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-2xl text-[10px] font-black uppercase tracking-widest transition-all flex items-center justify-center gap-2"
                 >
                   {arCollectSubmitting ? <><Loader2 className="w-4 h-4 animate-spin" /> Registrando...</> : 'Registrar Pago'}
@@ -5229,9 +6693,80 @@ export function FinanceView({ exchangeRate = 36.50, onStartARCollection }: { exc
                 <Printer className="w-4 h-4" /> Imprimir Recibo
               </button>
               <button
-                onClick={() => { setShowARCollectModal(false); setArCollectTarget(null); setArCollectLastReceipt(null); }}
+                onClick={() => {
+                  setShowARCollectModal(false);
+                  setArCollectTarget(null);
+                  setArCollectLastReceipt(null);
+                  setArCollectAdvanceBalance(null);
+                }}
                 className="w-full py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-2xl text-[10px] font-black uppercase tracking-widest transition-all"
               >Cerrar</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showCreateLoanModal && (
+        <div className="fixed inset-0 z-[120] bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="w-full max-w-2xl rounded-3xl border border-slate-200 bg-white shadow-2xl overflow-hidden">
+            <div className="px-6 py-4 border-b border-slate-100 bg-slate-50/70 flex items-center justify-between">
+              <div>
+                <p className="text-[9px] font-black uppercase tracking-widest text-emerald-600">Préstamos internos</p>
+                <h4 className="font-headline font-black text-lg uppercase tracking-tight text-slate-900">Registrar préstamo (trabajador/socio)</h4>
+              </div>
+              <button
+                onClick={() => { if (!loanSubmitting) setShowCreateLoanModal(false); }}
+                className="p-2 rounded-xl bg-white border border-slate-200 text-slate-500 hover:bg-slate-100"
+                disabled={loanSubmitting}
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="p-6 grid grid-cols-1 md:grid-cols-2 gap-3">
+              <label className="text-[10px] font-black uppercase text-slate-500">Tipo beneficiario
+                <select
+                  value={loanForm.beneficiaryType}
+                  onChange={(e) => setLoanForm((p) => ({ ...p, beneficiaryType: e.target.value as CompanyLoan['beneficiaryType'] }))}
+                  className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 text-[11px] font-bold"
+                >
+                  <option value="EMPLOYEE">Trabajador</option>
+                  <option value="PARTNER">Socio</option>
+                </select>
+              </label>
+              <label className="text-[10px] font-black uppercase text-slate-500">Nombre
+                <input value={loanForm.beneficiaryName} onChange={(e) => setLoanForm((p) => ({ ...p, beneficiaryName: e.target.value }))} className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 text-[11px] font-bold" placeholder="Nombre completo" />
+              </label>
+              <label className="text-[10px] font-black uppercase text-slate-500">Documento / ID
+                <input value={loanForm.beneficiaryId} onChange={(e) => setLoanForm((p) => ({ ...p, beneficiaryId: e.target.value }))} className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 text-[11px] font-bold" placeholder="Cédula o identificador" />
+              </label>
+              <label className="text-[10px] font-black uppercase text-slate-500">Monto USD
+                <input type="number" min="0.01" step="0.01" value={loanForm.amountUSD} onChange={(e) => setLoanForm((p) => ({ ...p, amountUSD: e.target.value }))} className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 text-[11px] font-bold" placeholder="0.00" />
+              </label>
+              <label className="text-[10px] font-black uppercase text-slate-500 md:col-span-2">Concepto
+                <input value={loanForm.description} onChange={(e) => setLoanForm((p) => ({ ...p, description: e.target.value }))} className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 text-[11px] font-bold" placeholder="Motivo del préstamo" />
+              </label>
+              <label className="text-[10px] font-black uppercase text-slate-500">Plazo (días)
+                <input type="number" min="1" step="1" value={loanForm.daysToPay} onChange={(e) => setLoanForm((p) => ({ ...p, daysToPay: e.target.value }))} className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 text-[11px] font-bold" />
+              </label>
+              <label className="text-[10px] font-black uppercase text-slate-500">Método salida
+                <input value={loanForm.sourceMethod} onChange={(e) => setLoanForm((p) => ({ ...p, sourceMethod: e.target.value }))} className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 text-[11px] font-bold" placeholder="Transferencia / Efectivo / Zelle..." />
+              </label>
+              <label className="text-[10px] font-black uppercase text-slate-500">Banco (opcional)
+                <input value={loanForm.sourceBankName} onChange={(e) => setLoanForm((p) => ({ ...p, sourceBankName: e.target.value }))} className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 text-[11px] font-bold" placeholder="Banco origen" />
+              </label>
+              <label className="text-[10px] font-black uppercase text-slate-500">Referencia
+                <input value={loanForm.reference} onChange={(e) => setLoanForm((p) => ({ ...p, reference: e.target.value }))} className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 text-[11px] font-bold" placeholder="Referencia bancaria/documento" />
+              </label>
+              <label className="text-[10px] font-black uppercase text-slate-500 md:col-span-2">Nota
+                <input value={loanForm.note} onChange={(e) => setLoanForm((p) => ({ ...p, note: e.target.value }))} className="mt-1 w-full rounded-xl border border-slate-200 px-3 py-2 text-[11px] font-bold" placeholder="Observación para auditoría" />
+              </label>
+              {loanError && <div className="md:col-span-2 text-[10px] font-black text-red-600 bg-red-50 border border-red-200 rounded-xl px-3 py-2">{loanError}</div>}
+            </div>
+            <div className="px-6 py-4 border-t border-slate-100 bg-slate-50/60 flex justify-end gap-2">
+              <button onClick={() => setShowCreateLoanModal(false)} className="px-4 py-2 rounded-xl border border-slate-200 text-[10px] font-black uppercase text-slate-600 bg-white hover:bg-slate-100" disabled={loanSubmitting}>Cancelar</button>
+              <button onClick={handleCreateLoan} className="px-4 py-2 rounded-xl text-[10px] font-black uppercase text-white bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60" disabled={loanSubmitting}>
+                {loanSubmitting ? 'Guardando...' : 'Registrar préstamo'}
+              </button>
             </div>
           </div>
         </div>

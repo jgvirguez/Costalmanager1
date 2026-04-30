@@ -730,7 +730,21 @@ export function DashboardView({ exchangeRates, accountingAlerts = [] }: { exchan
                   const product = dataService.getStocks().find(p => p.code === mov.sku);
                   const isVenta = mov.type === 'SALE' || mov.qty < 0;
                   const isCompra = mov.type === 'IN' || mov.type === 'PURCHASE' || (mov.qty > 0 && mov.type !== 'FRACTION');
-                  const totalUSD = product ? Math.abs(mov.qty) * product.priceUSD : null;
+                  const batch = product?.lotes?.find((l: any) => String(l.id ?? '') === String(mov.batchId ?? ''));
+                  const weightedCostUSD = product?.lotes?.length
+                    ? (() => {
+                        const totals = product.lotes.reduce((acc: { qty: number; cost: number }, lote: any) => {
+                          const qty = Number(lote?.qty ?? 0) || 0;
+                          const cost = Number(lote?.costUSD ?? 0) || 0;
+                          acc.qty += qty;
+                          acc.cost += qty * cost;
+                          return acc;
+                        }, { qty: 0, cost: 0 });
+                        return totals.qty > 0 ? (totals.cost / totals.qty) : 0;
+                      })()
+                    : 0;
+                  const unitCostUSD = Number(batch?.costUSD ?? weightedCostUSD ?? 0) || 0;
+                  const totalUSD = product ? Math.abs(mov.qty) * unitCostUSD : null;
                   const accentColor = isVenta ? 'bg-emerald-50 border-emerald-200' : isCompra ? 'bg-red-50 border-red-200' : 'bg-blue-50 border-blue-100';
                   const labelColor = isVenta ? 'text-emerald-700' : isCompra ? 'text-red-700' : 'text-blue-700';
                   const tipoLabel = isVenta ? 'VENTA / SALIDA' : isCompra ? 'COMPRA / ENTRADA' : mov.type;
@@ -766,7 +780,7 @@ export function DashboardView({ exchangeRates, accountingAlerts = [] }: { exchan
                             ? <p className={`text-[15px] font-black ${isVenta ? 'text-emerald-700' : 'text-red-700'}`}>${totalUSD.toFixed(2)}</p>
                             : <p className="text-[11px] font-black text-slate-400">—</p>
                           }
-                          {product && <p className="text-[8px] text-slate-400">@ ${product.priceUSD.toFixed(2)} c/u</p>}
+                          {product && <p className="text-[8px] text-slate-400">@ ${unitCostUSD.toFixed(2)} costo/u</p>}
                         </div>
                         {/* Almacén origen/destino */}
                         <div className="col-span-2 bg-white/70 rounded-xl p-3">
