@@ -1926,7 +1926,7 @@ export class DataService {
     };
   }
 
-  private async getAvailableBankBalance(input: {
+  async getAvailableBankBalance(input: {
     bankId?: string;
     accountId?: string;
     currency?: 'USD' | 'VES';
@@ -1936,15 +1936,27 @@ export class DataService {
     const currency = (input?.currency === 'VES' ? 'VES' : 'USD') as 'USD' | 'VES';
     if (!bankId) return 0;
 
+    const OUTFLOW_SOURCES = new Set([
+      'AP_PAYMENT', 'PURCHASE_PAYMENT', 'PAYROLL', 'EXPENSE',
+      'MANUAL_OUT', 'LOAN_OUT', 'TRANSFER_OUT', 'ADVANCE_OUT'
+    ]);
+    const INFLOW_SOURCES = new Set([
+      'SALE', 'AR_PAYMENT', 'MANUAL_IN', 'TRANSFER_IN',
+      'ADVANCE_IN', 'LOAN_REPAYMENT', 'DEPOSIT'
+    ]);
+
     const constraints: any[] = [where('bankId', '==', bankId)];
     if (accountId) constraints.push(where('accountId', '==', accountId));
 
-    const OUTFLOW_SOURCES = new Set(['AP_PAYMENT', 'PURCHASE_PAYMENT']);
     const snap = await getDocs(query(collection(db, 'bank_transactions'), ...constraints));
     return snap.docs.reduce((acc, d) => {
       const row: any = d.data() || {};
+      const source = String(row?.source ?? '').trim().toUpperCase();
+      const txType = String(row?.type ?? '').trim().toUpperCase();
       const amount = Number(currency === 'VES' ? row?.amountVES ?? 0 : row?.amountUSD ?? 0);
-      const sign = OUTFLOW_SOURCES.has(String(row?.source ?? '')) ? -1 : 1;
+      let sign = 0;
+      if (OUTFLOW_SOURCES.has(source) || txType === 'OUT') sign = -1;
+      else if (INFLOW_SOURCES.has(source) || txType === 'IN') sign = 1;
       return acc + sign * amount;
     }, 0);
   }

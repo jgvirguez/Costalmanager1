@@ -45,6 +45,7 @@ import { buildExcelFriendlyCsv } from '../../utils/csvExport';
 import { PurchaseEntryModal } from '../modals/PurchaseEntryModal';
 import { ConfirmModal } from '../ConfirmModal';
 import { BillingClient } from '../../types/billing';
+import { useBankBalances } from '../../hooks/useBankBalances';
 
 const CheckIcon = CheckCircle2;
 
@@ -924,6 +925,18 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
   const [allBankTransactions, setAllBankTransactions] = useState<any[]>([]);
 
   const activeBanks = React.useMemo(() => (banks || []).filter((bank: any) => bank?.active !== false), [banks]);
+
+  const payrollBalanceKeys = useMemo(() =>
+    payrollLines
+      .filter(l => l.bankId)
+      .map(l => ({
+        bankId: l.bankId,
+        accountId: l.accountId,
+        currency: (l.method === 'cash_usd' || l.method === 'zelle' ? 'USD' : 'VES') as 'USD' | 'VES'
+      })),
+    [payrollLines]
+  );
+  const payrollBankBalances = useBankBalances(payrollBalanceKeys);
   const getAPPaymentBankOptions = (method: string) => activeBanks.filter((bank: any) => {
     const supportedMethods = Array.isArray(bank?.supportedMethods) ? bank.supportedMethods : [];
     return supportedMethods.length === 0 || supportedMethods.includes(method);
@@ -4611,6 +4624,22 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
         const cxcUSDCalc = totalCxcDesc > 0 ? totalCxcDesc : payrollCxcUSD;
         const netoCalc = Math.max(0, payrollSalaryNum - cxcUSDCalc);
         const pendCalc = Math.max(0, netoCalc - payrollTotalPaid);
+        const payrollHasInsufficientBalance = payrollLines.some(l => {
+          if (!l.bankId) return false;
+          const balKey = `${l.bankId}::${l.accountId}`;
+          const bal = payrollBankBalances.get(balKey);
+          if (!bal || bal.loading || bal.error) return false;
+          const lineAmt = l.currency === 'BS' ? (parseFloat(l.amountBS) || 0) : (parseFloat(l.amountUSD) || 0);
+          return lineAmt > 0 && lineAmt > bal.balance;
+        });
+        const payrollInsufficientLine = payrollLines.find(l => {
+          if (!l.bankId) return false;
+          const balKey = `${l.bankId}::${l.accountId}`;
+          const bal = payrollBankBalances.get(balKey);
+          if (!bal || bal.loading || bal.error) return false;
+          const lineAmt = l.currency === 'BS' ? (parseFloat(l.amountBS) || 0) : (parseFloat(l.amountUSD) || 0);
+          return lineAmt > 0 && lineAmt > bal.balance;
+        });
         return (
           <div className="fixed inset-0 z-[600] bg-black/60 backdrop-blur-sm flex items-start justify-center p-4 overflow-y-auto">
             <div className="bg-white rounded-3xl shadow-2xl w-full max-w-2xl my-6 overflow-hidden border border-slate-100">
@@ -4954,6 +4983,36 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
                               </div>
                             </div>
                           )}
+                          {/* Saldo disponible del banco seleccionado */}
+                          {line.bankId && (() => {
+                            const balKey = `${line.bankId}::${line.accountId}`;
+                            const bal = payrollBankBalances.get(balKey);
+                            const balCurr = (line.method === 'cash_usd' || line.method === 'zelle') ? 'USD' : 'VES';
+                            const lineAmt = line.currency === 'BS'
+                              ? parseFloat(line.amountBS) || 0
+                              : parseFloat(line.amountUSD) || 0;
+                            const exceeds = bal && !bal.loading && lineAmt > 0 && lineAmt > bal.balance;
+                            if (!bal) return null;
+                            return (
+                              <div className={`flex items-center justify-between rounded-xl px-3 py-2 text-xs font-black ${exceeds ? 'bg-red-50 border border-red-200' : 'bg-slate-50 border border-slate-100'}`}>
+                                <span className={exceeds ? 'text-red-500' : 'text-slate-400'}>
+                                  Saldo disponible ({balCurr})
+                                </span>
+                                {bal.loading ? (
+                                  <span className="text-slate-300 animate-pulse">Consultando...</span>
+                                ) : bal.error ? (
+                                  <span className="text-amber-500">Sin datos</span>
+                                ) : (
+                                  <span className={exceeds ? 'text-red-600' : 'text-emerald-600'}>
+                                    {balCurr === 'VES'
+                                      ? `Bs ${bal.balance.toLocaleString('es-VE', { minimumFractionDigits: 2 })}`
+                                      : `$${bal.balance.toFixed(2)}`}
+                                    {exceeds && <span className="ml-2 text-[9px] bg-red-500 text-white px-1.5 py-0.5 rounded-full uppercase tracking-widest">Insuficiente</span>}
+                                  </span>
+                                )}
+                              </div>
+                            );
+                          })()}
                           {/* Moneda + Montos + Tasa */}
                           <div className="grid grid-cols-2 gap-2">
                             <div>
@@ -5080,10 +5139,19 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
                     Cancelar
                   </button>
                   <button
-                    disabled={payrollSubmitting || !payrollEmpId || !payrollSalary || payrollSalaryNum <= 0 || payrollTotalPaid <= 0}
+                    disabled={payrollSubmitting || !payrollEmpId || !payrollSalary || payrollSalaryNum <= 0 || payrollTotalPaid <= 0 || payrollHasInsufficientBalance}
                     onClick={async () => {
                       if (!payrollEmpId || payrollSalaryNum <= 0) { setPayrollError('Selecciona persona y sueldo pactado.'); return; }
                       if (payrollTotalPaid <= 0) { setPayrollError('Agrega al menos una línea de pago con monto.'); return; }
+                      if (payrollInsufficientLine) {
+                        const balKey = `${payrollInsufficientLine.bankId}::${payrollInsufficientLine.accountId}`;
+                        const bal = payrollBankBalances.get(balKey);
+                        const currency = payrollInsufficientLine.currency === 'BS' ? 'Bs' : 'USD';
+                        const requested = payrollInsufficientLine.currency === 'BS' ? (parseFloat(payrollInsufficientLine.amountBS) || 0).toFixed(2) : (parseFloat(payrollInsufficientLine.amountUSD) || 0).toFixed(2);
+                        const available = bal ? bal.balance.toFixed(2) : '0.00';
+                        setPayrollError(`Saldo insuficiente. Línea: ${payrollInsufficientLine.method.toUpperCase()} · ${currency} ${requested} > Disponible ${currency} ${available}. Reduce el monto o cambia de cuenta.`);
+                        return;
+                      }
                       const user = payrollSystemUsers.find(u => u.id === payrollEmpId);
                       if (!user) return;
                       setPayrollSubmitting(true); setPayrollError('');
