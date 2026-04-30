@@ -34,7 +34,8 @@ import {
   ChevronDown,
   ChevronUp,
   ReceiptText,
-  UserCheck
+  UserCheck,
+  Check
 } from 'lucide-react';
 import { dataService, ClientAdvance, SupplierAdvance, ExpenseCategory, EXPENSE_CATEGORIES, OperationalExpense, PurchaseInvoiceHistoryEntry, CompanyLoan, type MayorCuentaMovimientoRow } from '../../services/dataService';
 import { clientService } from '../../services/clientService';
@@ -536,6 +537,18 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
   const [expenseCatFilter, setExpenseCatFilter] = useState<ExpenseCategory | 'ALL'>('ALL');
   const [expenseStatusFilter, setExpenseStatusFilter] = useState<'ACTIVE' | 'VOID' | 'ALL'>('ACTIVE');
   const [expenseMonthFilter, setExpenseMonthFilter] = useState('');
+  const [showPayrollModal, setShowPayrollModal] = useState(false);
+  const [payrollEmpId, setPayrollEmpId] = useState('');
+  const [payrollSalary, setPayrollSalary] = useState('');
+  const [payrollPeriod, setPayrollPeriod] = useState('');
+  const [payrollCxcCurrency, setPayrollCxcCurrency] = useState<'USD'|'BS'>('USD');
+  const [payrollCxcAmount, setPayrollCxcAmount] = useState('');
+  const [payrollObservation, setPayrollObservation] = useState('');
+  const [payrollLines, setPayrollLines] = useState<Array<{method: string; amountUSD: string; ref: string}>>([{ method: 'cash_usd', amountUSD: '', ref: '' }]);
+  const [payrollCxcInvoices, setPayrollCxcInvoices] = useState<Record<string, boolean>>({});
+  const [payrollCxcAbonos, setPayrollCxcAbonos] = useState<Record<string, string>>({});
+  const [payrollSubmitting, setPayrollSubmitting] = useState(false);
+  const [payrollError, setPayrollError] = useState('');
   const [voidingId, setVoidingId] = useState<string | null>(null);
   const [voidReason, setVoidReason] = useState('');
   const [showPurchaseModal, setShowPurchaseModal] = useState(false);
@@ -2058,6 +2071,27 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
 
   const bankTxModalProfile =
     showBankTxModal && bankTxTarget ? getBankCurrencyProfile(bankTxTarget) : 'UNKNOWN';
+
+  const payrollSystemUsers = dataService.getUsers().filter(u => u.active && (u.companyRole === 'EMPLEADO' || u.companyRole === 'SOCIO'));
+  const payrollSelectedUser = payrollSystemUsers.find(u => u.id === payrollEmpId);
+  const payrollUserAREntries = payrollSelectedUser?.cedula
+    ? arEntries.filter(e => e.customerId === payrollSelectedUser.cedula && e.status !== 'PAID' && (e.balanceUSD ?? 0) > 0)
+    : [];
+  const payrollSalaryNum = parseFloat(payrollSalary) || 0;
+  const payrollCxcAmtNum = parseFloat(payrollCxcAmount) || 0;
+  const payrollCxcUSD = payrollCxcCurrency === 'USD' ? payrollCxcAmtNum : payrollCxcAmtNum / (exchangeRate || 1);
+  const payrollNeto = Math.max(0, payrollSalaryNum - payrollCxcUSD);
+  const payrollTotalPaid = payrollLines.reduce((s, l) => s + (parseFloat(l.amountUSD) || 0), 0);
+  const payrollPendiente = Math.max(0, payrollNeto - payrollTotalPaid);
+  const closePayrollModal = () => {
+    setShowPayrollModal(false);
+    setPayrollEmpId(''); setPayrollSalary(''); setPayrollPeriod('');
+    setPayrollCxcCurrency('USD'); setPayrollCxcAmount('');
+    setPayrollObservation(''); setPayrollError('');
+    setPayrollLines([{ method: 'cash_usd', amountUSD: '', ref: '' }]);
+    setPayrollCxcInvoices({});
+    setPayrollCxcAbonos({});
+  };
 
   return (
     <div className="space-y-8 animate-in fade-in slide-in-from-bottom-6 duration-700 pb-16">
@@ -4348,7 +4382,16 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
               {/* Form */}
               <div className="lg:col-span-4 space-y-4">
                 <div className="bg-white rounded-[2rem] border border-slate-200 shadow-sm p-6 space-y-4">
-                  <h4 className="font-black text-base text-slate-900 flex items-center gap-2"><Plus className="w-4 h-4 text-emerald-600"/> Registrar Gasto</h4>
+                  <div className="flex items-center justify-between">
+                    <h4 className="font-black text-base text-slate-900 flex items-center gap-2"><Plus className="w-4 h-4 text-emerald-600"/> Registrar Gasto</h4>
+                    <button
+                      type="button"
+                      onClick={() => { setPayrollEmpId(''); setPayrollSalary(''); setPayrollPeriod(''); setPayrollCxcCurrency('USD'); setPayrollCxcAmount(''); setPayrollObservation(''); setPayrollError(''); setPayrollLines([{ method: 'cash_usd', amountUSD: '', ref: '' }]); setShowPayrollModal(true); }}
+                      className="flex items-center gap-1.5 px-3 py-1.5 bg-indigo-900 hover:bg-indigo-800 text-white rounded-xl text-[9px] font-black uppercase tracking-widest transition-all"
+                    >
+                      <Users className="w-3 h-3" /> Pago Nómina
+                    </button>
+                  </div>
                   <div>
                     <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest block mb-1">Concepto *</label>
                     <input type="text" value={newExpense.description} onChange={e => setNewExpense(p => ({...p, description: e.target.value}))}
@@ -4543,6 +4586,389 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
                       ))}
                     </tbody>
                   </table>
+                </div>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Modal Pago Nómina */}
+      {showPayrollModal && (() => {
+        const totalCxcDesc = Object.entries(payrollCxcInvoices)
+          .filter(([,sel]) => sel)
+          .reduce((s, [id]) => s + (parseFloat(payrollCxcAbonos[id] || '0') || 0), 0);
+        const cxcUSDCalc = totalCxcDesc > 0 ? totalCxcDesc : payrollCxcUSD;
+        const netoCalc = Math.max(0, payrollSalaryNum - cxcUSDCalc);
+        const pendCalc = Math.max(0, netoCalc - payrollTotalPaid);
+        return (
+          <div className="fixed inset-0 z-[600] bg-black/60 backdrop-blur-sm flex items-start justify-center p-4 overflow-y-auto">
+            <div className="bg-white rounded-3xl shadow-2xl w-full max-w-2xl my-6 overflow-hidden border border-slate-100">
+
+              {/* Header */}
+              <div className="bg-gradient-to-r from-slate-900 to-slate-800 px-6 py-5 flex items-center justify-between gap-4">
+                <div className="flex items-center gap-4">
+                  {/* Avatar del empleado seleccionado */}
+                  <div className="shrink-0">
+                    {payrollSelectedUser?.photoURL ? (
+                      <img src={payrollSelectedUser.photoURL} alt={payrollSelectedUser.name}
+                        className="w-14 h-14 rounded-2xl object-cover border-2 border-emerald-400/40 shadow-lg"/>
+                    ) : (
+                      <div className={`w-14 h-14 rounded-2xl flex items-center justify-center border-2 border-white/10 text-2xl font-black
+                        ${payrollSelectedUser?.companyRole === 'SOCIO' ? 'bg-violet-900/60 text-violet-300' : 'bg-emerald-900/60 text-emerald-300'}`}>
+                        {payrollSelectedUser ? payrollSelectedUser.name.charAt(0) : <Users className="w-6 h-6 text-slate-500"/>}
+                      </div>
+                    )}
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2 mb-0.5">
+                      <h3 className="font-black text-lg text-white tracking-tight">
+                        {payrollSelectedUser ? payrollSelectedUser.name : 'Pago de Nómina'}
+                      </h3>
+                      {payrollSelectedUser && (
+                        <span className={`text-[8px] font-black px-2 py-0.5 rounded-full uppercase tracking-widest
+                          ${payrollSelectedUser.companyRole === 'SOCIO' ? 'bg-violet-500/30 text-violet-300' : 'bg-emerald-500/30 text-emerald-300'}`}>
+                          {payrollSelectedUser.companyRole}
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-[9px] font-bold text-slate-400 uppercase tracking-widest">
+                      {payrollSelectedUser?.cedula ? `CI/RIF: ${payrollSelectedUser.cedula} · ` : ''}Nómina · Multi-método · Cruce CxC
+                    </p>
+                  </div>
+                </div>
+                <button onClick={closePayrollModal} className="p-2 hover:bg-white/10 rounded-xl transition-all shrink-0">
+                  <X className="w-4 h-4 text-slate-300"/>
+                </button>
+              </div>
+
+              <div className="p-6 space-y-5 max-h-[75vh] overflow-y-auto">
+
+                {/* Fila 1: Persona + Período */}
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest block mb-1.5">Empleado / Socio *</label>
+                    <div className="relative">
+                      <select
+                        value={payrollEmpId}
+                        onChange={e => {
+                          setPayrollEmpId(e.target.value);
+                          setPayrollCxcInvoices({});
+                          setPayrollCxcAbonos({});
+                          setPayrollCxcAmount('');
+                        }}
+                        className="w-full border border-slate-200 rounded-2xl pl-10 pr-4 py-2.5 text-sm font-bold outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100 transition-all bg-white appearance-none"
+                      >
+                        <option value="">Seleccionar persona...</option>
+                        {payrollSystemUsers.map(u => (
+                          <option key={u.id} value={u.id}>
+                            {u.name} · {u.companyRole}{u.cedula ? ` · ${u.cedula}` : ''}
+                          </option>
+                        ))}
+                      </select>
+                      <div className="absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none">
+                        {payrollSelectedUser?.photoURL ? (
+                          <img src={payrollSelectedUser.photoURL} alt="" className="w-5 h-5 rounded-lg object-cover"/>
+                        ) : payrollSelectedUser ? (
+                          <div className={`w-5 h-5 rounded-lg flex items-center justify-center text-[9px] font-black
+                            ${payrollSelectedUser.companyRole === 'SOCIO' ? 'bg-violet-100 text-violet-700' : 'bg-emerald-100 text-emerald-700'}`}>
+                            {payrollSelectedUser.name.charAt(0)}
+                          </div>
+                        ) : (
+                          <Users className="w-4 h-4 text-slate-300"/>
+                        )}
+                      </div>
+                    </div>
+                    {payrollSystemUsers.length === 0 && (
+                      <p className="text-[10px] text-amber-600 font-bold mt-1">Sin empleados/socios. Asigna el rol en Seguridad.</p>
+                    )}
+                    {/* Mini-cards de usuarios disponibles */}
+                    {payrollSystemUsers.length > 0 && !payrollEmpId && (
+                      <div className="mt-2 flex gap-2 flex-wrap">
+                        {payrollSystemUsers.slice(0, 5).map(u => (
+                          <button key={u.id} type="button"
+                            onClick={() => { setPayrollEmpId(u.id); setPayrollCxcInvoices({}); setPayrollCxcAbonos({}); setPayrollCxcAmount(''); }}
+                            className="flex items-center gap-1.5 px-2 py-1 bg-slate-50 hover:bg-emerald-50 border border-slate-200 hover:border-emerald-300 rounded-xl transition-all">
+                            {u.photoURL ? (
+                              <img src={u.photoURL} alt="" className="w-5 h-5 rounded-lg object-cover"/>
+                            ) : (
+                              <div className={`w-5 h-5 rounded-lg flex items-center justify-center text-[8px] font-black shrink-0
+                                ${u.companyRole === 'SOCIO' ? 'bg-violet-100 text-violet-700' : 'bg-emerald-100 text-emerald-700'}`}>
+                                {u.name.charAt(0)}
+                              </div>
+                            )}
+                            <span className="text-[9px] font-black text-slate-700 max-w-[80px] truncate">{u.name.split(' ')[0]}</span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  <div>
+                    <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest block mb-1.5">Período *</label>
+                    <input
+                      type="text" value={payrollPeriod}
+                      onChange={e => setPayrollPeriod(e.target.value)}
+                      placeholder="Ej. Abril Q2 2026"
+                      className="w-full border border-slate-200 rounded-2xl px-4 py-2.5 text-sm font-bold outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100 transition-all"
+                    />
+                  </div>
+                </div>
+
+                {/* Sueldo Pactado */}
+                <div>
+                  <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest block mb-1.5">Sueldo Pactado USD *</label>
+                  <div className="relative">
+                    <span className="absolute left-4 top-1/2 -translate-y-1/2 text-slate-400 font-black text-sm">$</span>
+                    <input
+                      type="number" min="0" step="0.01" value={payrollSalary}
+                      onChange={e => setPayrollSalary(e.target.value)}
+                      className="w-full border border-slate-200 rounded-2xl pl-8 pr-4 py-2.5 text-sm font-black outline-none focus:border-emerald-500 focus:ring-2 focus:ring-emerald-100 transition-all"
+                    />
+                  </div>
+                </div>
+
+                {/* Descuentos CxC — Facturas pendientes */}
+                <div className="border border-amber-100 rounded-2xl overflow-hidden">
+                  <div className="bg-amber-50 px-4 py-3 flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <div className="w-2 h-2 rounded-full bg-amber-400"/>
+                      <p className="text-[10px] font-black text-amber-700 uppercase tracking-widest">Descuento CxC</p>
+                    </div>
+                    {payrollUserAREntries.length > 0 && (
+                      <span className="bg-amber-200 text-amber-800 text-[9px] font-black px-2 py-0.5 rounded-full">
+                        {payrollUserAREntries.length} factura{payrollUserAREntries.length > 1 ? 's' : ''} pendiente{payrollUserAREntries.length > 1 ? 's' : ''}
+                      </span>
+                    )}
+                  </div>
+                  <div className="p-4">
+                    {!payrollSelectedUser && (
+                      <p className="text-[10px] text-slate-400 font-bold text-center py-2">Selecciona un empleado/socio para ver sus CxC</p>
+                    )}
+                    {payrollSelectedUser && !payrollSelectedUser.cedula && (
+                      <p className="text-[10px] text-amber-600 font-bold">Este usuario no tiene cédula/RIF. Agrégala en Seguridad para vincular CxC.</p>
+                    )}
+                    {payrollSelectedUser?.cedula && payrollUserAREntries.length === 0 && (
+                      <p className="text-[10px] text-slate-400 font-bold text-center py-2">Sin facturas CxC pendientes para este usuario.</p>
+                    )}
+                    {payrollUserAREntries.length > 0 && (
+                      <div className="space-y-2">
+                        {payrollUserAREntries.map(entry => {
+                          const isSelected = !!payrollCxcInvoices[entry.id];
+                          const maxAbono = entry.balanceUSD ?? 0;
+                          const abonoStr = payrollCxcAbonos[entry.id] ?? '';
+                          const abonoNum = parseFloat(abonoStr) || 0;
+                          return (
+                            <div key={entry.id} className={`rounded-2xl border transition-all ${isSelected ? 'border-amber-300 bg-amber-50/60' : 'border-slate-200 bg-white'}`}>
+                              <div className="flex items-center gap-3 px-4 py-3">
+                                <input
+                                  type="checkbox"
+                                  checked={isSelected}
+                                  onChange={e => {
+                                    const sel = e.target.checked;
+                                    setPayrollCxcInvoices(prev => ({ ...prev, [entry.id]: sel }));
+                                    if (sel && !payrollCxcAbonos[entry.id]) {
+                                      setPayrollCxcAbonos(prev => ({ ...prev, [entry.id]: String(maxAbono.toFixed(2)) }));
+                                    }
+                                    if (!sel) {
+                                      setPayrollCxcAbonos(prev => { const n = { ...prev }; delete n[entry.id]; return n; });
+                                    }
+                                  }}
+                                  className="rounded w-4 h-4 border-amber-300 text-amber-500 focus:ring-amber-300"
+                                />
+                                <div className="flex-1 min-w-0">
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    <span className="text-[10px] font-black text-slate-700 uppercase">{entry.saleCorrelativo}</span>
+                                    <span className="text-[9px] font-bold text-slate-400">Monto original: <span className="text-slate-600">${(entry.amountUSD ?? 0).toFixed(2)}</span></span>
+                                    <span className={`text-[9px] font-black px-2 py-0.5 rounded-full ${(entry.balanceUSD ?? 0) > 0 ? 'bg-red-50 text-red-600' : 'bg-emerald-50 text-emerald-600'}`}>
+                                      Saldo: ${(entry.balanceUSD ?? 0).toFixed(2)}
+                                    </span>
+                                    <span className="text-[9px] font-bold text-amber-600 uppercase">{entry.status === 'PAID' ? 'Cobrado' : 'Pendiente'}</span>
+                                  </div>
+                                  <p className="text-[9px] text-slate-400 mt-0.5 truncate">{entry.description}</p>
+                                </div>
+                              </div>
+                              {isSelected && (
+                                <div className="px-4 pb-3">
+                                  <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest block mb-1">Monto a abonar (máx ${maxAbono.toFixed(2)})</label>
+                                  <div className="flex gap-2 items-center">
+                                    <input
+                                      type="number" min="0.01" step="0.01" max={maxAbono}
+                                      value={abonoStr}
+                                      onChange={e => setPayrollCxcAbonos(prev => ({ ...prev, [entry.id]: e.target.value }))}
+                                      className="w-36 border border-amber-200 rounded-xl px-3 py-1.5 text-sm font-black outline-none focus:border-amber-400 transition-all"
+                                    />
+                                    <button type="button"
+                                      onClick={() => setPayrollCxcAbonos(prev => ({ ...prev, [entry.id]: String(maxAbono.toFixed(2)) }))}
+                                      className="text-[9px] font-black text-amber-600 hover:text-amber-800 uppercase tracking-widest transition-all">
+                                      Pago total
+                                    </button>
+                                    {abonoNum > 0 && abonoNum < maxAbono && (
+                                      <span className="text-[9px] text-slate-400 font-bold">Pendiente tras abono: ${(maxAbono - abonoNum).toFixed(2)}</span>
+                                    )}
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                        <div className="flex justify-between items-center pt-1 px-1">
+                          <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Total descuento CxC seleccionado</p>
+                          <p className="text-base font-black text-amber-700 font-mono">${totalCxcDesc.toFixed(2)}</p>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* KPIs */}
+                <div className="grid grid-cols-4 gap-3">
+                  <div className="bg-slate-50 rounded-2xl p-3 text-center">
+                    <p className="text-[8px] font-black text-slate-400 uppercase tracking-widest mb-1">Pactado</p>
+                    <p className="text-base font-black text-slate-900 font-mono">${payrollSalaryNum.toFixed(2)}</p>
+                  </div>
+                  <div className="bg-amber-50 rounded-2xl p-3 text-center">
+                    <p className="text-[8px] font-black text-amber-500 uppercase tracking-widest mb-1">Desc. CxC</p>
+                    <p className="text-base font-black text-amber-700 font-mono">${cxcUSDCalc.toFixed(2)}</p>
+                  </div>
+                  <div className="bg-emerald-50 rounded-2xl p-3 text-center">
+                    <p className="text-[8px] font-black text-emerald-600 uppercase tracking-widest mb-1">Neto a Pagar</p>
+                    <p className="text-base font-black text-emerald-700 font-mono">${netoCalc.toFixed(2)}</p>
+                  </div>
+                  <div className={`rounded-2xl p-3 text-center ${pendCalc > 0 ? 'bg-red-50' : 'bg-slate-50'}`}>
+                    <p className={`text-[8px] font-black uppercase tracking-widest mb-1 ${pendCalc > 0 ? 'text-red-400' : 'text-slate-400'}`}>Pendiente</p>
+                    <p className={`text-base font-black font-mono ${pendCalc > 0 ? 'text-red-600' : 'text-slate-900'}`}>${pendCalc.toFixed(2)}</p>
+                  </div>
+                </div>
+
+                {/* Líneas de pago */}
+                <div className="border border-slate-100 rounded-2xl overflow-hidden">
+                  <div className="bg-slate-50 px-4 py-3 flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <div className="w-2 h-2 rounded-full bg-emerald-400"/>
+                      <p className="text-[10px] font-black text-slate-600 uppercase tracking-widest">Líneas de pago</p>
+                    </div>
+                    <button type="button"
+                      onClick={() => setPayrollLines(prev => [...prev, { method: 'cash_usd', amountUSD: '', ref: '' }])}
+                      className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl text-[9px] font-black uppercase tracking-widest transition-all">
+                      <Plus className="w-3 h-3"/> Línea
+                    </button>
+                  </div>
+                  <div className="p-4 space-y-3">
+                    {payrollLines.map((line, idx) => (
+                      <div key={idx} className="rounded-2xl border border-slate-200 p-4 bg-white space-y-3">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Línea {idx + 1}</span>
+                          {payrollLines.length > 1 && (
+                            <button type="button"
+                              onClick={() => setPayrollLines(prev => prev.filter((_, i) => i !== idx))}
+                              className="p-1 text-red-300 hover:text-red-500 transition-all rounded-lg hover:bg-red-50">
+                              <X className="w-3.5 h-3.5"/>
+                            </button>
+                          )}
+                        </div>
+                        <select value={line.method}
+                          onChange={e => setPayrollLines(prev => prev.map((l, i) => i === idx ? { ...l, method: e.target.value } : l))}
+                          className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm font-bold outline-none focus:border-emerald-500 bg-white">
+                          {Object.entries(EXPENSE_PAY_METHODS).map(([k,v]) => <option key={k} value={k}>{v}</option>)}
+                        </select>
+                        <div className="grid grid-cols-2 gap-3">
+                          <div>
+                            <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1">Monto USD *</p>
+                            <div className="relative">
+                              <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 font-black text-xs">$</span>
+                              <input type="number" min="0" step="0.01" value={line.amountUSD}
+                                onChange={e => setPayrollLines(prev => prev.map((l, i) => i === idx ? { ...l, amountUSD: e.target.value } : l))}
+                                className="w-full border border-slate-200 rounded-xl pl-6 pr-3 py-2.5 text-sm font-black outline-none focus:border-emerald-500"/>
+                            </div>
+                          </div>
+                          <div>
+                            <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1">Referencia / Nº Op.</p>
+                            <input type="text" value={line.ref}
+                              onChange={e => setPayrollLines(prev => prev.map((l, i) => i === idx ? { ...l, ref: e.target.value } : l))}
+                              className="w-full border border-slate-200 rounded-xl px-3 py-2.5 text-sm font-bold outline-none focus:border-emerald-500"/>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Observación */}
+                <div>
+                  <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest block mb-1.5">Observación</label>
+                  <textarea value={payrollObservation}
+                    onChange={e => setPayrollObservation(e.target.value)}
+                    placeholder="Comentarios sobre este pago de nómina (opcional)..."
+                    rows={2}
+                    className="w-full border border-slate-200 rounded-2xl px-4 py-3 text-sm font-bold outline-none focus:border-emerald-500 resize-none transition-all"/>
+                </div>
+
+                {payrollError && (
+                  <div className="flex items-center gap-2 bg-red-50 border border-red-200 px-4 py-3 rounded-2xl">
+                    <X className="w-3.5 h-3.5 text-red-500 shrink-0"/>
+                    <p className="text-[10px] text-red-600 font-bold">{payrollError}</p>
+                  </div>
+                )}
+              </div>
+
+              {/* Footer */}
+              <div className="flex items-center justify-between px-6 py-4 bg-slate-50 border-t border-slate-100">
+                <div>
+                  <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Total pagado</p>
+                  <p className="text-xl font-black text-emerald-700 font-mono">${payrollTotalPaid.toFixed(2)}</p>
+                </div>
+                <div className="flex gap-3">
+                  <button onClick={closePayrollModal}
+                    className="px-5 py-2.5 bg-white border border-slate-200 hover:bg-slate-100 text-slate-600 rounded-2xl text-[10px] font-black uppercase tracking-widest transition-all">
+                    Cancelar
+                  </button>
+                  <button
+                    disabled={payrollSubmitting || !payrollEmpId || !payrollSalary || payrollSalaryNum <= 0 || payrollTotalPaid <= 0}
+                    onClick={async () => {
+                      if (!payrollEmpId || payrollSalaryNum <= 0) { setPayrollError('Selecciona persona y sueldo pactado.'); return; }
+                      if (payrollTotalPaid <= 0) { setPayrollError('Agrega al menos una línea de pago con monto.'); return; }
+                      const user = payrollSystemUsers.find(u => u.id === payrollEmpId);
+                      if (!user) return;
+                      setPayrollSubmitting(true); setPayrollError('');
+                      try {
+                        const primaryLine = payrollLines.find(l => parseFloat(l.amountUSD) > 0);
+                        const cxcLines = Object.entries(payrollCxcInvoices)
+                          .filter(([,sel]) => sel)
+                          .map(([id]) => ({ id, abono: parseFloat(payrollCxcAbonos[id] || '0') || 0 }))
+                          .filter(x => x.abono > 0);
+                        const totalCxcAbono = cxcLines.reduce((s, x) => s + x.abono, 0);
+                        const description = [
+                          `Pago de nómina · ${user.name} · ${user.companyRole}`,
+                          payrollPeriod ? `Período: ${payrollPeriod}` : '',
+                          totalCxcAbono > 0 ? `Cruce CxC: $${totalCxcAbono.toFixed(2)}` : '',
+                          payrollObservation || ''
+                        ].filter(Boolean).join(' | ');
+                        await dataService.addExpense({
+                          description,
+                          amountUSD: payrollTotalPaid,
+                          category: 'NOMINA' as any,
+                          supplier: user.name,
+                          paymentMethod: (primaryLine?.method || undefined) as any,
+                          reference: primaryLine?.ref || undefined
+                        });
+                        for (const { id, abono } of cxcLines) {
+                          await (dataService as any).registerARPaymentWithSupport(id, abono, {
+                            method: 'NOMINA_CXC',
+                            note: `Abono CxC vía nómina · ${user.name}${payrollPeriod ? ' · ' + payrollPeriod : ''}`,
+                            reference: primaryLine?.ref || ''
+                          });
+                        }
+                        closePayrollModal();
+                      } catch (e: any) {
+                        setPayrollError(e?.message ?? 'Error al registrar.');
+                      } finally {
+                        setPayrollSubmitting(false);
+                      }
+                    }}
+                    className="px-6 py-2.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-2xl text-[10px] font-black uppercase tracking-widest transition-all flex items-center gap-2 shadow-lg shadow-emerald-600/20"
+                  >
+                    {payrollSubmitting ? <><Loader2 className="w-3.5 h-3.5 animate-spin"/> Procesando...</> : <><Check className="w-3.5 h-3.5"/> Registrar Pago</>}
+                  </button>
                 </div>
               </div>
             </div>

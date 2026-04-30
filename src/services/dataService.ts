@@ -61,6 +61,8 @@ export interface PermissionDefinition {
   module: string;
 }
 
+export type UserCompanyRole = 'EMPLEADO' | 'SOCIO' | 'NINGUNO';
+
 export interface User {
   id: string;
   name: string;
@@ -70,6 +72,9 @@ export interface User {
   permissions: PermissionKey[];
   active: boolean;
   firebaseUid?: string;
+  cedula?: string;
+  companyRole?: UserCompanyRole;
+  photoURL?: string;
 }
 
 export const PERMISSION_DEFINITIONS: PermissionDefinition[] = [
@@ -5309,7 +5314,10 @@ export class DataService {
         (u.role ?? 'CAJERO') as UserRole
       ),
       active: u.active ?? true,
-      firebaseUid: u.firebaseUid ?? u.firebase_uid ?? undefined
+      firebaseUid: u.firebaseUid ?? u.firebase_uid ?? undefined,
+      cedula: u.cedula ? String(u.cedula).trim().toUpperCase() : undefined,
+      companyRole: (u.companyRole ?? 'NINGUNO') as UserCompanyRole,
+      photoURL: u.photoURL ? String(u.photoURL) : undefined
     });
     };
     const applyUsers = (docs: { id: string; data: () => any }[]) => {
@@ -5479,7 +5487,21 @@ export class DataService {
     await deleteDoc(doc(db, 'banks', bankId));
   }
 
-  async addUser(name: string, email: string, role: UserRole, pin: string, permissions?: PermissionKey[]) {
+  async updateUserPhoto(userId: string, file: File): Promise<string> {
+    const { ref, uploadBytes, getDownloadURL } = await import('firebase/storage');
+    const path = `user_photos/${userId}/${Date.now()}_${file.name.replace(/[^a-zA-Z0-9.]/g, '_')}`;
+    const storageRef = ref(storage, path);
+    await uploadBytes(storageRef, file);
+    const url = await getDownloadURL(storageRef);
+    await updateDoc(doc(db, 'users', userId), { photoURL: url });
+    const idx = this.users.findIndex(u => u.id === userId);
+    if (idx >= 0) this.users[idx] = { ...this.users[idx], photoURL: url };
+    if (this.currentUser?.id === userId) this.currentUser = { ...this.currentUser, photoURL: url };
+    this.notify();
+    return url;
+  }
+
+  async addUser(name: string, email: string, role: UserRole, pin: string, permissions?: PermissionKey[], extra?: { cedula?: string; companyRole?: UserCompanyRole }) {
     const normalizedName = String(name ?? '').trim().toUpperCase();
     const normalizedEmail = String(email ?? '').trim().toLowerCase();
     if (!normalizedName) throw new Error('El nombre del operador es obligatorio.');
@@ -5519,7 +5541,9 @@ export class DataService {
       pin,
       permissions: this.normalizePermissions(permissions, role),
       active: true,
-      firebaseUid: firebaseUserId // Guardar referencia al UID de Firebase
+      firebaseUid: firebaseUserId,
+      cedula: String(extra?.cedula ?? '').trim().toUpperCase() || undefined,
+      companyRole: extra?.companyRole ?? 'NINGUNO'
     };
 
     // 3. Guardar en Firestore
@@ -5531,6 +5555,8 @@ export class DataService {
       permissions: newUser.permissions,
       active: newUser.active,
       firebaseUid: firebaseUserId,
+      cedula: newUser.cedula ?? '',
+      companyRole: newUser.companyRole ?? 'NINGUNO',
       createdAt: new Date().toISOString()
     });
 
@@ -5591,7 +5617,7 @@ export class DataService {
     return newUser;
   }
 
-  async updateUserAccess(id: string, patch: { name?: string; email?: string; role?: UserRole; pin?: string; permissions?: PermissionKey[]; active?: boolean }) {
+  async updateUserAccess(id: string, patch: { name?: string; email?: string; role?: UserRole; pin?: string; permissions?: PermissionKey[]; active?: boolean; cedula?: string; companyRole?: UserCompanyRole }) {
     const user = this.users.find(u => u.id === id);
     if (!user) return;
     const nextRole = patch.role ?? user.role;
@@ -5603,7 +5629,9 @@ export class DataService {
       role: nextRole,
       pin: newPin,
       permissions: patch.permissions ? this.normalizePermissions(patch.permissions, nextRole) : this.normalizePermissions(user.permissions, nextRole),
-      active: patch.active ?? user.active
+      active: patch.active ?? user.active,
+      cedula: patch.cedula !== undefined ? String(patch.cedula).trim().toUpperCase() : user.cedula,
+      companyRole: patch.companyRole ?? user.companyRole ?? 'NINGUNO'
     };
     const firestorePayload: any = {
       name: updated.name,
@@ -5612,6 +5640,8 @@ export class DataService {
       pin: updated.pin,
       permissions: updated.permissions,
       active: updated.active,
+      cedula: updated.cedula ?? '',
+      companyRole: updated.companyRole ?? 'NINGUNO',
       updatedAt: new Date().toISOString()
     };
     // Si se cambia el PIN, manejar actualización en Firebase Auth

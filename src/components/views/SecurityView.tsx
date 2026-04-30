@@ -30,9 +30,10 @@ import {
   Bell,
   BellRing,
   UserCog,
-  KeyRound
+  KeyRound,
+  Camera
 } from 'lucide-react';
-import { dataService, UserRole, User, PermissionKey } from '../../services/dataService';
+import { dataService, UserRole, User, PermissionKey, UserCompanyRole } from '../../services/dataService';
 import { ConfirmModal } from '../ConfirmModal';
 import { db } from '../../services/firebaseConfig';
 import { collection, query, where, onSnapshot, deleteDoc, doc } from 'firebase/firestore';
@@ -55,6 +56,10 @@ export function SecurityView() {
   const [editPin, setEditPin] = useState('');
   const [editPermissions, setEditPermissions] = useState<PermissionKey[]>([]);
   const [newPermissions, setNewPermissions] = useState<PermissionKey[]>(dataService.getPermissionsForRole('CAJERO'));
+  const [newCedula, setNewCedula] = useState('');
+  const [newCompanyRole, setNewCompanyRole] = useState<UserCompanyRole>('NINGUNO');
+  const [editCedula, setEditCedula] = useState('');
+  const [editCompanyRole, setEditCompanyRole] = useState<UserCompanyRole>('NINGUNO');
   const [showPin, setShowPin] = useState(false);
   const [showEditPin, setShowEditPin] = useState(false);
   const [, setTick] = useState(0);
@@ -205,10 +210,12 @@ export function SecurityView() {
       return;
     }
     try {
-      await dataService.addUser(newName.trim().toUpperCase(), newEmail.trim().toLowerCase(), newRole, newPin, newPermissions);
+      await dataService.addUser(newName.trim().toUpperCase(), newEmail.trim().toLowerCase(), newRole, newPin, newPermissions, { cedula: newCedula.trim(), companyRole: newCompanyRole });
       setNewName('');
       setNewEmail('');
       setNewPin('');
+      setNewCedula('');
+      setNewCompanyRole('NINGUNO');
       setNewPermissions(dataService.getPermissionsForRole('CAJERO'));
       setNewRole('CAJERO');
       setIsAdding(false);
@@ -223,9 +230,10 @@ export function SecurityView() {
     setEditName(user.name);
     setEditEmail(user.email || '');
     setEditRole(user.role);
-    // SEC-FIX: No prellenar el PIN por seguridad, pero mostrar indicador visual
     setEditPin('');
     setEditPermissions([...user.permissions]);
+    setEditCedula(user.cedula || '');
+    setEditCompanyRole(user.companyRole || 'NINGUNO');
   };
 
   const handleEditUser = async () => {
@@ -235,6 +243,8 @@ export function SecurityView() {
       email: editEmail,
       role: editRole,
       permissions: editPermissions,
+      cedula: editCedula.trim() || undefined,
+      companyRole: editCompanyRole,
     };
     if (editPin) {
       if (editPin.length < 8) {
@@ -302,6 +312,19 @@ export function SecurityView() {
   };
 
   const [deletingUser, setDeletingUser] = useState<User | null>(null);
+  const [uploadingPhotoFor, setUploadingPhotoFor] = useState<string | null>(null);
+
+  const handleUserPhotoUpload = async (userId: string, file: File) => {
+    if (!file) return;
+    setUploadingPhotoFor(userId);
+    try {
+      await dataService.updateUserPhoto(userId, file);
+    } catch (e: any) {
+      alert(`Error subiendo foto: ${e.message}`);
+    } finally {
+      setUploadingPhotoFor(null);
+    }
+  };
 
   // PIN sync diagnostic state
   const [pinDiagnosis, setPinDiagnosis] = useState<{
@@ -685,14 +708,49 @@ export function SecurityView() {
 
                 <div className="flex justify-between items-start mb-6">
                   <div className="flex items-center gap-4">
-                    <div className={`p-3 rounded-2xl ${user.role === 'ADMIN' ? 'bg-emerald-50 text-emerald-600' : user.role === 'ALMACENISTA' ? 'bg-amber-50 text-amber-600' : 'bg-blue-50 text-blue-600'}`}>
-                      <UserCircle className="w-6 h-6" />
-                    </div>
+                    <label className="relative cursor-pointer group/photo shrink-0" title="Cambiar foto">
+                      <input type="file" accept="image/*" className="hidden"
+                        onChange={e => { const f = e.target.files?.[0]; if (f) handleUserPhotoUpload(user.id, f); e.target.value = ''; }}/>
+                      {uploadingPhotoFor === user.id ? (
+                        <div className="w-14 h-14 rounded-2xl bg-slate-100 flex items-center justify-center">
+                          <Loader2 className="w-5 h-5 text-slate-400 animate-spin"/>
+                        </div>
+                      ) : user.photoURL ? (
+                        <div className="relative w-14 h-14">
+                          <img src={user.photoURL} alt={user.name}
+                            className="w-14 h-14 rounded-2xl object-cover border-2 border-slate-200 group-hover/photo:border-emerald-400 transition-all"/>
+                          <div className="absolute inset-0 rounded-2xl bg-black/30 opacity-0 group-hover/photo:opacity-100 flex items-center justify-center transition-all">
+                            <Camera className="w-4 h-4 text-white"/>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className={`w-14 h-14 rounded-2xl flex flex-col items-center justify-center gap-0.5 border-2 border-dashed transition-all
+                          ${user.role === 'ADMIN' ? 'bg-emerald-50 border-emerald-200 text-emerald-400 group-hover/photo:border-emerald-500' :
+                            user.role === 'ALMACENISTA' ? 'bg-amber-50 border-amber-200 text-amber-400 group-hover/photo:border-amber-500' :
+                            'bg-blue-50 border-blue-200 text-blue-400 group-hover/photo:border-blue-500'}`}>
+                          <UserCircle className="w-5 h-5"/>
+                          <Camera className="w-2.5 h-2.5 opacity-60"/>
+                        </div>
+                      )}
+                    </label>
                     <div>
                       <h4 className="font-black text-slate-900 uppercase tracking-tighter text-lg leading-none">{user.name}</h4>
-                      <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest mt-1">{user.role}</p>
+                      <div className="flex items-center gap-2 mt-1 flex-wrap">
+                        <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest">{user.role}</span>
+                        {(user as any).companyRole && (user as any).companyRole !== 'NINGUNO' && (
+                          <span className={`text-[8px] font-black px-1.5 py-0.5 rounded-full uppercase tracking-widest
+                            ${(user as any).companyRole === 'EMPLEADO' ? 'bg-blue-100 text-blue-700' : 'bg-violet-100 text-violet-700'}`}>
+                            {(user as any).companyRole}
+                          </span>
+                        )}
+                      </div>
                       {user.email && (
                         <p className="text-[8px] font-mono text-slate-500 mt-1 truncate max-w-[140px]" title={user.email}>{user.email}</p>
+                      )}
+                      {(user as any).cedula && (
+                        <p className="text-[8px] font-black text-slate-400 mt-0.5">
+                          <span className="text-slate-300">CI/RIF:</span> {(user as any).cedula}
+                        </p>
                       )}
                     </div>
                   </div>
@@ -829,6 +887,26 @@ export function SecurityView() {
                         </div>
                      </div>
 
+                     <div className="grid grid-cols-2 gap-3 text-left">
+                        <div className="space-y-2">
+                           <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest ml-1">Cédula / RIF</label>
+                           <input
+                              type="text" value={newCedula} onChange={e => setNewCedula(e.target.value)}
+                              className="w-full bg-slate-50 border-2 border-slate-100 rounded-xl px-4 py-3 text-sm font-black text-slate-900 outline-none focus:border-emerald-500 transition-all"
+                              placeholder="V-12345678 · J-30000000"
+                           />
+                        </div>
+                        <div className="space-y-2">
+                           <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest ml-1">Rol en la Empresa</label>
+                           <select value={newCompanyRole} onChange={e => setNewCompanyRole(e.target.value as UserCompanyRole)}
+                              className="w-full bg-slate-50 border-2 border-slate-100 rounded-xl px-4 py-3 text-sm font-black text-slate-900 outline-none focus:border-emerald-500 transition-all">
+                              <option value="NINGUNO">— Ninguno —</option>
+                              <option value="EMPLEADO">Empleado</option>
+                              <option value="SOCIO">Socio</option>
+                           </select>
+                        </div>
+                     </div>
+
                      <div className="space-y-2 text-left">
                         <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest ml-1">Contraseña (8+ caracteres alfanuméricos) — Firebase Auth</label>
                         <div className="relative">
@@ -942,6 +1020,35 @@ export function SecurityView() {
                   </div>
                   
                   <div className="p-4 sm:p-8 space-y-4 sm:space-y-6">
+                     {/* Foto de perfil */}
+                     <div className="flex flex-col items-center gap-3">
+                        <label className="relative cursor-pointer group/photo" title="Cambiar foto de perfil">
+                           <input type="file" accept="image/*" className="hidden"
+                              onChange={e => { const f = e.target.files?.[0]; if (f && editingUser) handleUserPhotoUpload(editingUser.id, f); e.target.value = ''; }}/>
+                           {uploadingPhotoFor === editingUser?.id ? (
+                              <div className="w-24 h-24 rounded-3xl bg-slate-100 flex items-center justify-center">
+                                 <Loader2 className="w-7 h-7 text-slate-400 animate-spin"/>
+                              </div>
+                           ) : editingUser?.photoURL ? (
+                              <div className="relative w-24 h-24">
+                                 <img src={editingUser.photoURL} alt={editingUser.name}
+                                    className="w-24 h-24 rounded-3xl object-cover border-2 border-blue-200 group-hover/photo:border-blue-500 transition-all shadow-lg"/>
+                                 <div className="absolute inset-0 rounded-3xl bg-black/40 opacity-0 group-hover/photo:opacity-100 flex items-center justify-center transition-all">
+                                    <Camera className="w-6 h-6 text-white"/>
+                                 </div>
+                              </div>
+                           ) : (
+                              <div className="w-24 h-24 rounded-3xl bg-blue-50 border-2 border-dashed border-blue-200 group-hover/photo:border-blue-500 flex flex-col items-center justify-center gap-1 transition-all">
+                                 <UserCircle className="w-8 h-8 text-blue-300"/>
+                                 <Camera className="w-3.5 h-3.5 text-blue-400"/>
+                              </div>
+                           )}
+                        </label>
+                        <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest">
+                           {editingUser?.photoURL ? 'Haz clic para cambiar foto' : 'Haz clic para agregar foto'}
+                        </p>
+                     </div>
+
                      <div className="space-y-2 text-left">
                         <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest ml-1">Nombre Completo</label>
                         <input 
@@ -1008,6 +1115,26 @@ export function SecurityView() {
                                  </div>
                               </div>
                            ))}
+                        </div>
+                     </div>
+
+                     <div className="grid grid-cols-2 gap-3 text-left">
+                        <div className="space-y-2">
+                           <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest ml-1">Cédula / RIF</label>
+                           <input
+                              type="text" value={editCedula} onChange={e => setEditCedula(e.target.value)}
+                              className="w-full bg-slate-50 border-2 border-slate-100 rounded-xl px-4 py-3 text-sm font-black text-slate-900 outline-none focus:border-blue-500 transition-all"
+                              placeholder="V-12345678 · J-30000000"
+                           />
+                        </div>
+                        <div className="space-y-2">
+                           <label className="text-[9px] font-black text-slate-400 uppercase tracking-widest ml-1">Rol en la Empresa</label>
+                           <select value={editCompanyRole} onChange={e => setEditCompanyRole(e.target.value as UserCompanyRole)}
+                              className="w-full bg-slate-50 border-2 border-slate-100 rounded-xl px-4 py-3 text-sm font-black text-slate-900 outline-none focus:border-blue-500 transition-all">
+                              <option value="NINGUNO">— Ninguno —</option>
+                              <option value="EMPLEADO">Empleado</option>
+                              <option value="SOCIO">Socio</option>
+                           </select>
                         </div>
                      </div>
 
