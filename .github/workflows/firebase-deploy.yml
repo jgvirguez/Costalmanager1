@@ -20,16 +20,12 @@ jobs:
       - name: Install dependencies
         run: |
           rm -rf node_modules package-lock.json
-          npm install
+          npm install --include=optional
 
-      - name: Force install @tailwindcss/oxide Linux x64 binding (workaround npm#4828)
+      - name: Verify Tailwind oxide Linux binding
         run: |
-          VER=$(node -p "require('./node_modules/@tailwindcss/oxide/package.json').version")
-          echo "Detected @tailwindcss/oxide version: $VER"
-          npm install --no-save "@tailwindcss/oxide-linux-x64-gnu@${VER}"
-          echo "--- Verifying binding install ---"
-          ls -la node_modules/@tailwindcss/oxide-linux-x64-gnu/ || (echo "ERROR: binding not installed" && exit 1)
-          ls node_modules/@tailwindcss/oxide-linux-x64-gnu/*.node || (echo "ERROR: .node file missing" && exit 1)
+          ls node_modules/@tailwindcss/oxide-linux-x64-gnu/*.node || (echo "ERROR: oxide Linux binding missing" && exit 1)
+          echo "OK: oxide Linux binding present"
 
       - name: Build project
         run: npm run build
