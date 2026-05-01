@@ -33,7 +33,46 @@ jobs:
       - name: Deploy to Firebase Hosting
         uses: FirebaseExtended/action-hosting-deploy@v0
         with:
-          repoToken: {{ secrets.GITHUB_TOKEN }}
-          firebaseServiceAccount: {{ secrets.FIREBASE_SERVICE_ACCOUNT_COSTALMANAGER }}
+          repoToken: '${{ secrets.GITHUB_TOKEN }}'
+          firebaseServiceAccount: '${{ secrets.FIREBASE_SERVICE_ACCOUNT_COSTALMANAGER }}'
+          channelId: live
+          projectId: costalmanager
+name: Build and Deploy to Firebase
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build_and_deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4.2.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4.4.0
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          rm -rf node_modules package-lock.json
+          npm install
+
+      - name: Verify Tailwind oxide Linux binding
+        run: |
+          ls node_modules/@tailwindcss/oxide-linux-x64-gnu/*.node || (echo "ERROR: oxide Linux binding missing" && exit 1)
+          echo "OK: oxide Linux binding present"
+
+      - name: Build project
+        run: npm run build
+
+      - name: Deploy to Firebase Hosting
+        uses: FirebaseExtended/action-hosting-deploy@v0
+        with:
+          repoToken: '${{ secrets.GITHUB_TOKEN }}'
+          firebaseServiceAccount: '${{ secrets.FIREBASE_SERVICE_ACCOUNT_COSTALMANAGER }}'
           channelId: live
           projectId: costalmanager
