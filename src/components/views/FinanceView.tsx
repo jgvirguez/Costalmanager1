@@ -37,6 +37,13 @@ import {
   Check
 } from 'lucide-react';
 import { dataService, ClientAdvance, SupplierAdvance, ExpenseCategory, EXPENSE_CATEGORIES, OperationalExpense, PurchaseInvoiceHistoryEntry, CompanyLoan, type MayorCuentaMovimientoRow } from '../../services/dataService';
+import {
+  computeNetBankBalanceFromTransactions,
+  getOpeningBalanceForAccount,
+  isBankTransactionCountedForBalance,
+  ledgerDeltaForBankAggregate,
+  sumOpeningBalancesForBank
+} from '../../services/bankBalanceUtils';
 import { clientService } from '../../services/clientService';
 import { supplierService } from '../../services/supplierService';
 import { reportService } from '../../services/reportService';
@@ -45,7 +52,7 @@ import { buildExcelFriendlyCsv } from '../../utils/csvExport';
 import { PurchaseEntryModal } from '../modals/PurchaseEntryModal';
 import { ConfirmModal } from '../ConfirmModal';
 import { BillingClient } from '../../types/billing';
-import { useBankBalances } from '../../hooks/useBankBalances';
+import { bankBalanceMapKey, useBankBalances } from '../../hooks/useBankBalances';
 
 const CheckIcon = CheckCircle2;
 
@@ -353,38 +360,66 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
       const bankTransactions = allBankTransactions;
       const bankTxAll = bankTransactions.filter(tx => String(tx.bankId) === String(bankId));
       const profile = bank ? getBankCurrencyProfile(bank) : 'UNKNOWN';
+      const baseFiltered = bankTxAll.filter((tx) => isBankTransactionCountedForBalance(tx));
       const bankTx =
         profile === 'USD_ONLY'
-          ? bankTxAll.filter((tx) => String(tx?.currency ?? 'USD').toUpperCase() === 'USD')
+          ? baseFiltered.filter((tx) => String(tx?.currency ?? 'USD').toUpperCase() === 'USD')
           : profile === 'VES_ONLY'
-            ? bankTxAll.filter((tx) => String(tx?.currency ?? '').toUpperCase() === 'VES')
-            : bankTxAll;
-      
-      const totalInUSD = bankTx
-        .filter(tx => tx && typeof tx.amountUSD === 'number' && tx.amountUSD > 0)
-        .reduce((sum, tx) => sum + tx.amountUSD, 0);
-      
-      const totalOutUSD = bankTx
-        .filter(tx => tx && typeof tx.amountUSD === 'number' && tx.amountUSD < 0)
-        .reduce((sum, tx) => sum + Math.abs(tx.amountUSD), 0);
-      
-      const totalInVES = bankTx
-        .filter(tx => tx && typeof tx.amountVES === 'number' && tx.amountVES > 0)
-        .reduce((sum, tx) => sum + tx.amountVES, 0);
-      
-      const totalOutVES = bankTx
-        .filter(tx => tx && typeof tx.amountVES === 'number' && tx.amountVES < 0)
-        .reduce((sum, tx) => sum + Math.abs(tx.amountVES), 0);
-      
-      const balanceUSD = totalInUSD - totalOutUSD;
-      const balanceVES = totalInVES - totalOutVES;
-      
+            ? baseFiltered.filter((tx) => String(tx?.currency ?? '').toUpperCase() === 'VES')
+            : baseFiltered;
+
+      if (!bank) {
+        const totalInUSD = bankTx.filter((tx) => (Number(tx?.amountUSD ?? 0) || 0) > 0).reduce((s, tx) => s + (Number(tx?.amountUSD ?? 0) || 0), 0);
+        const totalOutUSD = bankTx.filter((tx) => (Number(tx?.amountUSD ?? 0) || 0) < 0).reduce((s, tx) => s + Math.abs(Number(tx?.amountUSD ?? 0) || 0), 0);
+        const totalInVES = bankTx.filter((tx) => (Number(tx?.amountVES ?? 0) || 0) > 0).reduce((s, tx) => s + (Number(tx?.amountVES ?? 0) || 0), 0);
+        const totalOutVES = bankTx.filter((tx) => (Number(tx?.amountVES ?? 0) || 0) < 0).reduce((s, tx) => s + Math.abs(Number(tx?.amountVES ?? 0) || 0), 0);
+        const balanceUSD = totalInUSD - totalOutUSD;
+        const balanceVES = totalInVES - totalOutVES;
+        const methodBreakdown = bankTx.reduce((acc, tx) => {
+          if (!tx || !tx.method) return acc;
+          const method = tx.method;
+          if (!acc[method]) acc[method] = { count: 0, totalUSD: 0, totalVES: 0 };
+          acc[method].count++;
+          acc[method].totalUSD += Number(tx?.amountUSD ?? 0) || 0;
+          acc[method].totalVES += Number(tx?.amountVES ?? 0) || 0;
+          return acc;
+        }, {} as Record<string, { count: number; totalUSD: number; totalVES: number }>);
+        return {
+          totalInUSD,
+          totalOutUSD,
+          balanceUSD,
+          totalInVES,
+          totalOutVES,
+          balanceVES,
+          transactionCount: bankTx.length,
+          lastTransaction: bankTx.length > 0 ? new Date(Math.max(...bankTx.map((tx) => (tx.createdAt ? new Date(tx.createdAt).getTime() : 0)))) : null,
+          methodBreakdown,
+          currencyProfile: profile
+        };
+      }
+
+      let totalInUSD = 0;
+      let totalOutUSD = 0;
+      let totalInVES = 0;
+      let totalOutVES = 0;
+      let balanceUSD = sumOpeningBalancesForBank(bank, 'USD');
+      let balanceVES = sumOpeningBalancesForBank(bank, 'VES');
+      for (const tx of bankTx) {
+        const dUsd = ledgerDeltaForBankAggregate(tx, bank, 'USD');
+        const dVes = ledgerDeltaForBankAggregate(tx, bank, 'VES');
+        if (dUsd > 0) totalInUSD += dUsd;
+        else if (dUsd < 0) totalOutUSD += Math.abs(dUsd);
+        if (dVes > 0) totalInVES += dVes;
+        else if (dVes < 0) totalOutVES += Math.abs(dVes);
+        balanceUSD += dUsd;
+        balanceVES += dVes;
+      }
+
       const transactionCount = bankTx.length;
-      const lastTransaction = bankTx.length > 0 
+      const lastTransaction = bankTx.length > 0
         ? new Date(Math.max(...bankTx.map(tx => tx.createdAt ? new Date(tx.createdAt).getTime() : 0)))
         : null;
-      
-      // Calcular por método de pago
+
       const methodBreakdown = bankTx.reduce((acc, tx) => {
         if (!tx || !tx.method) return acc;
         const method = tx.method;
@@ -392,11 +427,11 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
           acc[method] = { count: 0, totalUSD: 0, totalVES: 0 };
         }
         acc[method].count++;
-        acc[method].totalUSD += (typeof tx.amountUSD === 'number' ? tx.amountUSD : 0);
-        acc[method].totalVES += (typeof tx.amountVES === 'number' ? tx.amountVES : 0);
+        acc[method].totalUSD += ledgerDeltaForBankAggregate(tx, bank, 'USD');
+        acc[method].totalVES += ledgerDeltaForBankAggregate(tx, bank, 'VES');
         return acc;
       }, {} as Record<string, { count: number; totalUSD: number; totalVES: number }>);
-      
+
       return {
         totalInUSD,
         totalOutUSD,
@@ -497,7 +532,15 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
   const [cuentaOptionsMayor, setCuentaOptionsMayor] = useState<Array<{ codigo: string; nombre: string }>>([]);
   // FIN-04: Manual bank movement modal
   const [showManualTxModal, setShowManualTxModal] = useState(false);
-  const [manualTx, setManualTx] = useState({ bankId: '', concept: '', reference: '', amountUSD: '', amountVES: '', type: 'IN' as 'IN' | 'OUT' });
+  const [manualTx, setManualTx] = useState({
+    bankId: '',
+    accountId: '',
+    concept: '',
+    reference: '',
+    amountUSD: '',
+    amountVES: '',
+    type: 'IN' as 'IN' | 'OUT'
+  });
   const [manualTxError, setManualTxError] = useState('');
   const [manualTxSaving, setManualTxSaving] = useState(false);
 
@@ -870,7 +913,7 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
   const [bankFormName, setBankFormName] = useState('');
   const [bankFormActive, setBankFormActive] = useState(true);
   const [bankFormMethods, setBankFormMethods] = useState<Record<string, boolean>>({});
-  const [bankAccounts, setBankAccounts] = useState<Array<{ id: string; label: string; currency: 'VES' | 'USD'; accountNumber: string; accountType?: string; holder?: string; rif?: string; phone?: string }>>([]);
+  const [bankAccounts, setBankAccounts] = useState<Array<{ id: string; label: string; currency: 'VES' | 'USD'; accountNumber: string; openingBalance?: number; accountType?: string; holder?: string; rif?: string; phone?: string }>>([]);
   const [bankFormError, setBankFormError] = useState<string>('');
   const [editingPOSTerminalId, setEditingPOSTerminalId] = useState('');
   const [posTerminalName, setPosTerminalName] = useState('');
@@ -890,6 +933,11 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
   const [showBankTxModal, setShowBankTxModal] = useState(false);
   const [bankTxTarget, setBankTxTarget] = useState<any>(null);
   const [bankTxList, setBankTxList] = useState<any[]>([]);
+  const [bankTxOpBal, setBankTxOpBal] = useState<{ usd: number | null; ves: number | null; loading: boolean }>({
+    usd: null,
+    ves: null,
+    loading: false
+  });
   const [bankTxLoading, setBankTxLoading] = useState(false);
   const [bankTxError, setBankTxError] = useState<string>('');
   const [showBankSupportModal, setShowBankSupportModal] = useState(false);
@@ -917,6 +965,38 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
     [payrollLines]
   );
   const payrollBankBalances = useBankBalances(payrollBalanceKeys);
+
+  const apPayBalanceKeys = React.useMemo(
+    () =>
+      showAPPaymentModal
+        ? apPayLines
+            .filter((l) => String(l.bankId ?? '').trim() && String(l.accountId ?? '').trim())
+            .map((l) => ({
+              bankId: String(l.bankId),
+              accountId: String(l.accountId),
+              currency: (getAPPaymentCurrency(l.method) === 'VES' ? 'VES' : 'USD') as 'USD' | 'VES'
+            }))
+        : [],
+    [showAPPaymentModal, apPayLines]
+  );
+  const apPayBankBalances = useBankBalances(apPayBalanceKeys);
+
+  const bankWideBalanceKeys = React.useMemo(() => {
+    if (activeSubTab !== 'banks') return [];
+    return (banks || []).flatMap((b: any) => {
+      if (b?.active === false) return [];
+      const prof = getBankCurrencyProfile(b);
+      const keys: Array<{ bankId: string; accountId: string; currency: 'USD' | 'VES' }> = [];
+      if (prof === 'USD_ONLY' || prof === 'MIXED' || prof === 'UNKNOWN') {
+        keys.push({ bankId: String(b.id), accountId: '', currency: 'USD' });
+      }
+      if (prof === 'VES_ONLY' || prof === 'MIXED' || prof === 'UNKNOWN') {
+        keys.push({ bankId: String(b.id), accountId: '', currency: 'VES' });
+      }
+      return keys;
+    });
+  }, [activeSubTab, banks, tick]);
+  const bankWideBalances = useBankBalances(bankWideBalanceKeys);
   const getAPPaymentBankOptions = (method: string) => activeBanks.filter((bank: any) => {
     const supportedMethods = Array.isArray(bank?.supportedMethods) ? bank.supportedMethods : [];
     return supportedMethods.length === 0 || supportedMethods.includes(method);
@@ -957,16 +1037,17 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
 
   const getAPPaymentAccountBalance = (bankId: string, accountId: string, currency: 'USD' | 'VES') => {
     if (!bankId || !accountId) return 0;
-    return allBankTransactions
-      .filter((tx: any) => String(tx?.bankId ?? '') === String(bankId) && String(tx?.accountId ?? '') === String(accountId))
-      .reduce((acc: number, tx: any) => acc + Number(currency === 'VES' ? tx?.amountVES ?? 0 : tx?.amountUSD ?? 0), 0);
-  };
-
-  const getManualTxBankBalance = (bankId: string, currency: 'USD' | 'VES') => {
-    if (!bankId) return 0;
-    return allBankTransactions
-      .filter((tx: any) => String(tx?.bankId ?? '') === String(bankId))
-      .reduce((acc: number, tx: any) => acc + Number(currency === 'VES' ? tx?.amountVES ?? 0 : tx?.amountUSD ?? 0), 0);
+    const bank = activeBanks.find((b: any) => String(b?.id ?? '') === String(bankId));
+    const acc = bank?.accounts?.find((a: any) => String(a?.id ?? '') === String(accountId));
+    const opening =
+      acc && String(acc?.currency ?? '').trim().toUpperCase() === currency ? getOpeningBalanceForAccount(acc) : 0;
+    return computeNetBankBalanceFromTransactions({
+      transactions: allBankTransactions,
+      bankId,
+      accountId,
+      currency,
+      openingBalance: opening
+    });
   };
 
   const apPayTotalUSD = React.useMemo(
@@ -1164,7 +1245,8 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
     }
     for (const [key, totalUsed] of groupedUsage.entries()) {
       const [bankId, accountId, currency] = key.split('|');
-      const available = getAPPaymentAccountBalance(bankId, accountId, currency === 'VES' ? 'VES' : 'USD');
+      const cur = currency === 'VES' ? 'VES' : 'USD';
+      const available = await dataService.getAvailableBankBalance({ bankId, accountId, currency: cur });
       if (available + 0.005 < totalUsed) {
         setApPayError(`Saldo insuficiente en la cuenta seleccionada. Disponible ${currency === 'VES' ? 'Bs' : '$'} ${available.toFixed(2)} para consumir ${currency === 'VES' ? 'Bs' : '$'} ${totalUsed.toFixed(2)}.`);
         return;
@@ -1342,6 +1424,42 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
     }
   };
 
+  React.useEffect(() => {
+    if (!showBankTxModal || !bankTxTarget?.id) return;
+    let cancelled = false;
+    const bid = String(bankTxTarget.id);
+    const prof = getBankCurrencyProfile(bankTxTarget);
+    setBankTxOpBal((s) => ({ ...s, loading: true }));
+    (async () => {
+      try {
+        let usd: number | null = null;
+        let ves: number | null = null;
+        if (prof !== 'VES_ONLY') {
+          usd = await dataService.getAvailableBankBalance({ bankId: bid, currency: 'USD' });
+        }
+        if (prof !== 'USD_ONLY') {
+          ves = await dataService.getAvailableBankBalance({ bankId: bid, currency: 'VES' });
+        }
+        if (!cancelled) setBankTxOpBal({ usd, ves, loading: false });
+      } catch {
+        if (!cancelled) setBankTxOpBal({ usd: null, ves: null, loading: false });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [showBankTxModal, bankTxTarget, tick]);
+
+  React.useEffect(() => {
+    if (!showManualTxModal || !manualTx.bankId) return;
+    const bank = activeBanks.find((b: any) => String(b?.id ?? '') === String(manualTx.bankId));
+    const accs = Array.isArray(bank?.accounts) ? bank.accounts : [];
+    if (accs.length !== 1) return;
+    const only = String(accs[0]?.id ?? '').trim();
+    if (!only) return;
+    setManualTx((p) => (p.accountId === only ? p : { ...p, accountId: only }));
+  }, [showManualTxModal, manualTx.bankId, activeBanks]);
+
   const handleViewBankReport = async (bank: any) => {
     console.log('🏦 Abriendo reporte para banco:', bank);
     setSelectedBankForReport(bank);
@@ -1362,11 +1480,13 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
   const generateBankReport = async (bank: any) => {
     try {
       const bankTransactions = await dataService.getBankTransactions({ take: 1000 }) || [];
-      const tx = bankTransactions.filter((t: any) => String(t.bankId) === String(bank.id))
+      const tx = bankTransactions
+        .filter((t: any) => String(t.bankId) === String(bank.id))
+        .filter((t: any) => isBankTransactionCountedForBalance(t))
         .sort((a: any, b: any) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
 
-      let runningBalanceUSD = 0;
-      let runningBalanceVES = 0;
+      let runningBalanceUSD = sumOpeningBalancesForBank(bank, 'USD');
+      let runningBalanceVES = sumOpeningBalancesForBank(bank, 'VES');
 
       return tx.map((transaction: any) => {
         const amountUSD = transaction.amountUSD || 0;
@@ -1462,7 +1582,8 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
         id: Math.random().toString(36).slice(2, 10),
         label: 'Cuenta',
         currency: 'VES',
-        accountNumber: ''
+        accountNumber: '',
+        openingBalance: 0
       }
     ]));
   };
@@ -1828,6 +1949,45 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
     });
   }, [ledger, ledgerDateRange]);
 
+  /** Una fila por asiento contable, mismos importes que el mayor (evita montos $0 si `detalles_asiento` no llega por cliente). */
+  const operationalLedgerView = React.useMemo(() => {
+    if (!Array.isArray(mayorRows) || mayorRows.length === 0) return filteredLedger;
+    const bySeat = new Map<
+      string,
+      { fecha: Date; tipoOperacion: string; descripcionAsiento: string; sumDebe: number; sumHaber: number }
+    >();
+    for (const r of mayorRows) {
+      const id = String(r.asientoId ?? '').trim();
+      if (!id) continue;
+      const fecha = r.fecha instanceof Date ? r.fecha : new Date(r.fecha);
+      const debe = Number(r.debe ?? 0) || 0;
+      const haber = Number(r.haber ?? 0) || 0;
+      const prev = bySeat.get(id);
+      if (!prev) {
+        bySeat.set(id, {
+          fecha,
+          tipoOperacion: String(r.tipoOperacion ?? '').trim(),
+          descripcionAsiento: String(r.descripcionAsiento ?? '').trim(),
+          sumDebe: debe,
+          sumHaber: haber
+        });
+      } else {
+        prev.sumDebe += debe;
+        prev.sumHaber += haber;
+        bySeat.set(id, prev);
+      }
+    }
+    return Array.from(bySeat.values())
+      .map((v) => ({
+        timestamp: v.fecha,
+        type: dataService.getLedgerFlowTypeForOperation(v.tipoOperacion),
+        category: v.tipoOperacion || 'ASIENTO',
+        description: v.descripcionAsiento || 'Movimiento contable',
+        amountUSD: Math.round(Math.max(v.sumDebe, v.sumHaber) * 100) / 100
+      }))
+      .sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
+  }, [mayorRows, filteredLedger]);
+
   useEffect(() => {
     if (activeSubTab !== 'ledger') return;
     let cancelled = false;
@@ -1857,22 +2017,45 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
 
   // FIN-04: Manual bank transaction handler
   const handleManualBankTx = async () => {
-    if (!manualTx.bankId || !manualTx.concept) { setManualTxError('Banco y concepto son obligatorios'); return; }
+    if (!manualTx.bankId || !manualTx.concept) {
+      setManualTxError('Banco y concepto son obligatorios');
+      return;
+    }
+    const accountId = String(manualTx.accountId ?? '').trim();
+    if (!accountId) {
+      setManualTxError('Seleccione la cuenta bancaria.');
+      return;
+    }
     const rawUSD = parseFloat((manualTx.amountUSD || '0').replace(',', '.'));
     const rawVES = parseFloat((manualTx.amountVES || '0').replace(',', '.'));
     const amtUSD = Number.isFinite(rawUSD) ? Math.abs(rawUSD) : 0;
     const amtVES = Number.isFinite(rawVES) ? Math.abs(rawVES) : 0;
-    if (amtUSD === 0 && amtVES === 0) { setManualTxError('Ingrese al menos un monto'); return; }
+    if (amtUSD === 0 && amtVES === 0) {
+      setManualTxError('Ingrese al menos un monto');
+      return;
+    }
     if (manualTx.type === 'OUT') {
-      const availableUSD = getManualTxBankBalance(manualTx.bankId, 'USD');
-      const availableVES = getManualTxBankBalance(manualTx.bankId, 'VES');
-      if (amtUSD > 0 && (availableUSD + 0.005) < amtUSD) {
-        setManualTxError(`Saldo insuficiente en USD. Disponible: $ ${availableUSD.toFixed(2)}.`);
-        return;
+      if (amtUSD > 0) {
+        const availableUSD = await dataService.getAvailableBankBalance({
+          bankId: manualTx.bankId,
+          accountId,
+          currency: 'USD'
+        });
+        if ((availableUSD + 0.005) < amtUSD) {
+          setManualTxError(`Saldo insuficiente en USD (cuenta). Disponible: $ ${availableUSD.toFixed(2)}.`);
+          return;
+        }
       }
-      if (amtVES > 0 && (availableVES + 0.005) < amtVES) {
-        setManualTxError(`Saldo insuficiente en Bs. Disponible: Bs ${availableVES.toFixed(2)}.`);
-        return;
+      if (amtVES > 0) {
+        const availableVES = await dataService.getAvailableBankBalance({
+          bankId: manualTx.bankId,
+          accountId,
+          currency: 'VES'
+        });
+        if ((availableVES + 0.05) < amtVES) {
+          setManualTxError(`Saldo insuficiente en Bs (cuenta). Disponible: Bs ${availableVES.toFixed(2)}.`);
+          return;
+        }
       }
     }
     setManualTxSaving(true);
@@ -1883,14 +2066,16 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
       const sign = manualTx.type === 'OUT' ? -1 : 1;
       await dataService.addManualBankTransaction({
         bankId: manualTx.bankId,
+        accountId,
         amountUSD: sign * amtUSD,
         amountVES: sign * amtVES,
         method: 'MANUAL',
         reference: manualTx.reference || undefined,
-        description: manualTx.concept,
+        description: manualTx.concept
       });
-      setManualTx({ bankId: '', concept: '', reference: '', amountUSD: '', amountVES: '', type: 'IN' });
+      setManualTx({ bankId: '', accountId: '', concept: '', reference: '', amountUSD: '', amountVES: '', type: 'IN' });
       setShowManualTxModal(false);
+      setTick((t) => t + 1);
     } catch (e: any) {
       setManualTxError(String(e?.message ?? 'Error al guardar'));
     } finally {
@@ -3863,7 +4048,12 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
                              const rateUsed = currency === 'VES' ? (Number((line.rateUsed || '').replace(',', '.')) || 0) : 0;
                              const amountUSD = Number((line.amountUSD || '').replace(',', '.')) || 0;
                              const requiredVES = currency === 'VES' ? Math.round(amountUSD * rateUsed * 100) / 100 : 0;
-                             const availableBalance = getAPPaymentAccountBalance(String(line.bankId ?? ''), String(line.accountId ?? ''), currency);
+                             const apBalKey = bankBalanceMapKey(String(line.bankId ?? ''), String(line.accountId ?? ''), currency);
+                             const apBalRow = apPayBankBalances.get(apBalKey);
+                             const availableBalance =
+                               apBalRow && !apBalRow.loading && !apBalRow.error
+                                 ? apBalRow.balance
+                                 : getAPPaymentAccountBalance(String(line.bankId ?? ''), String(line.accountId ?? ''), currency);
                              return (
                                <div key={line.id} className="rounded-[1.75rem] border border-slate-200 bg-white p-5 space-y-4">
                                  <div className="flex items-center justify-between gap-3">
@@ -3943,7 +4133,12 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
                                    </div>
                                    <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-4">
                                      <div className="text-[8px] font-black uppercase tracking-widest text-slate-400">Saldo disponible</div>
-                                     <div className="mt-2 text-[16px] font-black text-emerald-700 font-mono">{currency === 'VES' ? 'Bs' : '$'} {availableBalance.toFixed(2)}</div>
+                                     <div className="mt-2 text-[16px] font-black text-emerald-700 font-mono flex items-baseline gap-2 flex-wrap">
+                                       {currency === 'VES' ? 'Bs' : '$'} {availableBalance.toFixed(2)}
+                                       {apBalRow?.loading && (
+                                         <span className="text-[9px] font-bold text-slate-400 normal-case">sincronizando…</span>
+                                       )}
+                                     </div>
                                    </div>
                                    <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-4">
                                      <div className="text-[8px] font-black uppercase tracking-widest text-slate-400">Cuenta seleccionada</div>
@@ -4466,7 +4661,8 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
         const pendCalc = Math.max(0, netoCalc - payrollTotalPaid);
         const payrollHasInsufficientBalance = payrollLines.some(l => {
           if (!l.bankId) return false;
-          const balKey = `${l.bankId}::${l.accountId}`;
+          const balCurr = (l.method === 'cash_usd' || l.method === 'zelle') ? 'USD' : 'VES';
+          const balKey = bankBalanceMapKey(l.bankId, l.accountId, balCurr);
           const bal = payrollBankBalances.get(balKey);
           if (!bal || bal.loading || bal.error) return false;
           const lineAmt = l.currency === 'BS' ? (parseFloat(l.amountBS) || 0) : (parseFloat(l.amountUSD) || 0);
@@ -4474,7 +4670,8 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
         });
         const payrollInsufficientLine = payrollLines.find(l => {
           if (!l.bankId) return false;
-          const balKey = `${l.bankId}::${l.accountId}`;
+          const balCurr = (l.method === 'cash_usd' || l.method === 'zelle') ? 'USD' : 'VES';
+          const balKey = bankBalanceMapKey(l.bankId, l.accountId, balCurr);
           const bal = payrollBankBalances.get(balKey);
           if (!bal || bal.loading || bal.error) return false;
           const lineAmt = l.currency === 'BS' ? (parseFloat(l.amountBS) || 0) : (parseFloat(l.amountUSD) || 0);
@@ -4825,9 +5022,9 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
                           )}
                           {/* Saldo disponible del banco seleccionado */}
                           {line.bankId && (() => {
-                            const balKey = `${line.bankId}::${line.accountId}`;
-                            const bal = payrollBankBalances.get(balKey);
                             const balCurr = (line.method === 'cash_usd' || line.method === 'zelle') ? 'USD' : 'VES';
+                            const balKey = bankBalanceMapKey(line.bankId, line.accountId, balCurr);
+                            const bal = payrollBankBalances.get(balKey);
                             const lineAmt = line.currency === 'BS'
                               ? parseFloat(line.amountBS) || 0
                               : parseFloat(line.amountUSD) || 0;
@@ -4984,7 +5181,8 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
                       if (!payrollEmpId || payrollSalaryNum <= 0) { setPayrollError('Selecciona persona y sueldo pactado.'); return; }
                       if (payrollTotalPaid <= 0) { setPayrollError('Agrega al menos una línea de pago con monto.'); return; }
                       if (payrollInsufficientLine) {
-                        const balKey = `${payrollInsufficientLine.bankId}::${payrollInsufficientLine.accountId}`;
+                        const insCurr = (payrollInsufficientLine.method === 'cash_usd' || payrollInsufficientLine.method === 'zelle') ? 'USD' : 'VES';
+                        const balKey = bankBalanceMapKey(payrollInsufficientLine.bankId, payrollInsufficientLine.accountId, insCurr);
                         const bal = payrollBankBalances.get(balKey);
                         const currency = payrollInsufficientLine.currency === 'BS' ? 'Bs' : 'USD';
                         const requested = payrollInsufficientLine.currency === 'BS' ? (parseFloat(payrollInsufficientLine.amountBS) || 0).toFixed(2) : (parseFloat(payrollInsufficientLine.amountUSD) || 0).toFixed(2);
@@ -5208,7 +5406,9 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
           <div className="bg-white rounded-[2rem] border border-slate-200 overflow-hidden shadow-sm">
             <div className="p-6 border-b bg-slate-50/30">
               <h4 className="font-headline font-black text-sm uppercase text-slate-700">Vista resumen (operativa)</h4>
-              <p className="text-[9px] text-slate-400 font-bold mt-1 uppercase tracking-widest">Ingresos/egresos aprox. (ventas, gastos, notas) — no reemplaza el mayor contable</p>
+              <p className="text-[9px] text-slate-400 font-bold mt-1 uppercase tracking-widest">
+                Mismo periodo y filtros que el mayor: un renglón por asiento (monto = parte mayor entre total debe y total haber del asiento), clasificado ingreso/egreso. No sustituye el mayor analítico por cuenta.
+              </p>
             </div>
             <div className="overflow-x-auto">
               <table className="w-full text-left">
@@ -5222,14 +5422,14 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
                   </tr>
                 </thead>
                 <tbody className="text-[11px]">
-                  {filteredLedger.length === 0 ? (
+                  {operationalLedgerView.length === 0 ? (
                     <tr>
                       <td colSpan={5} className="p-12 text-center opacity-30 font-black uppercase text-xs">
                         Sin movimientos en resumen
                       </td>
                     </tr>
                   ) : (
-                    filteredLedger.map((entry, idx) => (
+                    operationalLedgerView.map((entry, idx) => (
                       <tr key={idx} className="border-b border-slate-50">
                         <td className="px-6 py-4">
                           <div className="font-bold text-slate-500">{entry.timestamp.toLocaleDateString()}</div>
@@ -5265,13 +5465,13 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
               <div className="text-right">
                 <p className="text-[9px] font-black text-slate-400 uppercase">Total ingresos (filtro fechas resumen)</p>
                 <p className="text-lg font-black text-emerald-600">
-                  $ {filteredLedger.filter((e: any) => e.type === 'INCOME').reduce((a: number, b: any) => a + b.amountUSD, 0).toFixed(2)}
+                  $ {operationalLedgerView.filter((e: any) => e.type === 'INCOME').reduce((a: number, b: any) => a + b.amountUSD, 0).toFixed(2)}
                 </p>
               </div>
               <div className="text-right">
                 <p className="text-[9px] font-black text-slate-400 uppercase">Total egresos</p>
                 <p className="text-lg font-black text-red-600">
-                  $ {filteredLedger.filter((e: any) => e.type === 'EXPENSE').reduce((a: number, b: any) => a + b.amountUSD, 0).toFixed(2)}
+                  $ {operationalLedgerView.filter((e: any) => e.type === 'EXPENSE').reduce((a: number, b: any) => a + b.amountUSD, 0).toFixed(2)}
                 </p>
               </div>
             </div>
@@ -5300,6 +5500,12 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
                 banks.map((b: any) => {
                   const analytics = getBankAnalytics(b.id, b);
                   const prof = analytics.currencyProfile ?? 'UNKNOWN';
+                  const usdLive = bankWideBalances.get(bankBalanceMapKey(String(b.id), '', 'USD'));
+                  const vesLive = bankWideBalances.get(bankBalanceMapKey(String(b.id), '', 'VES'));
+                  const balanceUSD =
+                    usdLive && !usdLive.loading && !usdLive.error ? usdLive.balance : analytics.balanceUSD;
+                  const balanceVES =
+                    vesLive && !vesLive.loading && !vesLive.error ? vesLive.balance : analytics.balanceVES;
                   return (
                     <div
                       key={b.id}
@@ -5318,8 +5524,12 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
                             {prof === 'USD_ONLY' && (
                               <div>
                                 <div className="text-slate-400 uppercase tracking-wider text-[10px]">Saldo (USD)</div>
-                                <div className={`font-black text-[13px] ${analytics.balanceUSD >= 0 ? 'text-emerald-600' : 'text-red-600'}`}>
-                                  {usd(analytics.balanceUSD, 2)}
+                                <div className={`font-black text-[13px] ${balanceUSD >= 0 ? 'text-emerald-600' : 'text-red-600'}`}>
+                                  {usdLive?.loading ? (
+                                    <span className="text-slate-400 animate-pulse text-[11px]">Actualizando…</span>
+                                  ) : (
+                                    usd(balanceUSD, 2)
+                                  )}
                                 </div>
                                 <div className="text-[8px] text-slate-400 font-bold uppercase tracking-wider mt-0.5">Cuentas en dólares — sin Bs</div>
                               </div>
@@ -5327,8 +5537,12 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
                             {prof === 'VES_ONLY' && (
                               <div>
                                 <div className="text-slate-400 uppercase tracking-wider text-[10px]">Saldo (Bs)</div>
-                                <div className={`font-black text-[13px] ${analytics.balanceVES >= 0 ? 'text-emerald-600' : 'text-red-600'}`}>
-                                  {bs(analytics.balanceVES, 2)}
+                                <div className={`font-black text-[13px] ${balanceVES >= 0 ? 'text-emerald-600' : 'text-red-600'}`}>
+                                  {vesLive?.loading ? (
+                                    <span className="text-slate-400 animate-pulse text-[11px]">Actualizando…</span>
+                                  ) : (
+                                    bs(balanceVES, 2)
+                                  )}
                                 </div>
                                 <div className="text-[8px] text-slate-400 font-bold uppercase tracking-wider mt-0.5">Cuentas en bolívares — sin USD</div>
                               </div>
@@ -5337,14 +5551,22 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
                               <div className="grid grid-cols-2 gap-3 text-[10px]">
                                 <div>
                                   <div className="text-slate-400 uppercase tracking-wider">Saldo USD</div>
-                                  <div className={`font-black ${analytics.balanceUSD >= 0 ? 'text-emerald-600' : 'text-red-600'}`}>
-                                    ${fmt(analytics.balanceUSD, 2)}
+                                  <div className={`font-black ${balanceUSD >= 0 ? 'text-emerald-600' : 'text-red-600'}`}>
+                                    {usdLive?.loading ? (
+                                      <span className="text-slate-400 animate-pulse">…</span>
+                                    ) : (
+                                      `$${fmt(balanceUSD, 2)}`
+                                    )}
                                   </div>
                                 </div>
                                 <div>
                                   <div className="text-slate-400 uppercase tracking-wider">Saldo Bs</div>
-                                  <div className={`font-black ${analytics.balanceVES >= 0 ? 'text-emerald-600' : 'text-red-600'}`}>
-                                    {bs(analytics.balanceVES, 2)}
+                                  <div className={`font-black ${balanceVES >= 0 ? 'text-emerald-600' : 'text-red-600'}`}>
+                                    {vesLive?.loading ? (
+                                      <span className="text-slate-400 animate-pulse">…</span>
+                                    ) : (
+                                      bs(balanceVES, 2)
+                                    )}
                                   </div>
                                 </div>
                               </div>
@@ -5497,14 +5719,14 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
                           className="px-3 py-1.5 bg-white border border-slate-200 rounded-lg text-[9px] font-black uppercase text-slate-500"
                         >Quitar</button>
                       </div>
-                      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
                         <div>
                           <label className="text-[8px] font-black uppercase tracking-widest text-slate-400">Etiqueta</label>
                           <input value={a.label} onChange={(e) => updateAccountRow(a.id, { label: e.target.value })} className="w-full mt-1 bg-white rounded-xl p-3 text-[11px] font-bold outline-none border border-slate-200" />
                         </div>
                         <div>
                           <label className="text-[8px] font-black uppercase tracking-widest text-slate-400">Moneda</label>
-                          <select value={a.currency} onChange={(e) => updateAccountRow(a.id, { currency: e.target.value })} className="w-full mt-1 bg-white rounded-xl p-3 text-[11px] font-bold outline-none border border-slate-200">
+                          <select value={a.currency} onChange={(e) => updateAccountRow(a.id, { currency: e.target.value as 'VES' | 'USD' })} className="w-full mt-1 bg-white rounded-xl p-3 text-[11px] font-bold outline-none border border-slate-200">
                             <option value="VES">Bs</option>
                             <option value="USD">USD</option>
                           </select>
@@ -5512,6 +5734,22 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
                         <div>
                           <label className="text-[8px] font-black uppercase tracking-widest text-slate-400">Nro. Cuenta</label>
                           <input value={a.accountNumber} onChange={(e) => updateAccountRow(a.id, { accountNumber: e.target.value })} className="w-full mt-1 bg-white rounded-xl p-3 text-[11px] font-bold outline-none border border-slate-200" />
+                        </div>
+                        <div>
+                          <label className="text-[8px] font-black uppercase tracking-widest text-slate-400">Saldo inicial</label>
+                          <input
+                            type="number"
+                            step="0.01"
+                            value={a.openingBalance ?? ''}
+                            placeholder="0"
+                            onChange={(e) =>
+                              updateAccountRow(a.id, {
+                                openingBalance: e.target.value === '' ? 0 : Number(e.target.value.replace(',', '.')) || 0
+                              })
+                            }
+                            className="w-full mt-1 bg-white rounded-xl p-3 text-[11px] font-bold outline-none border border-slate-200"
+                          />
+                          <p className="text-[8px] text-slate-400 mt-1 font-bold uppercase tracking-wide">En {a.currency === 'USD' ? 'USD' : 'Bs'} al registrar la cuenta</p>
                         </div>
                       </div>
 
@@ -5679,6 +5917,7 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
                   setBankTxList([]);
                   setBankTxError('');
                   setBankTxLoading(false);
+                  setBankTxOpBal({ usd: null, ves: null, loading: false });
                 }}
                 className="px-4 py-2 bg-slate-900 text-white rounded-xl text-[9px] font-black uppercase"
               >Cerrar</button>
@@ -5779,6 +6018,33 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
                       </div>
                     </div>
                   )}
+
+                  <div className="mb-6 p-4 rounded-2xl border border-indigo-200 bg-indigo-50/60">
+                    <div className="text-[9px] font-black uppercase tracking-widest text-indigo-800">
+                      Saldo operativo (libro)
+                    </div>
+                    <p className="text-[8px] text-slate-600 font-bold mt-1 leading-relaxed">
+                      Mismo criterio que CxP y validación de salidas: saldo inicial + movimientos que cuentan para balance
+                      (no pendientes / anulados). La tabla puede estar filtrada y no coincide con la suma de totales arriba.
+                    </p>
+                    <div className="mt-3 flex flex-wrap gap-4 text-[11px] font-black font-mono">
+                      {bankTxOpBal.loading ? (
+                        <span className="text-slate-500 uppercase tracking-widest text-[9px]">Calculando…</span>
+                      ) : (
+                        <>
+                          {bankTxOpBal.usd !== null && (
+                            <span className="text-emerald-800">USD: {usd(bankTxOpBal.usd, 2)}</span>
+                          )}
+                          {bankTxOpBal.ves !== null && (
+                            <span className="text-slate-900">Bs: {bs(bankTxOpBal.ves, 2)}</span>
+                          )}
+                          {bankTxOpBal.usd === null && bankTxOpBal.ves === null && (
+                            <span className="text-slate-400 uppercase text-[9px]">No disponible</span>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  </div>
 
                   {bankTxList.length === 0 ? (
                     <div className="p-12 text-center opacity-30 font-black uppercase tracking-widest text-[10px]">Sin movimientos</div>
@@ -6174,10 +6440,35 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
             <div className="p-8 space-y-4">
               <div>
                 <label className="text-[9px] font-black uppercase tracking-widest text-slate-400">Banco</label>
-                <select value={manualTx.bankId} onChange={e => setManualTx(p => ({...p, bankId: e.target.value}))}
-                  className="w-full mt-1 bg-slate-100 rounded-xl p-3 text-[12px] font-black text-slate-900 border-0 focus:ring-2 focus:ring-emerald-500/20">
+                <select
+                  value={manualTx.bankId}
+                  onChange={(e) => setManualTx((p) => ({ ...p, bankId: e.target.value, accountId: '' }))}
+                  className="w-full mt-1 bg-slate-100 rounded-xl p-3 text-[12px] font-black text-slate-900 border-0 focus:ring-2 focus:ring-emerald-500/20"
+                >
                   <option value="">Seleccione banco...</option>
-                  {banks.map((b: any) => <option key={b.id} value={b.id}>{b.name}</option>)}
+                  {banks.map((b: any) => (
+                    <option key={b.id} value={b.id}>
+                      {b.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="text-[9px] font-black uppercase tracking-widest text-slate-400">Cuenta</label>
+                <select
+                  value={manualTx.accountId}
+                  onChange={(e) => setManualTx((p) => ({ ...p, accountId: e.target.value }))}
+                  disabled={!manualTx.bankId}
+                  className="w-full mt-1 bg-slate-100 rounded-xl p-3 text-[12px] font-black text-slate-900 border-0 focus:ring-2 focus:ring-emerald-500/20 disabled:opacity-50"
+                >
+                  <option value="">{manualTx.bankId ? 'Seleccione cuenta…' : 'Primero elija banco'}</option>
+                  {(activeBanks.find((b: any) => String(b?.id ?? '') === String(manualTx.bankId))?.accounts || []).map(
+                    (a: any) => (
+                      <option key={String(a.id)} value={String(a.id)}>
+                        {String(a.label ?? a.id)} · {String(a.currency ?? 'VES').toUpperCase()}
+                      </option>
+                    )
+                  )}
                 </select>
               </div>
               <div>

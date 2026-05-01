@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { AlertCircle, Download } from 'lucide-react';
 import { dataService } from '../../services/dataService';
+import { isBankTransactionCountedForBalance, sumOpeningBalancesForBank } from '../../services/bankBalanceUtils';
 import { buildExcelFriendlyMatrixCsv } from '../../utils/csvExport';
 
 export function BankReport({ bank, onClose }: { bank: any; onClose: () => void }) {
@@ -25,15 +26,17 @@ export function BankReport({ bank, onClose }: { bank: any; onClose: () => void }
         const bankTransactions = await dataService.getBankTransactions() || [];
         console.log('🏦 Transacciones bancarias obtenidas:', bankTransactions.length);
         
-        const tx = bankTransactions.filter((t: any) => String(t.bankId) === String(bank.id))
+        const tx = bankTransactions
+          .filter((t: any) => String(t.bankId) === String(bank.id))
+          .filter((t: any) => isBankTransactionCountedForBalance(t))
           .sort((a: any, b: any) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
         
         console.log('🏦 Transacciones filtradas para este banco:', tx.length);
         console.log('🏦 Primera transacción:', tx[0]);
         console.log('🏦 Última transacción:', tx[tx.length - 1]);
 
-        let runningBalanceUSD = 0;
-        let runningBalanceVES = 0;
+        let runningBalanceUSD = sumOpeningBalancesForBank(bank, 'USD');
+        let runningBalanceVES = sumOpeningBalancesForBank(bank, 'VES');
 
         const report = tx.map((transaction: any, index: number) => {
           const amountUSD = transaction.amountUSD || 0;

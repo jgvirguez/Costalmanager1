@@ -23,6 +23,11 @@ import { normalizeDocumentId } from '../utils/idNormalization';
 import { auth, db, storage } from './firebaseConfig';
 import { authService } from './authService';
 import { LedgerOperationType, LedgerService, MissingLedgerRuleError } from './ledgerService';
+import {
+  computeBankWideNetBalance,
+  computeNetBankBalanceFromTransactions,
+  getOpeningBalanceForAccount
+} from './bankBalanceUtils';
 
 export type UserRole = 'ADMIN' | 'ALMACENISTA' | 'CAJERO' | 'FINANZAS' | 'SUPERVISOR';
 
@@ -112,6 +117,8 @@ export interface BankAccount {
   label: string;
   currency: 'VES' | 'USD';
   accountNumber: string;
+  /** Saldo al incorporar la cuenta al sistema (en la moneda de `currency`). */
+  openingBalance?: number;
   accountType?: string;
   holder?: string;
   rif?: string;
@@ -1219,7 +1226,17 @@ export interface BankTransactionRecord {
   accountId?: string;
   accountLabel?: string;
   method: string;
-  source: 'AR_PAYMENT' | 'SALE_PAYMENT' | 'CREDIT_DOWN' | 'AP_PAYMENT' | 'PURCHASE_PAYMENT' | 'MANUAL_ENTRY' | 'SALE_RETURN' | 'LOAN_DISBURSEMENT';
+  source:
+    | 'AR_PAYMENT'
+    | 'SALE_PAYMENT'
+    | 'CREDIT_DOWN'
+    | 'AP_PAYMENT'
+    | 'PURCHASE_PAYMENT'
+    | 'MANUAL_ENTRY'
+    | 'SALE_RETURN'
+    | 'LOAN_DISBURSEMENT'
+    | 'CLIENT_ADVANCE'
+    | 'AR_CHANGE';
   sourceId: string;
   cashBoxSessionId?: string;
   posTerminalId?: string;
@@ -1252,6 +1269,9 @@ export interface BankTransactionRecord {
   reconciled?: boolean;
   reconciledAt?: string;
   reconciledBy?: string;
+  /** Si existe: solo COMPLETADO / conciliado cuentan para saldo (ver bankBalanceUtils). */
+  status?: string;
+  completed?: boolean;
 }
 
 export interface AccountingAlert {
@@ -1521,6 +1541,12 @@ export class DataService {
     return incomeOps.has(operationType) ? 'INCOME' : 'EXPENSE';
   }
 
+  /** Clasificación ingreso/egreso para UI (mayor, resumen operativo). */
+  getLedgerFlowTypeForOperation(operationType: string): 'INCOME' | 'EXPENSE' {
+    const op = String(operationType ?? '').trim().toUpperCase() as LedgerOperationType;
+    return this.mapLedgerOperationTypeToFlow(op);
+  }
+
   async toggleBankTransactionReconciled(txId: string, currentValue: boolean, approvalPin?: string): Promise<void> {
     const newValue = !currentValue;
     const actor = this.getCurrentUser()?.name ?? 'SISTEMA';
@@ -1546,19 +1572,41 @@ export class DataService {
     } as any, { merge: true });
   }
 
-  async addManualBankTransaction(input: { bankId: string; amountUSD: number; amountVES: number; method: string; reference?: string; description: string; }): Promise<void> {
-    const bank = this.banks.find(b => String(b.id) === String(input.bankId));
+  async addManualBankTransaction(input: {
+    bankId: string;
+    accountId: string;
+    amountUSD: number;
+    amountVES: number;
+    method: string;
+    reference?: string;
+    description: string;
+  }): Promise<void> {
+    this.ensureBanksSubscription();
+    const bank = this.banks.find((b) => String(b.id) === String(input.bankId));
     if (!bank) throw new Error('Banco no encontrado');
+    const accountId = String(input.accountId ?? '').trim();
+    if (!accountId) throw new Error('Debe indicar la cuenta bancaria del movimiento.');
+    const account = (bank.accounts || []).find((a) => String(a.id ?? '').trim() === accountId);
+    if (!account) throw new Error('La cuenta no pertenece al banco seleccionado.');
     const actor = this.getCurrentUser()?.name ?? 'SISTEMA';
     const amountUSD = Number(input.amountUSD ?? 0) || 0;
     const amountVES = Number(input.amountVES ?? 0) || 0;
     const absUSD = Math.abs(amountUSD);
     const absVES = Math.abs(amountVES);
     const currency: 'USD' | 'VES' = absVES > 0.0001 && absUSD <= 0.0001 ? 'VES' : 'USD';
+    const accCur = String(account.currency ?? 'VES').trim().toUpperCase();
+    if (currency === 'USD' && accCur !== 'USD') {
+      throw new Error('El monto en USD debe registrarse en una cuenta en dólares.');
+    }
+    if (currency === 'VES' && accCur !== 'VES') {
+      throw new Error('El monto en Bs debe registrarse en una cuenta en bolívares.');
+    }
     const inferredRate = absUSD > 0.0001 ? roundMoney(absVES / absUSD) : 0;
     const tx: BankTransactionRecord = {
       bankId: String(bank.id),
       bankName: bank.name,
+      accountId,
+      accountLabel: String(account.label ?? '').trim(),
       method: input.method || 'MANUAL',
       source: 'MANUAL_ENTRY',
       sourceId: `MAN-${Date.now()}`,
@@ -1573,7 +1621,7 @@ export class DataService {
       reference: input.reference ?? '',
       note: input.description,
       actor,
-      createdAt: new Date().toISOString(),
+      createdAt: new Date().toISOString()
     };
     await this.appendBankTransaction(tx);
   }
@@ -1957,29 +2005,34 @@ export class DataService {
     const currency = (input?.currency === 'VES' ? 'VES' : 'USD') as 'USD' | 'VES';
     if (!bankId) return 0;
 
-    const OUTFLOW_SOURCES = new Set([
-      'AP_PAYMENT', 'PURCHASE_PAYMENT', 'PAYROLL', 'EXPENSE',
-      'MANUAL_OUT', 'LOAN_OUT', 'TRANSFER_OUT', 'ADVANCE_OUT'
-    ]);
-    const INFLOW_SOURCES = new Set([
-      'SALE', 'AR_PAYMENT', 'MANUAL_IN', 'TRANSFER_IN',
-      'ADVANCE_IN', 'LOAN_REPAYMENT', 'DEPOSIT'
-    ]);
+    this.ensureBanksSubscription();
+    const bank = this.banks.find((b) => String(b.id ?? '').trim() === bankId);
+    let opening = 0;
+    if (bank && accountId) {
+      const acc = (bank.accounts || []).find((a) => String(a.id ?? '').trim() === accountId);
+      if (acc && String(acc.currency ?? '').toUpperCase() === currency) {
+        opening = getOpeningBalanceForAccount(acc);
+      }
+    }
 
     const constraints: any[] = [where('bankId', '==', bankId)];
     if (accountId) constraints.push(where('accountId', '==', accountId));
 
     const snap = await getDocs(query(collection(db, 'bank_transactions'), ...constraints));
-    return snap.docs.reduce((acc, d) => {
-      const row: any = d.data() || {};
-      const source = String(row?.source ?? '').trim().toUpperCase();
-      const txType = String(row?.type ?? '').trim().toUpperCase();
-      const amount = Number(currency === 'VES' ? row?.amountVES ?? 0 : row?.amountUSD ?? 0);
-      let sign = 0;
-      if (OUTFLOW_SOURCES.has(source) || txType === 'OUT') sign = -1;
-      else if (INFLOW_SOURCES.has(source) || txType === 'IN') sign = 1;
-      return acc + sign * amount;
-    }, 0);
+    const rows = snap.docs.map((d) => d.data());
+    if (accountId) {
+      return computeNetBankBalanceFromTransactions({
+        transactions: rows,
+        bankId,
+        accountId,
+        currency,
+        openingBalance: opening
+      });
+    }
+    if (bank) {
+      return computeBankWideNetBalance(rows, bank, currency);
+    }
+    return 0;
   }
 
   getPOSTerminals() { this.ensurePOSTerminalsSubscription(); return this.posTerminals; }
@@ -4816,36 +4869,32 @@ export class DataService {
 
     // 6b. Cargar Libro Mayor contable desde asientos_contables (si existe en Supabase)
     try {
-      const { data: seatRows, error: seatErr } = await supabase
+      let seatRows: any[] = [];
+      let seatErr: any = null;
+      const emb = await supabase
         .from('asientos_contables')
-        .select('id,fecha,tipo_operacion,descripcion')
+        .select('id,fecha,tipo_operacion,descripcion,detalles_asiento(debe,haber)')
         .order('fecha', { ascending: false })
         .limit(500);
-      if (seatErr) {
-        const seatErrText = String((seatErr as any)?.message ?? '').toLowerCase();
-        const tableMissing = seatErrText.includes('asientos_contables') || seatErrText.includes('does not exist');
-        if (!tableMissing) console.warn('No se pudo cargar asientos_contables:', seatErr);
-        this.consolidatedLedgerEntries = [];
-      } else if (Array.isArray(seatRows) && seatRows.length > 0) {
-        const seatIds = seatRows.map((r: any) => String(r.id ?? '')).filter(Boolean);
-        const { data: detailRows, error: detailErr } = await supabase
-          .from('detalles_asiento')
-          .select('asiento_id,debe,haber')
-          .in('asiento_id', seatIds);
-        if (detailErr) {
-          console.warn('No se pudo cargar detalles_asiento para libro mayor:', detailErr);
-          this.consolidatedLedgerEntries = [];
-        } else {
-          const totalsBySeat = new Map<string, { debe: number; haber: number }>();
-          for (const row of (detailRows ?? []) as any[]) {
-            const key = String(row?.asiento_id ?? '').trim();
-            if (!key) continue;
-            const current = totalsBySeat.get(key) ?? { debe: 0, haber: 0 };
-            current.debe += Number(row?.debe ?? 0) || 0;
-            current.haber += Number(row?.haber ?? 0) || 0;
-            totalsBySeat.set(key, current);
-          }
-          this.consolidatedLedgerEntries = seatRows.map((row: any) => {
+      if (emb.error) {
+        const retry = await supabase
+          .from('asientos_contables')
+          .select('id,fecha,tipo_operacion,descripcion')
+          .order('fecha', { ascending: false })
+          .limit(500);
+        seatRows = (retry.data as any[]) ?? [];
+        seatErr = retry.error ?? null;
+      } else {
+        seatRows = (emb.data as any[]) ?? [];
+        seatErr = emb.error;
+      }
+
+      const buildConsolidatedFromSeatsAndTotals = (
+        seats: any[],
+        totalsBySeat: Map<string, { debe: number; haber: number }>
+      ) =>
+        seats
+          .map((row: any) => {
             const opType = String(row?.tipo_operacion ?? '').trim().toUpperCase() as LedgerOperationType;
             const totals = totalsBySeat.get(String(row?.id ?? '')) ?? { debe: 0, haber: 0 };
             const amountUSD = Math.round(Math.max(totals.debe, totals.haber) * 100) / 100;
@@ -4853,10 +4902,59 @@ export class DataService {
               timestamp: row?.fecha ? new Date(row.fecha) : new Date(),
               type: this.mapLedgerOperationTypeToFlow(opType),
               category: opType || 'ASIENTO',
-              description: String(row?.descripcion ?? '').trim() || `Asiento ${String(row?.id ?? '').slice(0, 8).toUpperCase()}`,
+              description:
+                String(row?.descripcion ?? '').trim() ||
+                `Asiento ${String(row?.id ?? '').slice(0, 8).toUpperCase()}`,
               amountUSD
             };
-          }).sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
+          })
+          .sort((a, b) => b.timestamp.getTime() - a.timestamp.getTime());
+
+      if (seatErr) {
+        const seatErrText = String((seatErr as any)?.message ?? '').toLowerCase();
+        const tableMissing = seatErrText.includes('asientos_contables') || seatErrText.includes('does not exist');
+        if (!tableMissing) console.warn('No se pudo cargar asientos_contables:', seatErr);
+        this.consolidatedLedgerEntries = [];
+      } else if (Array.isArray(seatRows) && seatRows.length > 0) {
+        const totalsBySeat = new Map<string, { debe: number; haber: number }>();
+        let filledFromEmbed = false;
+        for (const row of seatRows as any[]) {
+          const key = String(row?.id ?? '').trim();
+          if (!key) continue;
+          const nested = Array.isArray(row?.detalles_asiento) ? row.detalles_asiento : [];
+          if (nested.length > 0) filledFromEmbed = true;
+          let debe = 0;
+          let haber = 0;
+          for (const d of nested) {
+            debe += Number(d?.debe ?? 0) || 0;
+            haber += Number(d?.haber ?? 0) || 0;
+          }
+          totalsBySeat.set(key, { debe, haber });
+        }
+
+        if (!filledFromEmbed) {
+          const seatIds = seatRows.map((r: any) => String(r.id ?? '')).filter(Boolean);
+          const { data: detailRows, error: detailErr } = await supabase
+            .from('detalles_asiento')
+            .select('asiento_id,debe,haber')
+            .in('asiento_id', seatIds);
+          if (detailErr) {
+            console.warn('No se pudo cargar detalles_asiento para libro mayor:', detailErr);
+            this.consolidatedLedgerEntries = [];
+          } else {
+            totalsBySeat.clear();
+            for (const row of (detailRows ?? []) as any[]) {
+              const key = String(row?.asiento_id ?? '').trim();
+              if (!key) continue;
+              const current = totalsBySeat.get(key) ?? { debe: 0, haber: 0 };
+              current.debe += Number(row?.debe ?? 0) || 0;
+              current.haber += Number(row?.haber ?? 0) || 0;
+              totalsBySeat.set(key, current);
+            }
+            this.consolidatedLedgerEntries = buildConsolidatedFromSeatsAndTotals(seatRows, totalsBySeat);
+          }
+        } else {
+          this.consolidatedLedgerEntries = buildConsolidatedFromSeatsAndTotals(seatRows, totalsBySeat);
         }
       } else {
         this.consolidatedLedgerEntries = [];
@@ -5465,7 +5563,8 @@ export class DataService {
       id: String(a.id ?? Math.random().toString(36).slice(2, 10)),
       label: String(a.label ?? '').trim(),
       accountNumber: String(a.accountNumber ?? '').trim(),
-      currency: (a.currency === 'USD' ? 'USD' : 'VES') as any
+      currency: (a.currency === 'USD' ? 'USD' : 'VES') as any,
+      openingBalance: roundMoney(Number((a as any).openingBalance ?? (a as any).initialBalance ?? 0) || 0)
     })).filter(a => a.label && a.accountNumber);
 
     const seen = new Set<string>();
@@ -8842,29 +8941,39 @@ export class DataService {
         }
       } catch (_) { /* no banco con ese método */ }
 
-      const withdrawalTx: BankTransactionRecord = {
-        bankId: bankResolution?.bankId ?? '',
-        bankName: bankResolution?.bankName ?? 'CAJA',
-        accountId: bankResolution?.accountId ?? '',
-        accountLabel: bankResolution?.accountLabel ?? 'Efectivo',
-        method: payload.method,
-        source: 'SALE_PAYMENT',
-        sourceId: docRef.id,
-        cashBoxSessionId: payload.sessionId,
-        arId: '',
-        customerId: 'INTERNAL',
-        customerName: 'RETIRO DE CAJA',
-        saleCorrelativo: 'DEBITO',
-        currency: payload.currency,
-        amountUSD: paymentRecord.amountUSD,
-        amountVES: paymentRecord.amountVES,
-        rateUsed: payload.rateUsed,
-        note: payload.reason,
-        actor: payload.user?.name ?? 'SISTEMA',
-        actorUserId: payload.user?.id ?? '',
-        createdAt: new Date().toISOString()
-      };
-      await addDoc(collection(db, 'bank_transactions'), withdrawalTx as any);
+      if (
+        bankResolution &&
+        String(bankResolution.bankId ?? '').trim() &&
+        String(bankResolution.accountId ?? '').trim()
+      ) {
+        const withdrawalTx: BankTransactionRecord = {
+          bankId: bankResolution.bankId,
+          bankName: bankResolution.bankName,
+          accountId: bankResolution.accountId,
+          accountLabel: bankResolution.accountLabel,
+          method: payload.method,
+          source: 'SALE_PAYMENT',
+          sourceId: docRef.id,
+          cashBoxSessionId: payload.sessionId,
+          arId: '',
+          customerId: 'INTERNAL',
+          customerName: 'RETIRO DE CAJA',
+          saleCorrelativo: 'DEBITO',
+          currency: payload.currency,
+          amountUSD: paymentRecord.amountUSD,
+          amountVES: paymentRecord.amountVES,
+          rateUsed: payload.rateUsed,
+          note: payload.reason,
+          actor: payload.user?.name ?? 'SISTEMA',
+          actorUserId: payload.user?.id ?? '',
+          createdAt: new Date().toISOString()
+        };
+        await addDoc(collection(db, 'bank_transactions'), withdrawalTx as any);
+      } else {
+        console.warn(
+          'CAJA-01: no se registró bank_transaction para retiro de caja (ningún banco/cuenta resuelto para el método; configure banco con método y cuentas).'
+        );
+      }
     } catch (e) {
       console.warn('CAJA-01: no se pudo registrar bank_transaction para retiro de caja:', e);
     }
@@ -10555,15 +10664,29 @@ export class DataService {
           const changeUSDForBank = changeGivenUSD > 0.005 ? changeGivenUSD : roundMoney(changeGivenVES / rateForVES);
           
           if (changeUSDForBank > 0.005) {
-            // Register bank withdrawal
-            await this.addManualBankTransaction({
-              bankId: changeBank,
-              amountUSD: changeUSDForBank,
-              amountVES: changeGivenVES > 0.5 ? changeGivenVES : 0,
-              method: changeMethod,
-              reference: `VUELTO-AR-${entry.saleCorrelativo}`,
-              description: `Vuelto Cobro AR ${entry.saleCorrelativo} - Cliente: ${entry.customerName}`
-            });
+            const changeBankStr = String(changeBank ?? '').trim();
+            const byId = this.resolveBankIdByName(changeBankStr) || (changeBankStr.startsWith('BANK_') ? changeBankStr : '');
+            const vueltoResolution = this.resolveBankAccountForMethod(
+              byId
+                ? { bankId: byId, paymentMethod: changeMethod }
+                : { bankName: changeBankStr, paymentMethod: changeMethod }
+            );
+            if (vueltoResolution?.bankId && vueltoResolution.accountId) {
+              await this.addManualBankTransaction({
+                bankId: vueltoResolution.bankId,
+                accountId: vueltoResolution.accountId,
+                amountUSD: -Math.abs(changeUSDForBank),
+                amountVES: changeGivenVES > 0.5 ? -Math.abs(changeGivenVES) : 0,
+                method: changeMethod,
+                reference: `VUELTO-AR-${entry.saleCorrelativo}`,
+                description: `Vuelto Cobro AR ${entry.saleCorrelativo} - Cliente: ${entry.customerName}`
+              });
+            } else {
+              console.warn(
+                '[processARCollectionInCashBox] Vuelto bancario sin cuenta resuelta; omitido bank_transaction. Banco:',
+                changeBankStr
+              );
+            }
           }
         } else if (changeGivenUSD > 0.005 || changeGivenVES > 0.5) {
           // Default: register as cash box withdrawal in the appropriate currency
@@ -11214,7 +11337,9 @@ export class DataService {
         status: 'COMPLETED',
         operator: this.currentUser.name,
         user_id: this.currentUser.id ?? '',
-        date: new Date().toISOString()
+        date: new Date().toISOString(),
+        // Visión general / export: sin esto Supabase devuelve vacío y el mapa usa MIXTO → "Sin desglose".
+        payment_method: String(sale.paymentMethod ?? '').trim().toUpperCase() || 'MIXTO'
       });
       newSale = result.data;
       sError = result.error;
@@ -11391,10 +11516,11 @@ export class DataService {
     const paymentsPrepared = Array.isArray(paymentsPreparedRaw) ? paymentsPreparedRaw : [];
     finalSale.payments = paymentsPrepared.map((p: any) => ({ ...p, files: undefined }));
     await this.persistCashBoxSaleAudit(finalSale);
-    await this.persistSalePayments(sale, String(finalSale.id), paymentsPrepared.map((p: any) => ({ ...p, files: undefined })));
+    const saleForBankAndPayments = { ...sale, correlativo: finalCorrelativo };
+    await this.persistSalePayments(saleForBankAndPayments, String(finalSale.id), paymentsPrepared.map((p: any) => ({ ...p, files: undefined })));
 
     try {
-      await this.appendSaleBankTransactions(sale, String(finalSale.id), paymentsPrepared.map((p: any) => ({ ...p, files: undefined })));
+      await this.appendSaleBankTransactions(saleForBankAndPayments, String(finalSale.id), paymentsPrepared.map((p: any) => ({ ...p, files: undefined })));
     } catch (e: any) {
       console.warn('No se pudo registrar bank_transaction (SALE):', e?.message ?? e);
     }

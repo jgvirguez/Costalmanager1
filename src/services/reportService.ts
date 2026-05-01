@@ -2335,25 +2335,36 @@ class ReportService {
     pricing?: 'cost' | 'sale';
     currency?: 'USD' | 'VES';
     vesRate?: number;
+    /** Solo productos con existencia > 0 (valorización del disponible). */
+    onlyWithStock?: boolean;
   }) {
     const pricing = options?.pricing === 'sale' ? 'sale' : 'cost';
     const currency = options?.currency === 'VES' ? 'VES' : 'USD';
     const rawRate = Number(options?.vesRate ?? 36.5);
     const vesRate = Number.isFinite(rawRate) && rawRate > 0 ? rawRate : 36.5;
+    const onlyWithStock = Boolean(options?.onlyWithStock);
 
     const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
-    const stocks = this.getInventoryOverview(pricing);
+    let stocks = this.getInventoryOverview(pricing);
+    if (onlyWithStock) {
+      stocks = stocks.filter((s) => (Number(s.totalQty ?? 0) || 0) > 0.000001);
+    }
     const now = new Date().toLocaleString();
     const generatedBy = this.getReportOperatorLabel();
     const pricingLabel = pricing === 'sale' ? 'Precio venta (lista)' : 'Precio costo';
 
     doc.setFontSize(18);
     doc.setTextColor(2, 44, 34);
-    doc.text('VALORACIÓN DE INVENTARIO INDUSTRIAL', 14, 22);
+    doc.text(
+      onlyWithStock ? 'VALORACIÓN DE INVENTARIO (EXISTENCIA DISPONIBLE)' : 'VALORACIÓN DE INVENTARIO INDUSTRIAL',
+      14,
+      22
+    );
     doc.setFontSize(9);
     doc.setTextColor(150);
     doc.text(`Periodo: Corte actual de inventario`, 14, 30);
     const filterParts = [`Criterio: ${pricingLabel}`];
+    if (onlyWithStock) filterParts.push('Solo existencia disponible');
     if (currency === 'VES') {
       filterParts.push(`Tasa Bs/USD: ${this.formatNumber(vesRate, 4)}`);
     }
@@ -2362,21 +2373,23 @@ class ReportService {
 
     const valueColHead = currency === 'VES' ? 'VALORACIÓN BS' : 'VALORACIÓN USD';
 
-    const tableData = stocks.map((s) => {
-      const usdVal = Number(s.valueUSD ?? 0) || 0;
-      const displayVal =
-        currency === 'VES' ? usdVal * vesRate : usdVal;
-      const formatted =
-        currency === 'VES'
-          ? this.formatVES(displayVal)
-          : `$ ${displayVal.toLocaleString(undefined, { minimumFractionDigits: 2 })}`;
-      return [
-        s.sku,
-        s.description,
-        `${this.formatNumber(Number(s.totalQty ?? 0), 3)} ${String(s.unit ?? 'UND').toUpperCase()}`,
-        formatted
-      ];
-    });
+    const tableData =
+      stocks.length > 0
+        ? stocks.map((s) => {
+            const usdVal = Number(s.valueUSD ?? 0) || 0;
+            const displayVal = currency === 'VES' ? usdVal * vesRate : usdVal;
+            const formatted =
+              currency === 'VES'
+                ? this.formatVES(displayVal)
+                : `$ ${displayVal.toLocaleString(undefined, { minimumFractionDigits: 2 })}`;
+            return [
+              s.sku,
+              s.description,
+              `${this.formatNumber(Number(s.totalQty ?? 0), 3)} ${String(s.unit ?? 'UND').toUpperCase()}`,
+              formatted
+            ];
+          })
+        : [['—', 'Sin registros con los filtros aplicados', '0.000', currency === 'VES' ? this.formatVES(0) : '$ 0.00']];
 
     autoTable(doc, {
       startY: 46,
@@ -2387,7 +2400,7 @@ class ReportService {
       columnStyles: { 2: { halign: 'right' }, 3: { halign: 'right' } }
     });
 
-    const totalUsd = this.getTotalValorization(pricing);
+    const totalUsd = stocks.reduce((acc, s) => acc + (Number(s.valueUSD ?? 0) || 0), 0);
     const totalDisplay = currency === 'VES' ? totalUsd * vesRate : totalUsd;
     const totalLabel =
       currency === 'VES'
@@ -2410,8 +2423,149 @@ class ReportService {
     ]);
 
     this.applyStandardPdfFooter(doc);
-    const suffix = `${pricing}_${currency}`.toLowerCase();
+    const suffix = `${pricing}_${currency}${onlyWithStock ? '_disponible' : ''}`.toLowerCase();
     this.savePdfWithAudit(doc, `INVENTARIO_${new Date().toISOString().split('T')[0]}_${suffix}.pdf`, 'Inventario');
+  }
+
+  /** Stock por ubicación: solo filas con existencia total > 0. */
+  exportInventoryStockOnHandPDF(params: {
+    rows: Array<{
+      code: string;
+      description: string;
+      galpon: number;
+      pesa: number;
+      exhib: number;
+      total: number;
+      unit: string;
+      estado: string;
+    }>;
+    filterLabel?: string;
+  }): void {
+    const list = Array.isArray(params.rows) ? params.rows : [];
+    const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+    const now = new Date().toLocaleString('es-VE');
+    const generatedBy = this.getReportOperatorLabel();
+    doc.setFontSize(16);
+    doc.setTextColor(2, 44, 34);
+    doc.text('STOCK ACTUAL (CON EXISTENCIA)', 14, 18);
+    doc.setFontSize(9);
+    doc.setTextColor(100);
+    doc.text(`Generado: ${now} | Operador: ${generatedBy}`, 14, 25);
+    doc.text(`Filtros: ${String(params.filterLabel ?? '').trim() || 'Sin filtros'}`, 14, 30);
+
+    const body =
+      list.length > 0
+        ? list.map((r) => [
+            String(r.code ?? ''),
+            String(r.description ?? '').slice(0, 42),
+            this.formatNumber(Number(r.galpon ?? 0), 3),
+            this.formatNumber(Number(r.pesa ?? 0), 3),
+            this.formatNumber(Number(r.exhib ?? 0), 3),
+            `${this.formatNumber(Number(r.total ?? 0), 3)} ${String(r.unit ?? '').toUpperCase()}`,
+            String(r.estado ?? '')
+          ])
+        : [['—', 'Sin productos con existencia', '0', '0', '0', '0', '—']];
+
+    autoTable(doc, {
+      startY: 36,
+      head: [['CÓDIGO', 'DESCRIPCIÓN', 'GALPÓN', 'PESA', 'EXHIB.', 'TOTAL', 'ESTADO']],
+      body,
+      theme: 'striped',
+      headStyles: { fillColor: [2, 44, 34], textColor: [255, 255, 255], fontStyle: 'bold' },
+      styles: { fontSize: 8 },
+      columnStyles: { 2: { halign: 'right' }, 3: { halign: 'right' }, 4: { halign: 'right' }, 5: { halign: 'right' } }
+    });
+
+    this.applyStandardPdfFooter(doc);
+    this.savePdfWithAudit(
+      doc,
+      `INVENTARIO_STOCK_DISPONIBLE_${new Date().toISOString().split('T')[0]}.pdf`,
+      'Inventario Stock Disponible',
+      String(params.filterLabel ?? '').trim()
+    );
+  }
+
+  /** Una fila por lote con vencimiento y cantidad. */
+  exportInventoryLotsExpiryPDF(params: {
+    rows: Array<{
+      sku: string;
+      producto: string;
+      lote_codigo: string;
+      lote_id: string;
+      almacen: string;
+      cantidad: number;
+      unidad: string;
+      costo_unit_usd: number;
+      valor_costo_usd: number;
+      fecha_vencimiento: string;
+      estado_lote: string;
+    }>;
+    filterLabel?: string;
+  }): void {
+    const list = Array.isArray(params.rows) ? params.rows : [];
+    const doc = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' });
+    const now = new Date().toLocaleString('es-VE');
+    const generatedBy = this.getReportOperatorLabel();
+    doc.setFontSize(16);
+    doc.setTextColor(2, 44, 34);
+    doc.text('LOTES Y FECHAS DE VENCIMIENTO', 14, 14);
+    doc.setFontSize(9);
+    doc.setTextColor(100);
+    doc.text(`Generado: ${now} | Operador: ${generatedBy}`, 14, 21);
+    doc.text(`Filtros: ${String(params.filterLabel ?? '').trim() || 'Sin filtros'}`, 14, 26);
+
+    const body =
+      list.length > 0
+        ? list.map((r) => [
+            String(r.sku ?? ''),
+            String(r.producto ?? '').slice(0, 36),
+            String(r.lote_codigo ?? '').slice(0, 24),
+            String(r.lote_id ?? '').slice(0, 18),
+            String(r.almacen ?? ''),
+            this.formatNumber(Number(r.cantidad ?? 0), 3),
+            String(r.unidad ?? '').toUpperCase(),
+            this.formatNumber(Number(r.costo_unit_usd ?? 0), 4),
+            this.formatUSD(Number(r.valor_costo_usd ?? 0)),
+            String(r.fecha_vencimiento ?? '—'),
+            String(r.estado_lote ?? '')
+          ])
+        : [['—', 'Sin lotes en el filtro', '', '', '', '0', '', '0', '$ 0.00', '—', '—']];
+
+    autoTable(doc, {
+      startY: 32,
+      head: [
+        [
+          'SKU',
+          'PRODUCTO',
+          'LOTE',
+          'ID LOTE',
+          'ALMACÉN',
+          'CANT.',
+          'UD.',
+          'COSTO/U $',
+          'VAL. $',
+          'VENCIMIENTO',
+          'ESTADO'
+        ]
+      ],
+      body,
+      theme: 'striped',
+      headStyles: { fillColor: [2, 44, 34], textColor: [255, 255, 255], fontStyle: 'bold' },
+      styles: { fontSize: 7 },
+      columnStyles: {
+        5: { halign: 'right' },
+        7: { halign: 'right' },
+        8: { halign: 'right' }
+      }
+    });
+
+    this.applyStandardPdfFooter(doc);
+    this.savePdfWithAudit(
+      doc,
+      `INVENTARIO_LOTES_VTO_${new Date().toISOString().split('T')[0]}.pdf`,
+      'Inventario Lotes Vencimiento',
+      String(params.filterLabel ?? '').trim()
+    );
   }
 
   async exportAPStatementToPDF(

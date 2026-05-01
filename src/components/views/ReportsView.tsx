@@ -34,6 +34,7 @@ import {
 } from 'lucide-react';
 import { reportService } from '../../services/reportService';
 import { dataService, type ClientAdvance, type SupplierAdvance, type PurchaseInvoiceHistoryEntry } from '../../services/dataService';
+import { computeBankWideNetBalance, isBankTransactionCountedForBalance } from '../../services/bankBalanceUtils';
 import { formatQuantity, formatUnitCost } from '../../utils/costCalculations';
 import { compareCorrelativo, compareSalesForReport, normalizeReportCashier } from '../../utils/reportSort';
 import { buildExcelFriendlyCsv } from '../../utils/csvExport';
@@ -83,6 +84,17 @@ const formatInvoiceProductDetails = (lines: any[]): string => {
     return `${index + 1}) ${name} - ${qty.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}${unit ? ` ${unit}` : ''}`;
   }).join(' | ');
 };
+
+/** Misma regla que Finanzas > Bancos para saber qué monedas consultar por banco. */
+function getBankCurrencyProfileForTreasury(b: any): 'USD_ONLY' | 'VES_ONLY' | 'MIXED' | 'UNKNOWN' {
+  const accs = Array.isArray(b?.accounts) ? b.accounts : [];
+  if (accs.length === 0) return 'UNKNOWN';
+  const hasU = accs.some((a: any) => String(a?.currency ?? '').toUpperCase() === 'USD');
+  const hasV = accs.some((a: any) => String(a?.currency ?? '').toUpperCase() === 'VES');
+  if (hasU && hasV) return 'MIXED';
+  if (hasU) return 'USD_ONLY';
+  return 'VES_ONLY';
+}
 
 export function ReportsView() {
   const fmt = React.useCallback((value: any, decimals: number = 2) =>
@@ -174,6 +186,47 @@ export function ReportsView() {
     return Number.isFinite(n) && n > 0 ? n : 36.5;
   }, [valuationVesRateInput]);
 
+  const invFilteredStocks = React.useMemo(() => {
+    const stocks = dataService.getStocks();
+    const q = invSearch.toLowerCase().trim();
+    return stocks.filter((s: any) => {
+      const matchSearch = !q || s.code?.toLowerCase().includes(q) || s.description?.toLowerCase().includes(q);
+      const matchWh = invWarehouse === 'ALL' || (s.lotes || []).some((l: any) => l.warehouse === invWarehouse);
+      return matchSearch && matchWh;
+    });
+  }, [tick, invSearch, invWarehouse]);
+
+  /** Todos los productos (export CSV): solo filtro por búsqueda (incluye con y sin existencia en todos los almacenes). */
+  const invCatalogStocks = React.useMemo(() => {
+    const stocks = dataService.getStocks();
+    const q = invSearch.toLowerCase().trim();
+    if (!q) return stocks;
+    return stocks.filter(
+      (s: any) =>
+        s.code?.toLowerCase().includes(q) ||
+        String(s.description ?? '')
+          .toLowerCase()
+          .includes(q)
+    );
+  }, [tick, invSearch]);
+
+  const invLotRows = React.useMemo(() => {
+    const out: Array<{ s: any; l: any }> = [];
+    for (const s of invFilteredStocks) {
+      for (const l of s.lotes || []) {
+        if (invWarehouse !== 'ALL' && l.warehouse !== invWarehouse) continue;
+        out.push({ s, l });
+      }
+    }
+    return out;
+  }, [invFilteredStocks, invWarehouse]);
+
+  const invExportFilterLabel = React.useMemo(
+    () =>
+      `Búsqueda: ${invSearch.trim() || '—'} | Almacén: ${invWarehouse === 'ALL' ? 'Todos' : invWarehouse}`,
+    [invSearch, invWarehouse]
+  );
+
   React.useEffect(() => {
     if (activeTab !== 'purchases') return;
     let active = true;
@@ -194,6 +247,9 @@ export function ReportsView() {
   }, [valuationVesRate]);
 
   const [allBankTx, setAllBankTx] = React.useState<any[]>([]);
+  /** Saldos netos por banco (misma API que Finanzas > Bancos); null = aún no cargado en pestaña Tesorería. */
+  const [treasuryOfficialBalances, setTreasuryOfficialBalances] = React.useState<Record<string, { usd: number; ves: number }> | null>(null);
+  const [treasuryOfficialBalancesLoading, setTreasuryOfficialBalancesLoading] = React.useState(false);
   const [treasurySelectedBankId, setTreasurySelectedBankId] = React.useState<string>('ALL');
   const [treasurySelectedAccountKey, setTreasurySelectedAccountKey] = React.useState<string>('ALL');
   const [treasuryFlowFilter, setTreasuryFlowFilter] = React.useState<'ALL' | 'GENERAL' | 'SALES' | 'PURCHASES'>('GENERAL');
@@ -411,23 +467,35 @@ export function ReportsView() {
     return base;
   }, [paymentMethodLabel]);
 
-  const bankTxSalePaymentMap = React.useMemo(() => {
-    const byCorrelativo: Record<string, Array<{ method: string; amountUSD: number; amountVES: number; count: number; rateUsed: number; reference: string }>> = {};
+  type BankSalePaymentAggLine = { method: string; amountUSD: number; amountVES: number; count: number; rateUsed: number; reference: string };
+
+  const bankTxSalePaymentIndexes = React.useMemo(() => {
+    const byCorrelativo: Record<string, BankSalePaymentAggLine[]> = {};
+    const bySaleId: Record<string, BankSalePaymentAggLine[]> = {};
+    const push = (bucket: Record<string, BankSalePaymentAggLine[]>, key: string, line: BankSalePaymentAggLine) => {
+      if (!bucket[key]) bucket[key] = [];
+      bucket[key].push(line);
+    };
     allBankTx.forEach((tx: any) => {
       const source = String(tx?.source ?? '').toUpperCase();
       if (source !== 'SALE_PAYMENT' && source !== 'CREDIT_DOWN') return;
-      const correlativo = String(tx?.saleCorrelativo ?? '').trim();
-      if (!correlativo) return;
       const method = paymentMethodLabel(tx?.method, tx?.bankName ?? tx?.bank, tx?.note);
       const amountUSD = Math.abs(Number(tx?.amountUSD ?? 0) || 0);
       const amountVES = Math.abs(Number(tx?.amountVES ?? 0) || 0);
       const rateUsed = Number(tx?.rateUsed ?? 0) || 0;
       const reference = String(tx?.reference ?? '').trim();
       if (amountUSD <= 0.0001 && amountVES <= 0.0001) return;
-      if (!byCorrelativo[correlativo]) byCorrelativo[correlativo] = [];
-      byCorrelativo[correlativo].push({ method, amountUSD, amountVES, count: 1, rateUsed, reference });
+      const line: BankSalePaymentAggLine = { method, amountUSD, amountVES, count: 1, rateUsed, reference };
+      const correlativo = String(tx?.saleCorrelativo ?? '').trim();
+      if (correlativo) push(byCorrelativo, correlativo, line);
+      const sourceId = String(tx?.sourceId ?? '').trim();
+      const colon = sourceId.indexOf(':');
+      if (colon > 0) {
+        const saleIdFromTx = sourceId.slice(0, colon).trim();
+        if (saleIdFromTx) push(bySaleId, saleIdFromTx, line);
+      }
     });
-    return byCorrelativo;
+    return { byCorrelativo, bySaleId };
   }, [allBankTx, paymentMethodLabel]);
 
   const cxpSaleCorrelativoHints = React.useMemo(() => {
@@ -478,8 +546,20 @@ export function ReportsView() {
       if (lines.length > 0) return lines;
     }
     const correlativo = String(sale?.correlativo ?? '').trim();
-    if (correlativo && Array.isArray(bankTxSalePaymentMap[correlativo]) && bankTxSalePaymentMap[correlativo].length > 0) {
-      lines.push(...bankTxSalePaymentMap[correlativo]);
+    const fromCorrelativo = correlativo && Array.isArray(bankTxSalePaymentIndexes.byCorrelativo[correlativo])
+      ? bankTxSalePaymentIndexes.byCorrelativo[correlativo]
+      : [];
+    if (fromCorrelativo.length > 0) {
+      lines.push(...fromCorrelativo);
+      appendMissingCreditLine();
+      return lines;
+    }
+    const saleId = String(sale?.id ?? '').trim();
+    const fromSaleId = saleId && Array.isArray(bankTxSalePaymentIndexes.bySaleId[saleId])
+      ? bankTxSalePaymentIndexes.bySaleId[saleId]
+      : [];
+    if (fromSaleId.length > 0) {
+      lines.push(...fromSaleId);
       appendMissingCreditLine();
       return lines;
     }
@@ -528,7 +608,7 @@ export function ReportsView() {
       });
     }
     return lines;
-  }, [paymentMethodLabel, bankTxSalePaymentMap, cxpSaleCorrelativoHints, normalizePaymentToken]);
+  }, [paymentMethodLabel, bankTxSalePaymentIndexes, cxpSaleCorrelativoHints, normalizePaymentToken]);
 
   const salesMethodOptions = React.useMemo(() => {
     const methods = new Set<string>();
@@ -947,6 +1027,17 @@ export function ReportsView() {
       flow: 'INCOME' | 'EXPENSE';
     }> = [];
 
+    // Método en ventas: usar el mismo desglose que cierre Z / bancos (payments + bank_tx SALE_PAYMENT),
+    // no solo sale.paymentMethod (p. ej. MIXTO → "Sin desglose" aunque en banco figure Pago Móvil).
+    const resolveSaleJournalMethod = (sale: any): string => {
+      const lines = extractSalePaymentLines(sale);
+      if (!Array.isArray(lines) || lines.length === 0) {
+        return overviewMethodLabel(sale?.paymentMethod);
+      }
+      const normalized = [...new Set(lines.map((l) => overviewMethodLabel(l.method)).filter(Boolean))];
+      return normalized.length > 0 ? normalized.join(' + ') : overviewMethodLabel(sale?.paymentMethod);
+    };
+
     // Ventas del período (incluye anuladas para trazabilidad contable)
     salesInRange.forEach((s: any) => {
       const isVoided = (s as any).status === 'VOID' || (s as any).voided;
@@ -963,7 +1054,7 @@ export function ReportsView() {
         description: `${(s as any).items?.length ?? 0} ítem(s)`,
         amountUSD: Number(s.totalUSD ?? 0) || 0,
         amountVES: Number(s.totalVES ?? 0) || 0,
-        method: overviewMethodLabel(s.paymentMethod),
+        method: resolveSaleJournalMethod(s),
         status: isVoided ? 'ANULADA' : 'COMPLETADA',
         timestamp: saleTs.getTime(),
         flow: 'INCOME'
@@ -1104,7 +1195,7 @@ export function ReportsView() {
       if (dt !== 0) return dt;
       return compareCorrelativo(a.correlativo, b.correlativo);
     });
-  }, [dateRange.start, dateRange.end, allBankTx, classifyCreditSale, overviewMethodLabel, tick]);
+  }, [dateRange.start, dateRange.end, allBankTx, classifyCreditSale, overviewMethodLabel, extractSalePaymentLines, tick]);
 
   const filteredOperationsJournal = React.useMemo(() => {
     const q = overviewQuery.trim().toLowerCase();
@@ -1343,22 +1434,78 @@ export function ReportsView() {
     return () => { active = false; };
   }, []);
 
-  // TREASURY DATA — using real transactions
+  // Saldos "Saldo por banco" = getAvailableBankBalance (todos los movimientos en Firestore por banco), no la ventana truncada de allBankTx.
+  React.useEffect(() => {
+    if (activeTab !== 'treasury') return;
+    let cancelled = false;
+    setTreasuryOfficialBalancesLoading(true);
+    const banks = (dataService.getBanks() || []).filter((b: any) => b?.active !== false);
+    (async () => {
+      const next: Record<string, { usd: number; ves: number }> = {};
+      await Promise.all(
+        banks.map(async (b: any) => {
+          const id = String(b?.id ?? '').trim();
+          if (!id) return;
+          const prof = getBankCurrencyProfileForTreasury(b);
+          let usd = 0;
+          let ves = 0;
+          try {
+            if (prof === 'USD_ONLY' || prof === 'MIXED' || prof === 'UNKNOWN') {
+              usd = await dataService.getAvailableBankBalance({ bankId: id, currency: 'USD' });
+            }
+            if (prof === 'VES_ONLY' || prof === 'MIXED' || prof === 'UNKNOWN') {
+              ves = await dataService.getAvailableBankBalance({ bankId: id, currency: 'VES' });
+            }
+          } catch (e) {
+            console.warn('[ReportsView] tesorería: no se pudo leer saldo oficial del banco', id, e);
+          }
+          next[id] = { usd, ves };
+        })
+      );
+      if (!cancelled) {
+        setTreasuryOfficialBalances(next);
+        setTreasuryOfficialBalancesLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, tick]);
+
+  // TREASURY DATA — saldos por banco alineados con Finanzas; conteo/última fecha desde ventana sincronizada allBankTx
   const treasuryData = React.useMemo(() => {
-    const banks = dataService.getBanks();
-    const usdTotal = allBankTx.filter(tx => (tx?.currency ?? '').toUpperCase() === 'USD' || (tx?.amountUSD ?? 0) !== 0)
-      .reduce((acc, tx) => acc + Number(tx?.amountUSD ?? 0), 0);
-    const vesTotal = allBankTx.filter(tx => (tx?.currency ?? '').toUpperCase() === 'VES' || (tx?.amountVES ?? 0) !== 0)
-      .reduce((acc, tx) => acc + Number(tx?.amountVES ?? 0), 0);
-    const bankBalances = banks.map(bank => {
-      const txs = allBankTx.filter(tx => String(tx?.bankId ?? '') === String(bank.id));
-      const balanceUSD = txs.reduce((acc, tx) => acc + Number(tx?.amountUSD ?? 0), 0);
-      const balanceVES = txs.reduce((acc, tx) => acc + Number(tx?.amountVES ?? 0), 0);
-      const lastTx = txs.length > 0 ? new Date(Math.max(...txs.map(tx => new Date(tx.createdAt ?? 0).getTime()))) : null;
+    const banks = (dataService.getBanks() || []).filter((bank: any) => bank?.active !== false);
+    const counted = allBankTx.filter((tx) => isBankTransactionCountedForBalance(tx));
+    const officialReady = treasuryOfficialBalances !== null;
+    const bankBalances = banks.map((bank) => {
+      const bid = String(bank?.id ?? '');
+      const txs = counted.filter((tx) => String(tx?.bankId ?? '') === String(bank.id));
+      const rowOfficial = officialReady ? treasuryOfficialBalances![bid] : undefined;
+      const balanceUSD =
+        rowOfficial !== undefined
+          ? rowOfficial.usd
+          : computeBankWideNetBalance(counted, bank, 'USD');
+      const balanceVES =
+        rowOfficial !== undefined
+          ? rowOfficial.ves
+          : computeBankWideNetBalance(counted, bank, 'VES');
+      const lastTx = txs.length > 0 ? new Date(Math.max(...txs.map((tx) => new Date(tx.createdAt ?? 0).getTime()))) : null;
       return { ...bank, balanceUSD, balanceVES, txCount: txs.length, lastTx };
     });
-    return { usdTotal, vesTotal, banks: bankBalances };
-  }, [allBankTx]);
+    const usdTotal = officialReady
+      ? bankBalances.reduce((acc, b) => acc + (Number(b.balanceUSD) || 0), 0)
+      : 0;
+    const vesTotal = officialReady
+      ? bankBalances.reduce((acc, b) => acc + (Number(b.balanceVES) || 0), 0)
+      : 0;
+    return {
+      usdTotal,
+      vesTotal,
+      banks: bankBalances,
+      officialBalancesReady: officialReady,
+      officialBalancesLoading: treasuryOfficialBalancesLoading
+    };
+  }, [allBankTx, tick, treasuryOfficialBalances, treasuryOfficialBalancesLoading]);
 
   const treasuryBankOptions = React.useMemo(() => {
     return (dataService.getBanks() || [])
@@ -4450,7 +4597,9 @@ export function ReportsView() {
                 </div>
                 <div>
                   <h3 className="text-xl font-black text-slate-900 uppercase">Tesorería por Moneda</h3>
-                  <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Saldo calculado desde transacciones reales</p>
+                  <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest">
+                    Saldos por banco = misma suma que Finanzas &gt; Bancos (historial completo en Firestore)
+                  </p>
                 </div>
               </div>
               <button onClick={() => exportCSV(
@@ -4458,7 +4607,7 @@ export function ReportsView() {
                 `tesoreria_${new Date().toISOString().split('T')[0]}.csv`,
                 { reportLabel: 'Tesoreria por banco', filterLabel: getActiveFilterLabel(), includeTotals: true }
               )}
-                disabled={!canExportTreasuryReports}
+                disabled={!canExportTreasuryReports || !treasuryData.officialBalancesReady}
                 className="flex items-center gap-2 px-4 py-2 bg-slate-100 text-slate-600 rounded-xl text-[10px] font-black uppercase hover:bg-slate-200 transition-all disabled:opacity-40 disabled:cursor-not-allowed">
                 <Download className="w-3 h-3" /> Excel
               </button>
@@ -4472,7 +4621,11 @@ export function ReportsView() {
                 </div>
                 <div className="border-t border-blue-200 pt-3">
                   <span className="text-[12px] font-black text-blue-800 uppercase">Total USD</span>
-                  <div className="text-3xl font-black font-mono text-blue-900 mt-1">{usd(treasuryData.usdTotal)}</div>
+                  <div className="text-3xl font-black font-mono text-blue-900 mt-1">
+                    {treasuryData.officialBalancesReady ? usd(treasuryData.usdTotal) : (
+                      <span className="text-lg text-blue-700/70 animate-pulse">Consultando…</span>
+                    )}
+                  </div>
                 </div>
               </div>
               <div className="bg-emerald-50 p-6 rounded-2xl border border-emerald-200">
@@ -4482,17 +4635,29 @@ export function ReportsView() {
                 </div>
                 <div className="border-t border-emerald-200 pt-3">
                   <span className="text-[12px] font-black text-emerald-800 uppercase">Total Bs</span>
-                  <div className="text-3xl font-black font-mono text-emerald-900 mt-1">{bs(treasuryData.vesTotal)}</div>
+                  <div className="text-3xl font-black font-mono text-emerald-900 mt-1">
+                    {treasuryData.officialBalancesReady ? bs(treasuryData.vesTotal) : (
+                      <span className="text-lg text-emerald-800/70 animate-pulse">Consultando…</span>
+                    )}
+                  </div>
                 </div>
               </div>
             </div>
 
             <div className="bg-slate-50 p-4 rounded-xl border border-slate-200">
-              <h4 className="text-[12px] font-black text-slate-600 uppercase mb-4 flex items-center gap-2">
+              <h4 className="text-[12px] font-black text-slate-600 uppercase mb-1 flex items-center gap-2">
                 <Landmark className="w-4 h-4" /> Saldo por Banco
               </h4>
+              <p className="text-[9px] font-bold text-slate-500 uppercase tracking-wide mb-3">
+                El número de transacciones y la última fecha usan la ventana sincronizada en memoria; los importes usan el libro completo.
+              </p>
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-                {treasuryData.banks.map(bank => (
+                {!treasuryData.officialBalancesReady && (
+                  <div className="col-span-full text-center py-6 text-sm font-bold text-slate-500">
+                    {treasuryData.officialBalancesLoading ? 'Sincronizando saldos con el módulo Bancos…' : 'Preparando saldos…'}
+                  </div>
+                )}
+                {treasuryData.officialBalancesReady && treasuryData.banks.map(bank => (
                   <div key={bank.id} className="bg-white p-4 rounded-xl border border-slate-200">
                     <div className="flex items-center gap-2 mb-3">
                       <CreditCard className="w-4 h-4 text-slate-400" />
@@ -5759,269 +5924,411 @@ export function ReportsView() {
                 <h3 className="font-headline font-black text-2xl tracking-tighter uppercase text-slate-900">Reportes de Inventario</h3>
                 <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mt-1">Valorización · Lotes · Kardex</p>
               </div>
-              <div className="flex items-center gap-2 flex-wrap">
-                <input
-                  type="text"
-                  value={invSearch}
-                  onChange={e => setInvSearch(e.target.value)}
-                  placeholder="Buscar producto..."
-                  className="px-4 py-2 rounded-xl border border-slate-200 text-[11px] font-bold text-slate-700 w-48 outline-none focus:border-emerald-400 bg-white"
-                />
-                <select
-                  value={invWarehouse}
-                  onChange={e => setInvWarehouse(e.target.value as any)}
-                  className="px-3 py-2 rounded-xl border border-slate-200 text-[11px] font-bold text-slate-700 bg-white outline-none focus:border-emerald-400"
-                >
-                  <option value="ALL">Todos los almacenes</option>
-                  <option value="Galpon D3">Galpón D3</option>
-                  <option value="Pesa D2">Pesa D2</option>
-                  <option value="exibicion D1">Exhibición D1</option>
-                </select>
-                <button
-                  onClick={() => {
-                    const stocks = dataService.getStocks();
-                    const rows = stocks.map((s: any) => {
-                      const lotes = s.lotes || [];
-                      const total = lotes.reduce((a: number, l: any) => a + (Number(l.qty) || 0), 0);
-                      const valCosto = lotes.reduce((a: number, l: any) => a + ((Number(l.qty) || 0) * (Number(l.costUSD) || 0)), 0);
-                      const valVenta = total * (Number(s.priceUSD) || 0);
-                      const margen = valCosto > 0 ? ((valVenta - valCosto) / valCosto * 100) : 0;
-                      return {
-                        codigo: s.code, descripcion: s.description, unidad: s.unit,
-                        galpon: s.d3 ?? 0, pesa: s.d2 ?? 0, exhibicion: s.a1 ?? 0, total,
-                        p_costo_usd: (Number(s.avgCostUSD) || lotes.reduce((a: number, l: any) => a + (Number(l.costUSD) || 0), 0) / (lotes.length || 1)).toFixed(4),
-                        p_venta_usd: (Number(s.priceUSD) || 0).toFixed(4),
-                        val_costo_usd: valCosto.toFixed(2),
-                        val_venta_usd: valVenta.toFixed(2),
-                        margen_pct: margen.toFixed(1),
-                        estado: total > 0 ? 'OK' : 'SIN STOCK'
-                      };
-                    });
-                    exportCSV(rows, `inventario_${new Date().toISOString().split('T')[0]}.csv`, { reportLabel: 'Inventario Valorizado', filterLabel: 'Corte actual', includeTotals: false });
-                  }}
-                  className="flex items-center gap-2 px-4 py-2 bg-slate-800 text-white rounded-xl text-[10px] font-black uppercase hover:bg-slate-700 transition-all"
-                >
-                  <Download className="w-3 h-3" /> CSV
-                </button>
-                <button
-                  onClick={() => reportService.exportInventoryToPDF({ pricing: valuationPricing, currency: valuationCurrency, vesRate: valuationVesRate })}
-                  className="flex items-center gap-2 px-4 py-2 bg-emerald-800 text-white rounded-xl text-[10px] font-black uppercase hover:bg-emerald-700 transition-all"
-                >
-                  <Download className="w-3 h-3" /> PDF
-                </button>
+              <div className="flex flex-col items-end gap-2 max-w-xl">
+                <div className="flex items-center gap-2 flex-wrap justify-end">
+                  <input
+                    type="text"
+                    value={invSearch}
+                    onChange={e => setInvSearch(e.target.value)}
+                    placeholder="Buscar producto..."
+                    className="px-4 py-2 rounded-xl border border-slate-200 text-[11px] font-bold text-slate-700 w-48 outline-none focus:border-emerald-400 bg-white"
+                  />
+                  <select
+                    value={invWarehouse}
+                    onChange={e => setInvWarehouse(e.target.value as any)}
+                    className="px-3 py-2 rounded-xl border border-slate-200 text-[11px] font-bold text-slate-700 bg-white outline-none focus:border-emerald-400"
+                  >
+                    <option value="ALL">Todos los almacenes</option>
+                    <option value="Galpon D3">Galpón D3</option>
+                    <option value="Pesa D2">Pesa D2</option>
+                    <option value="exibicion D1">Exhibición D1</option>
+                  </select>
+                </div>
+                <div className="flex flex-wrap gap-2 justify-end">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const date = new Date().toISOString().split('T')[0];
+                      if (invView === 'stock') {
+                        const rows = invFilteredStocks
+                          .map((s: any) => {
+                            const total = (s.lotes || []).reduce((a: number, l: any) => a + (Number(l.qty) || 0), 0);
+                            if (total <= 0.000001) return null;
+                            return {
+                              codigo: s.code,
+                              descripcion: s.description,
+                              galpon: roundMoney(Number(s.d3 ?? 0) || 0),
+                              pesa: roundMoney(Number(s.d2 ?? 0) || 0),
+                              exhibicion: roundMoney(Number(s.a1 ?? 0) || 0),
+                              total_existencia: roundMoney(total),
+                              unidad: s.unit ?? '',
+                              estado: 'CON EXISTENCIA'
+                            };
+                          })
+                          .filter(Boolean) as any[];
+                        if (!rows.length) {
+                          window.alert('No hay productos con existencia para los filtros actuales.');
+                          return;
+                        }
+                        exportCSV(rows, `inventario_stock_disponible_${date}.csv`, {
+                          reportLabel: 'Stock actual (solo con existencia)',
+                          filterLabel: invExportFilterLabel,
+                          includeTotals: false
+                        });
+                        return;
+                      }
+                      if (invView === 'valorizacion') {
+                        const rows = invFilteredStocks
+                          .map((s: any) => {
+                            const lotes = s.lotes || [];
+                            const total = lotes.reduce((a: number, l: any) => a + (Number(l.qty) || 0), 0);
+                            if (total <= 0.000001) return null;
+                            const valCosto = lotes.reduce(
+                              (a: number, l: any) => a + (Number(l.qty) || 0) * (Number(l.costUSD) || 0),
+                              0
+                            );
+                            const pCostoPond = total > 0 ? valCosto / total : 0;
+                            return {
+                              codigo: s.code,
+                              descripcion: s.description,
+                              galpon: roundMoney(Number(s.d3 ?? 0) || 0),
+                              pesa: roundMoney(Number(s.d2 ?? 0) || 0),
+                              exhibicion: roundMoney(Number(s.a1 ?? 0) || 0),
+                              total_unidades: roundMoney(total),
+                              unidad: s.unit ?? '',
+                              precio_costo_promedio_ponderado_usd: roundMoney(pCostoPond),
+                              valor_inventario_a_costo_usd: roundMoney(valCosto),
+                              nota: 'Valor = suma (cantidad × costo USD) por lote con existencia'
+                            };
+                          })
+                          .filter(Boolean) as any[];
+                        if (!rows.length) {
+                          window.alert('No hay existencia para valorizar a costo con los filtros actuales.');
+                          return;
+                        }
+                        exportCSV(rows, `inventario_valorizacion_costo_disponible_${date}.csv`, {
+                          reportLabel: 'Valorización a costo (existencia disponible)',
+                          filterLabel: invExportFilterLabel,
+                          includeTotals: false
+                        });
+                        return;
+                      }
+                      const rows = invLotRows.map(({ s, l }) => {
+                        const qty = Number(l.qty) || 0;
+                        const cost = Number(l.costUSD) || 0;
+                        const valCosto = roundMoney(qty * cost);
+                        const exp = l.expiry ? new Date(l.expiry) : null;
+                        const now = new Date();
+                        const expired = Boolean(exp && exp < now);
+                        return {
+                          sku: s.code,
+                          producto: s.description,
+                          lote_codigo: String(l.batch ?? ''),
+                          lote_id: String(l.id ?? ''),
+                          almacen: l.warehouse ?? '',
+                          cantidad: roundMoney(qty),
+                          unidad: s.unit ?? '',
+                          costo_unitario_usd: roundMoney(cost),
+                          valor_costo_lote_usd: valCosto,
+                          fecha_vencimiento_iso: exp ? exp.toISOString().split('T')[0] : '',
+                          fecha_vencimiento: exp ? exp.toLocaleDateString('es-VE') : '',
+                          estado_lote: qty <= 0 ? 'VACIO' : expired ? 'VENCIDO' : 'OK'
+                        };
+                      });
+                      if (!rows.length) {
+                        window.alert('No hay líneas de lote para exportar con los filtros actuales.');
+                        return;
+                      }
+                      exportCSV(rows, `inventario_lotes_vencimiento_${date}.csv`, {
+                        reportLabel: 'Lotes y fechas de vencimiento (una fila por lote)',
+                        filterLabel: invExportFilterLabel,
+                        includeTotals: false
+                      });
+                    }}
+                    className="flex items-center gap-2 px-3 py-2 bg-slate-800 text-white rounded-xl text-[9px] font-black uppercase hover:bg-slate-700 transition-all"
+                  >
+                    <Download className="w-3 h-3" /> CSV ({invView === 'stock' ? 'stock' : invView === 'valorizacion' ? 'costo' : 'lotes'})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const date = new Date().toISOString().split('T')[0];
+                      const rows = invCatalogStocks.map((s: any) => {
+                        const lotes = s.lotes || [];
+                        const total = lotes.reduce((a: number, l: any) => a + (Number(l.qty) || 0), 0);
+                        return {
+                          codigo: s.code,
+                          descripcion: s.description,
+                          galpon: roundMoney(Number(s.d3 ?? 0) || 0),
+                          pesa: roundMoney(Number(s.d2 ?? 0) || 0),
+                          exhibicion: roundMoney(Number(s.a1 ?? 0) || 0),
+                          total_existencia: roundMoney(total),
+                          unidad: s.unit ?? '',
+                          estado_existencia: total > 0.000001 ? 'CON EXISTENCIA' : 'SIN EXISTENCIA'
+                        };
+                      });
+                      if (!rows.length) {
+                        window.alert('No hay productos que coincidan con la búsqueda.');
+                        return;
+                      }
+                      const catLabel = invSearch.trim()
+                        ? `Catálogo filtrado por búsqueda (todos los almacenes)`
+                        : 'Catálogo completo (todos los productos, todos los almacenes)';
+                      exportCSV(rows, `inventario_catalogo_completo_${date}.csv`, {
+                        reportLabel: 'Todos los productos (con y sin existencia)',
+                        filterLabel: catLabel,
+                        includeTotals: false
+                      });
+                    }}
+                    className="flex items-center gap-2 px-3 py-2 bg-slate-600 text-white rounded-xl text-[9px] font-black uppercase hover:bg-slate-500 transition-all"
+                  >
+                    <Download className="w-3 h-3" /> Todos los productos
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const fl = invExportFilterLabel;
+                      if (invView === 'stock') {
+                        const rows = invFilteredStocks
+                          .map((s: any) => {
+                            const total = (s.lotes || []).reduce((a: number, l: any) => a + (Number(l.qty) || 0), 0);
+                            if (total <= 0.000001) return null;
+                            return {
+                              code: String(s.code ?? ''),
+                              description: String(s.description ?? ''),
+                              galpon: Number(s.d3 ?? 0) || 0,
+                              pesa: Number(s.d2 ?? 0) || 0,
+                              exhib: Number(s.a1 ?? 0) || 0,
+                              total,
+                              unit: String(s.unit ?? ''),
+                              estado: 'CON EXISTENCIA'
+                            };
+                          })
+                          .filter(Boolean) as Array<{
+                            code: string;
+                            description: string;
+                            galpon: number;
+                            pesa: number;
+                            exhib: number;
+                            total: number;
+                            unit: string;
+                            estado: string;
+                          }>;
+                        if (!rows.length) {
+                          window.alert('No hay productos con existencia para el PDF.');
+                          return;
+                        }
+                        reportService.exportInventoryStockOnHandPDF({ rows, filterLabel: fl });
+                        return;
+                      }
+                      if (invView === 'valorizacion') {
+                        reportService.exportInventoryToPDF({
+                          pricing: 'cost',
+                          currency: valuationCurrency,
+                          vesRate: valuationVesRate,
+                          onlyWithStock: true
+                        });
+                        return;
+                      }
+                      const now = new Date();
+                      const rows = invLotRows.map(({ s, l }) => {
+                        const qty = Number(l.qty) || 0;
+                        const cost = Number(l.costUSD) || 0;
+                        const valCosto = roundMoney(qty * cost);
+                        const exp = l.expiry ? new Date(l.expiry) : null;
+                        const expired = Boolean(exp && exp < now);
+                        const estado = qty <= 0 ? 'VACIO' : expired ? 'VENCIDO' : 'OK';
+                        return {
+                          sku: String(s.code ?? ''),
+                          producto: String(s.description ?? ''),
+                          lote_codigo: String(l.batch ?? ''),
+                          lote_id: String(l.id ?? ''),
+                          almacen: String(l.warehouse ?? ''),
+                          cantidad: qty,
+                          unidad: String(s.unit ?? ''),
+                          costo_unit_usd: cost,
+                          valor_costo_usd: valCosto,
+                          fecha_vencimiento: exp ? exp.toLocaleDateString('es-VE') : '—',
+                          estado_lote: estado
+                        };
+                      });
+                      reportService.exportInventoryLotsExpiryPDF({ rows, filterLabel: fl });
+                    }}
+                    className="flex items-center gap-2 px-3 py-2 bg-emerald-800 text-white rounded-xl text-[9px] font-black uppercase hover:bg-emerald-700 transition-all"
+                  >
+                    <Download className="w-3 h-3" /> PDF ({invView === 'stock' ? 'stock' : invView === 'valorizacion' ? 'costo disp.' : 'lotes'})
+                  </button>
+                </div>
+                <p className="text-[8px] text-slate-400 font-bold text-right leading-snug">
+                  CSV/PDF usan la pestaña activa. &quot;Todos los productos&quot; exporta el listado completo (búsqueda opcional), con y sin stock, en todos los almacenes.
+                </p>
               </div>
             </div>
 
-            {/* Sub-tabs: Stock Actual / Lotes / Kardex */}
-            {(() => {
-              const stocks = dataService.getStocks();
-              const filtered = stocks.filter((s: any) => {
-                const q = invSearch.toLowerCase().trim();
-                const matchSearch = !q || s.code?.toLowerCase().includes(q) || s.description?.toLowerCase().includes(q);
-                const matchWh = invWarehouse === 'ALL' || (s.lotes || []).some((l: any) => l.warehouse === invWarehouse);
-                return matchSearch && matchWh;
-              });
-              return (
-                <div>
-                  <div className="px-8 border-b border-slate-100 flex gap-6">
-                    {(['stock', 'valorizacion', 'lotes'] as const).map(v => {
-                      const labels: Record<string, string> = { stock: 'Stock Actual', valorizacion: 'Valorización Completa', lotes: 'Lotes' };
-                      return (
-                        <button
-                          key={v}
-                          onClick={() => setInvView(v)}
-                          className={`py-3 text-[10px] font-black uppercase tracking-widest border-b-2 transition-all ${
-                            invView === v ? 'border-slate-900 text-slate-900' : 'border-transparent text-slate-400 hover:text-slate-600'
-                          }`}
-                        >{labels[v]}</button>
-                      );
-                    })}
-                  </div>
+            {/* Sub-tabs: Stock Actual / Valorización / Lotes */}
+            <div>
+              <div className="px-8 border-b border-slate-100 flex gap-6">
+                {(['stock', 'valorizacion', 'lotes'] as const).map(v => {
+                  const labels: Record<string, string> = { stock: 'Stock Actual', valorizacion: 'Valorización Completa', lotes: 'Lotes' };
+                  return (
+                    <button
+                      key={v}
+                      type="button"
+                      onClick={() => setInvView(v)}
+                      className={`py-3 text-[10px] font-black uppercase tracking-widest border-b-2 transition-all ${
+                        invView === v ? 'border-slate-900 text-slate-900' : 'border-transparent text-slate-400 hover:text-slate-600'
+                      }`}
+                    >{labels[v]}</button>
+                  );
+                })}
+              </div>
 
-                  <div className="overflow-x-auto">
-                    {invView === 'stock' && (
-                      <table className="w-full text-left">
-                        <thead className="bg-slate-50">
-                          <tr className="text-[9px] font-black text-slate-400 uppercase tracking-wider">
-                            <th className="px-5 py-3">Código</th>
-                            <th className="px-5 py-3">Descripción</th>
-                            <th className="px-4 py-3 text-right bg-blue-50/40">Galpón</th>
-                            <th className="px-4 py-3 text-right bg-amber-50/40">Pesa</th>
-                            <th className="px-4 py-3 text-right bg-emerald-50/40">Exhib.</th>
-                            <th className="px-5 py-3 text-right">Total</th>
-                            <th className="px-4 py-3 text-center">Estado</th>
+              <div className="overflow-x-auto">
+                {invView === 'stock' && (
+                  <table className="w-full text-left">
+                    <thead className="bg-slate-50">
+                      <tr className="text-[9px] font-black text-slate-400 uppercase tracking-wider">
+                        <th className="px-5 py-3">Código</th>
+                        <th className="px-5 py-3">Descripción</th>
+                        <th className="px-4 py-3 text-right bg-blue-50/40">Galpón</th>
+                        <th className="px-4 py-3 text-right bg-amber-50/40">Pesa</th>
+                        <th className="px-4 py-3 text-right bg-emerald-50/40">Exhib.</th>
+                        <th className="px-5 py-3 text-right">Total</th>
+                        <th className="px-4 py-3 text-center">Estado</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {invFilteredStocks.length === 0 ? (
+                        <tr><td colSpan={7} className="py-16 text-center text-slate-300 font-black uppercase text-sm">Sin productos</td></tr>
+                      ) : invFilteredStocks.map((s: any) => {
+                        const total = (s.lotes || []).reduce((a: number, l: any) => a + (Number(l.qty) || 0), 0);
+                        return (
+                          <tr key={s.code} className="hover:bg-slate-50 transition-colors">
+                            <td className="px-5 py-3 text-[10px] font-black font-mono text-slate-500">{s.code}</td>
+                            <td className="px-5 py-3 text-[11px] font-black text-slate-900 uppercase">{s.description}</td>
+                            <td className="px-4 py-3 text-right text-[11px] font-mono text-blue-600 bg-blue-50/20">{formatQuantity(s.d3 ?? 0)}</td>
+                            <td className="px-4 py-3 text-right text-[11px] font-mono text-amber-600 bg-amber-50/20">{formatQuantity(s.d2 ?? 0)}</td>
+                            <td className="px-4 py-3 text-right text-[11px] font-mono text-emerald-600 bg-emerald-50/20">{formatQuantity(s.a1 ?? 0)}</td>
+                            <td className="px-5 py-3 text-right text-[12px] font-black font-mono text-slate-900">{formatQuantity(total)} <span className="text-[9px] text-slate-400">{s.unit}</span></td>
+                            <td className="px-4 py-3 text-center">
+                              <span className={`inline-flex px-2 py-1 rounded-lg text-[9px] font-black ${total > 0 ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-600'}`}>
+                                {total > 0 ? 'OK' : 'SIN STOCK'}
+                              </span>
+                            </td>
                           </tr>
-                        </thead>
-                        <tbody className="divide-y divide-slate-100">
-                          {filtered.length === 0 ? (
-                            <tr><td colSpan={7} className="py-16 text-center text-slate-300 font-black uppercase text-sm">Sin productos</td></tr>
-                          ) : filtered.map((s: any) => {
-                            const total = (s.lotes || []).reduce((a: number, l: any) => a + (Number(l.qty) || 0), 0);
-                            return (
-                              <tr key={s.code} className="hover:bg-slate-50 transition-colors">
-                                <td className="px-5 py-3 text-[10px] font-black font-mono text-slate-500">{s.code}</td>
-                                <td className="px-5 py-3 text-[11px] font-black text-slate-900 uppercase">{s.description}</td>
-                                <td className="px-4 py-3 text-right text-[11px] font-mono text-blue-600 bg-blue-50/20">{formatQuantity(s.d3 ?? 0)}</td>
-                                <td className="px-4 py-3 text-right text-[11px] font-mono text-amber-600 bg-amber-50/20">{formatQuantity(s.d2 ?? 0)}</td>
-                                <td className="px-4 py-3 text-right text-[11px] font-mono text-emerald-600 bg-emerald-50/20">{formatQuantity(s.a1 ?? 0)}</td>
-                                <td className="px-5 py-3 text-right text-[12px] font-black font-mono text-slate-900">{formatQuantity(total)} <span className="text-[9px] text-slate-400">{s.unit}</span></td>
-                                <td className="px-4 py-3 text-center">
-                                  <span className={`inline-flex px-2 py-1 rounded-lg text-[9px] font-black ${total > 0 ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-600'}`}>
-                                    {total > 0 ? 'OK' : 'SIN STOCK'}
-                                  </span>
-                                </td>
-                              </tr>
-                            );
-                          })}
-                        </tbody>
-                      </table>
-                    )}
-                    {invView === 'valorizacion' && (
-                      <table className="w-full text-left">
-                        <thead className="bg-slate-50">
-                          <tr className="text-[9px] font-black text-slate-400 uppercase tracking-wider">
-                            <th className="px-5 py-3">Código</th>
-                            <th className="px-5 py-3">Descripción</th>
-                            <th className="px-4 py-3 text-right bg-blue-50/40">Galpón</th>
-                            <th className="px-4 py-3 text-right bg-amber-50/40">Pesa</th>
-                            <th className="px-4 py-3 text-right bg-emerald-50/40">Exhib.</th>
-                            <th className="px-4 py-3 text-right">Total</th>
-                            <th className="px-4 py-3 text-right">P.Costo $</th>
-                            <th className="px-4 py-3 text-right">P.Venta $</th>
-                            <th className="px-4 py-3 text-right">Val.Costo $</th>
-                            <th className="px-4 py-3 text-right">Val.Venta $</th>
-                            <th className="px-4 py-3 text-right">Margen $</th>
-                            <th className="px-4 py-3 text-center">Estado</th>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                )}
+                {invView === 'valorizacion' && (
+                  <table className="w-full text-left">
+                    <thead className="bg-slate-50">
+                      <tr className="text-[9px] font-black text-slate-400 uppercase tracking-wider">
+                        <th className="px-5 py-3">Código</th>
+                        <th className="px-5 py-3">Descripción</th>
+                        <th className="px-4 py-3 text-right bg-blue-50/40">Galpón</th>
+                        <th className="px-4 py-3 text-right bg-amber-50/40">Pesa</th>
+                        <th className="px-4 py-3 text-right bg-emerald-50/40">Exhib.</th>
+                        <th className="px-4 py-3 text-right">Total</th>
+                        <th className="px-4 py-3 text-right">P.Costo $</th>
+                        <th className="px-4 py-3 text-right">P.Venta $</th>
+                        <th className="px-4 py-3 text-right">Val.Costo $</th>
+                        <th className="px-4 py-3 text-right">Val.Venta $</th>
+                        <th className="px-4 py-3 text-right">Margen $</th>
+                        <th className="px-4 py-3 text-center">Estado</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {invFilteredStocks.length === 0 ? (
+                        <tr><td colSpan={12} className="py-16 text-center text-slate-300 font-black uppercase text-sm">Sin productos</td></tr>
+                      ) : invFilteredStocks.map((s: any) => {
+                        const lotes = s.lotes || [];
+                        const total = lotes.reduce((a: number, l: any) => a + (Number(l.qty) || 0), 0);
+                        const valCosto = lotes.reduce((a: number, l: any) => a + ((Number(l.qty) || 0) * (Number(l.costUSD) || 0)), 0);
+                        const pVenta = Number(s.priceUSD) || 0;
+                        const valVenta = total * pVenta;
+                        const margen = valVenta - valCosto;
+                        const avgCosto = lotes.length > 0 ? lotes.reduce((a: number, l: any) => a + (Number(l.costUSD) || 0), 0) / lotes.length : 0;
+                        return (
+                          <tr key={s.code} className="hover:bg-slate-50 transition-colors">
+                            <td className="px-5 py-3 text-[10px] font-black font-mono text-slate-500">{s.code}</td>
+                            <td className="px-5 py-3 text-[11px] font-black text-slate-900 uppercase max-w-[180px] truncate">{s.description}</td>
+                            <td className="px-4 py-3 text-right text-[10px] font-mono text-blue-600 bg-blue-50/20">{formatQuantity(s.d3 ?? 0)}</td>
+                            <td className="px-4 py-3 text-right text-[10px] font-mono text-amber-600 bg-amber-50/20">{formatQuantity(s.d2 ?? 0)}</td>
+                            <td className="px-4 py-3 text-right text-[10px] font-mono text-emerald-600 bg-emerald-50/20">{formatQuantity(s.a1 ?? 0)}</td>
+                            <td className="px-4 py-3 text-right text-[10px] font-black font-mono text-slate-900">{formatQuantity(total)} <span className="text-[8px] text-slate-400">{s.unit}</span></td>
+                            <td className="px-4 py-3 text-right text-[10px] font-mono text-slate-600">$ {avgCosto.toFixed(4)}</td>
+                            <td className="px-4 py-3 text-right text-[10px] font-mono text-emerald-700">$ {pVenta.toFixed(4)}</td>
+                            <td className="px-4 py-3 text-right text-[10px] font-black font-mono text-blue-700">$ {valCosto.toFixed(2)}</td>
+                            <td className="px-4 py-3 text-right text-[10px] font-black font-mono text-emerald-700">$ {valVenta.toFixed(2)}</td>
+                            <td className="px-4 py-3 text-right text-[10px] font-black font-mono">
+                              <span className={margen >= 0 ? 'text-emerald-600' : 'text-red-600'}>
+                                {margen >= 0 ? '' : '-'}$ {Math.abs(margen).toFixed(2)}
+                              </span>
+                            </td>
+                            <td className="px-4 py-3 text-center">
+                              <span className={`inline-flex px-2 py-1 rounded-lg text-[9px] font-black ${total > 0 ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-600'}`}>
+                                {total > 0 ? 'OK' : 'SIN STOCK'}
+                              </span>
+                            </td>
                           </tr>
-                        </thead>
-                        <tbody className="divide-y divide-slate-100">
-                          {filtered.length === 0 ? (
-                            <tr><td colSpan={12} className="py-16 text-center text-slate-300 font-black uppercase text-sm">Sin productos</td></tr>
-                          ) : filtered.map((s: any) => {
-                            const lotes = s.lotes || [];
-                            const total = lotes.reduce((a: number, l: any) => a + (Number(l.qty) || 0), 0);
-                            const valCosto = lotes.reduce((a: number, l: any) => a + ((Number(l.qty) || 0) * (Number(l.costUSD) || 0)), 0);
-                            const pVenta = Number(s.priceUSD) || 0;
-                            const valVenta = total * pVenta;
-                            const margen = valVenta - valCosto;
-                            const avgCosto = lotes.length > 0 ? lotes.reduce((a: number, l: any) => a + (Number(l.costUSD) || 0), 0) / lotes.length : 0;
-                            return (
-                              <tr key={s.code} className="hover:bg-slate-50 transition-colors">
-                                <td className="px-5 py-3 text-[10px] font-black font-mono text-slate-500">{s.code}</td>
-                                <td className="px-5 py-3 text-[11px] font-black text-slate-900 uppercase max-w-[180px] truncate">{s.description}</td>
-                                <td className="px-4 py-3 text-right text-[10px] font-mono text-blue-600 bg-blue-50/20">{formatQuantity(s.d3 ?? 0)}</td>
-                                <td className="px-4 py-3 text-right text-[10px] font-mono text-amber-600 bg-amber-50/20">{formatQuantity(s.d2 ?? 0)}</td>
-                                <td className="px-4 py-3 text-right text-[10px] font-mono text-emerald-600 bg-emerald-50/20">{formatQuantity(s.a1 ?? 0)}</td>
-                                <td className="px-4 py-3 text-right text-[10px] font-black font-mono text-slate-900">{formatQuantity(total)} <span className="text-[8px] text-slate-400">{s.unit}</span></td>
-                                <td className="px-4 py-3 text-right text-[10px] font-mono text-slate-600">$ {avgCosto.toFixed(4)}</td>
-                                <td className="px-4 py-3 text-right text-[10px] font-mono text-emerald-700">$ {pVenta.toFixed(4)}</td>
-                                <td className="px-4 py-3 text-right text-[10px] font-black font-mono text-blue-700">$ {valCosto.toFixed(2)}</td>
-                                <td className="px-4 py-3 text-right text-[10px] font-black font-mono text-emerald-700">$ {valVenta.toFixed(2)}</td>
-                                <td className="px-4 py-3 text-right text-[10px] font-black font-mono">
-                                  <span className={margen >= 0 ? 'text-emerald-600' : 'text-red-600'}>
-                                    {margen >= 0 ? '' : '-'}$ {Math.abs(margen).toFixed(2)}
-                                  </span>
-                                </td>
-                                <td className="px-4 py-3 text-center">
-                                  <span className={`inline-flex px-2 py-1 rounded-lg text-[9px] font-black ${total > 0 ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-600'}`}>
-                                    {total > 0 ? 'OK' : 'SIN STOCK'}
-                                  </span>
-                                </td>
-                              </tr>
-                            );
-                          })}
-                        </tbody>
-                      </table>
-                    )}
-                    {invView === 'lotes' && (
-                      <table className="w-full text-left">
-                        <thead className="bg-slate-50">
-                          <tr className="text-[9px] font-black text-slate-400 uppercase tracking-wider">
-                            <th className="px-5 py-3">SKU</th>
-                            <th className="px-5 py-3">Producto</th>
-                            <th className="px-4 py-3">Lote</th>
-                            <th className="px-4 py-3">Almacén</th>
-                            <th className="px-4 py-3 text-right">Qty</th>
-                            <th className="px-4 py-3 text-right">Costo Unit. $</th>
-                            <th className="px-4 py-3 text-right">Val. Costo $</th>
-                            <th className="px-4 py-3 text-center">Vto.</th>
-                            <th className="px-4 py-3 text-center">Estado</th>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                )}
+                {invView === 'lotes' && (
+                  <table className="w-full text-left">
+                    <thead className="bg-slate-50">
+                      <tr className="text-[9px] font-black text-slate-400 uppercase tracking-wider">
+                        <th className="px-5 py-3">SKU</th>
+                        <th className="px-5 py-3">Producto</th>
+                        <th className="px-4 py-3">Lote</th>
+                        <th className="px-4 py-3">Almacén</th>
+                        <th className="px-4 py-3 text-right">Qty</th>
+                        <th className="px-4 py-3 text-right">Costo Unit. $</th>
+                        <th className="px-4 py-3 text-right">Val. Costo $</th>
+                        <th className="px-4 py-3 text-center">Vto.</th>
+                        <th className="px-4 py-3 text-center">Estado</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {invLotRows.length === 0 ? (
+                        <tr><td colSpan={9} className="py-16 text-center text-slate-300 font-black uppercase text-sm">Sin lotes</td></tr>
+                      ) : invLotRows.map(({ s, l }) => {
+                        const qty = Number(l.qty) || 0;
+                        const cost = Number(l.costUSD) || 0;
+                        const valCosto = qty * cost;
+                        const exp = l.expiry ? new Date(l.expiry) : null;
+                        const now = new Date();
+                        const expired = Boolean(exp && exp < now);
+                        const expLabel = exp ? exp.toLocaleDateString('es-VE') : '—';
+                        return (
+                          <tr key={`${s.code}-${l.id}`} className="hover:bg-slate-50 transition-colors">
+                            <td className="px-5 py-3 text-[10px] font-black font-mono text-slate-500">{s.code}</td>
+                            <td className="px-5 py-3 text-[11px] font-black text-slate-900 uppercase max-w-[160px] truncate">{s.description}</td>
+                            <td className="px-4 py-3 text-[10px] font-mono text-slate-600">{String(l.batch ?? l.id ?? '').slice(0, 10)}</td>
+                            <td className="px-4 py-3 text-[10px] font-bold text-slate-600">{l.warehouse ?? '—'}</td>
+                            <td className="px-4 py-3 text-right text-[11px] font-black font-mono text-slate-900">{formatQuantity(qty)} <span className="text-[8px] text-slate-400">{s.unit}</span></td>
+                            <td className="px-4 py-3 text-right text-[10px] font-mono text-slate-600">$ {cost.toFixed(4)}</td>
+                            <td className="px-4 py-3 text-right text-[10px] font-black font-mono text-blue-700">$ {valCosto.toFixed(2)}</td>
+                            <td className="px-4 py-3 text-center text-[10px] font-mono">
+                              <span className={expired ? 'text-red-600 font-black' : 'text-slate-500'}>{expLabel}</span>
+                            </td>
+                            <td className="px-4 py-3 text-center">
+                              <span className={`inline-flex px-2 py-1 rounded-lg text-[9px] font-black ${qty > 0 && !expired ? 'bg-emerald-100 text-emerald-700' : qty === 0 ? 'bg-slate-100 text-slate-400' : 'bg-red-100 text-red-600'}`}>
+                                {qty === 0 ? 'VACÍO' : expired ? 'VENCIDO' : 'OK'}
+                              </span>
+                            </td>
                           </tr>
-                        </thead>
-                        <tbody className="divide-y divide-slate-100">
-                          {filtered.flatMap((s: any) =>
-                            (s.lotes || [])
-                              .filter((l: any) => invWarehouse === 'ALL' || l.warehouse === invWarehouse)
-                              .map((l: any) => {
-                                const qty = Number(l.qty) || 0;
-                                const cost = Number(l.costUSD) || 0;
-                                const valCosto = qty * cost;
-                                const now = new Date();
-                                const exp = l.expiry ? new Date(l.expiry) : null;
-                                const expired = exp && exp < now;
-                                const expLabel = exp ? exp.toLocaleDateString('es-VE') : '—';
-                                return (
-                                  <tr key={`${s.code}-${l.id}`} className="hover:bg-slate-50 transition-colors">
-                                    <td className="px-5 py-3 text-[10px] font-black font-mono text-slate-500">{s.code}</td>
-                                    <td className="px-5 py-3 text-[11px] font-black text-slate-900 uppercase max-w-[160px] truncate">{s.description}</td>
-                                    <td className="px-4 py-3 text-[10px] font-mono text-slate-600">{String(l.batch ?? l.id ?? '').slice(0, 10)}</td>
-                                    <td className="px-4 py-3 text-[10px] font-bold text-slate-600">{l.warehouse ?? '—'}</td>
-                                    <td className="px-4 py-3 text-right text-[11px] font-black font-mono text-slate-900">{formatQuantity(qty)} <span className="text-[8px] text-slate-400">{s.unit}</span></td>
-                                    <td className="px-4 py-3 text-right text-[10px] font-mono text-slate-600">$ {cost.toFixed(4)}</td>
-                                    <td className="px-4 py-3 text-right text-[10px] font-black font-mono text-blue-700">$ {valCosto.toFixed(2)}</td>
-                                    <td className="px-4 py-3 text-center text-[10px] font-mono">
-                                      <span className={expired ? 'text-red-600 font-black' : 'text-slate-500'}>{expLabel}</span>
-                                    </td>
-                                    <td className="px-4 py-3 text-center">
-                                      <span className={`inline-flex px-2 py-1 rounded-lg text-[9px] font-black ${qty > 0 && !expired ? 'bg-emerald-100 text-emerald-700' : qty === 0 ? 'bg-slate-100 text-slate-400' : 'bg-red-100 text-red-600'}`}>
-                                        {qty === 0 ? 'VACÍO' : expired ? 'VENCIDO' : 'OK'}
-                                      </span>
-                                    </td>
-                                  </tr>
-                                );
-                              })
-                          ).filter(Boolean).length === 0
-                            ? <tr><td colSpan={9} className="py-16 text-center text-slate-300 font-black uppercase text-sm">Sin lotes</td></tr>
-                            : filtered.flatMap((s: any) =>
-                                (s.lotes || [])
-                                  .filter((l: any) => invWarehouse === 'ALL' || l.warehouse === invWarehouse)
-                                  .map((l: any) => {
-                                    const qty = Number(l.qty) || 0;
-                                    const cost = Number(l.costUSD) || 0;
-                                    const valCosto = qty * cost;
-                                    const now = new Date();
-                                    const exp = l.expiry ? new Date(l.expiry) : null;
-                                    const expired = exp && exp < now;
-                                    const expLabel = exp ? exp.toLocaleDateString('es-VE') : '—';
-                                    return (
-                                      <tr key={`${s.code}-${l.id}`} className="hover:bg-slate-50 transition-colors">
-                                        <td className="px-5 py-3 text-[10px] font-black font-mono text-slate-500">{s.code}</td>
-                                        <td className="px-5 py-3 text-[11px] font-black text-slate-900 uppercase max-w-[160px] truncate">{s.description}</td>
-                                        <td className="px-4 py-3 text-[10px] font-mono text-slate-600">{String(l.batch ?? l.id ?? '').slice(0, 10)}</td>
-                                        <td className="px-4 py-3 text-[10px] font-bold text-slate-600">{l.warehouse ?? '—'}</td>
-                                        <td className="px-4 py-3 text-right text-[11px] font-black font-mono text-slate-900">{formatQuantity(qty)} <span className="text-[8px] text-slate-400">{s.unit}</span></td>
-                                        <td className="px-4 py-3 text-right text-[10px] font-mono text-slate-600">$ {cost.toFixed(4)}</td>
-                                        <td className="px-4 py-3 text-right text-[10px] font-black font-mono text-blue-700">$ {valCosto.toFixed(2)}</td>
-                                        <td className="px-4 py-3 text-center text-[10px] font-mono">
-                                          <span className={expired ? 'text-red-600 font-black' : 'text-slate-500'}>{expLabel}</span>
-                                        </td>
-                                        <td className="px-4 py-3 text-center">
-                                          <span className={`inline-flex px-2 py-1 rounded-lg text-[9px] font-black ${qty > 0 && !expired ? 'bg-emerald-100 text-emerald-700' : qty === 0 ? 'bg-slate-100 text-slate-400' : 'bg-red-100 text-red-600'}`}>
-                                            {qty === 0 ? 'VACÍO' : expired ? 'VENCIDO' : 'OK'}
-                                          </span>
-                                        </td>
-                                      </tr>
-                                    );
-                                  })
-                              )
-                          }
-                        </tbody>
-                      </table>
-                    )}
-                  </div>
-                </div>
-              );
-            })()}
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            </div>
           </div>
         </div>
       )}
