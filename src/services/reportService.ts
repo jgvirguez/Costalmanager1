@@ -89,6 +89,61 @@ class ReportService {
     return `Bs ${this.formatNumber(value, 2)}`;
   }
 
+  /** Normaliza estados técnicos del sistema a etiquetas legibles en español para reportes exportados. */
+  private formatStatusEs(value: any): string {
+    const raw = String(value ?? '').trim();
+    if (!raw) return '-';
+    const key = raw.toUpperCase();
+    const map: Record<string, string> = {
+      ACTIVE: 'ACTIVA',
+      ACTIV0: 'ACTIVA',
+      INACTIVE: 'INACTIVA',
+      COMPLETED: 'COMPLETADA',
+      COMPLETE: 'COMPLETADA',
+      PENDING: 'PENDIENTE',
+      PARTIAL: 'PARCIAL',
+      PAID: 'PAGADA',
+      OVERDUE: 'VENCIDA',
+      CANCELLED: 'CANCELADA',
+      CANCELED: 'CANCELADA',
+      VOID: 'ANULADA',
+      FAILED: 'FALLIDA',
+      ERROR: 'ERROR'
+    };
+    return map[key] ?? raw.toUpperCase();
+  }
+
+  /** Clasifica categoría visible del egreso con prioridad al motivo/descripción. */
+  private formatExpenseCategoryEs(value: any, description?: any): string {
+    const raw = String(value ?? '').trim();
+    const desc = String(description ?? '').trim().toLowerCase();
+
+    // 1) Prioridad al motivo textual para reportes más útiles en libro.
+    if (desc.includes('cxp')) return 'CxP';
+    if (desc.includes('nomina') || desc.includes('nómina') || desc.includes('empleado') || desc.includes('rrhh')) return 'Nómina';
+    if (desc.includes('flete') || desc.includes('transporte') || desc.includes('delivery')) return 'Transporte';
+    if (
+      desc.includes('internet') || desc.includes('luz') || desc.includes('agua') || desc.includes('telefono')
+      || desc.includes('teléfono') || desc.includes('servicio')
+    ) return 'Servicio';
+
+    // 2) Fallback por categoría técnica almacenada.
+    const key = raw.toUpperCase();
+    const map: Record<string, string> = {
+      NOMINA: 'Nómina',
+      ALQUILER: 'Alquiler',
+      SERVICIOS: 'Servicio',
+      FLETE: 'Transporte',
+      SUMINISTROS: 'Suministros',
+      MANTENIMIENTO: 'Mantenimiento',
+      PUBLICIDAD: 'Publicidad',
+      IMPUESTOS: 'Impuestos',
+      BANCARIO: 'Bancario',
+      OTRO: 'Otro'
+    };
+    return map[key] ?? (raw || 'Otro');
+  }
+
   private formatSaleProductDetails(sale: any): string {
     const items = Array.isArray(sale?.items) ? sale.items : [];
     if (items.length === 0) return 'Sin detalle de productos';
@@ -1016,7 +1071,7 @@ class ReportService {
       this.formatNumber(Number(row.amountUSD ?? 0), 2),
       this.formatNumber(Number(row.amountVES ?? 0), 2),
       String(row.method ?? ''),
-      String(row.status ?? '')
+      this.formatStatusEs(row.status)
     ]));
 
     autoTable(doc, {
@@ -2115,7 +2170,7 @@ class ReportService {
       String(row.operator ?? 'SISTEMA').slice(0, 22),
       this.formatPurchaseProductDetails(row),
       this.formatUSD(Number(row.amountUSD ?? 0)),
-      String(row.status ?? '')
+      this.formatStatusEs(row.status)
     ]));
 
     autoTable(doc, {
@@ -2228,7 +2283,7 @@ class ReportService {
         row.tercero,
         row.detalle_productos,
         this.formatUSD(row.totalUSD),
-        row.estado
+        this.formatStatusEs(row.estado)
       ]) : [['-', '-', '-', 'Sin registros', '-', '$ 0.00', '-']],
       foot: [['', '', '', '', 'TOTAL', this.formatUSD(totalUSD), '']],
       showFoot: 'lastPage',
@@ -2273,7 +2328,7 @@ class ReportService {
     const body = list.map((row) => ([
       row.timestamp instanceof Date ? row.timestamp.toLocaleDateString('es-VE') : String(row.timestamp ?? ''),
       String(row.description ?? '').slice(0, 58),
-      String(row.category ?? ''),
+      this.formatExpenseCategoryEs(row.category, row.description),
       this.formatUSD(Number(row.amountUSD ?? 0))
     ]));
 

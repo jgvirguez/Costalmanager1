@@ -1771,7 +1771,7 @@ export function ReportsView() {
       && Number.isFinite(session.endMs)
       && session.endMs >= session.startMs
     );
-    const resolveOperatorBySessionWindow = (sale: any) => {
+    const resolveOperatorBySessionWindow = (sale: any, preferredNames: string[] = []) => {
       const saleTime = sale?.timestamp instanceof Date
         ? sale.timestamp.getTime()
         : new Date(sale?.timestamp ?? Date.now()).getTime();
@@ -1779,13 +1779,16 @@ export function ReportsView() {
       const matches = sessionWindows
         .filter((session: any) => saleTime >= session.startMs && saleTime <= session.endMs);
       if (matches.length === 0) return null;
-      const uniqueUserIds = Array.from(new Set(matches.map((session: any) => session.userId).filter(Boolean)));
-      if (uniqueUserIds.length !== 1) return null;
-      const matchedUserId = uniqueUserIds[0];
-      const matchedSession = matches
-        .filter((session: any) => session.userId === matchedUserId)
-        .sort((a: any, b: any) => b.startMs - a.startMs)[0];
+      const normalizedPreferred = preferredNames
+        .map((n) => String(n ?? '').trim())
+        .filter(Boolean);
+      const preferredSession = matches.find((session: any) =>
+        normalizedPreferred.some((name) => namesLikelySame(name, session?.userName ?? ''))
+      );
+      const matchedSession = preferredSession
+        ?? [...matches].sort((a: any, b: any) => b.startMs - a.startMs)[0];
       if (!matchedSession) return null;
+      const matchedUserId = String(matchedSession.userId ?? '').trim();
       const matchedUser = usersById.get(matchedUserId);
       return {
         userId: matchedUserId,
@@ -1847,7 +1850,7 @@ export function ReportsView() {
         };
       }
 
-      const sessionOperator = resolveOperatorBySessionWindow(sale);
+      const sessionOperator = resolveOperatorBySessionWindow(sale, [saleOperatorNameRaw, bankActorName]);
       if (sessionOperator?.name) {
         return sessionOperator;
       }
@@ -2244,7 +2247,7 @@ export function ReportsView() {
       && Number.isFinite(session.endMs)
       && session.endMs >= session.startMs
     );
-    const resolveOperatorBySessionWindow = (sale: any) => {
+    const resolveOperatorBySessionWindow = (sale: any, preferredNames: string[] = []) => {
       const saleTime = sale?.timestamp instanceof Date
         ? sale.timestamp.getTime()
         : new Date(sale?.timestamp ?? Date.now()).getTime();
@@ -2252,13 +2255,16 @@ export function ReportsView() {
       const matches = sessionWindows
         .filter((session: any) => saleTime >= session.startMs && saleTime <= session.endMs);
       if (matches.length === 0) return null;
-      const uniqueUserIds = Array.from(new Set(matches.map((session: any) => session.userId).filter(Boolean)));
-      if (uniqueUserIds.length !== 1) return null;
-      const matchedUserId = uniqueUserIds[0];
-      const matchedSession = matches
-        .filter((session: any) => session.userId === matchedUserId)
-        .sort((a: any, b: any) => b.startMs - a.startMs)[0];
+      const normalizedPreferred = preferredNames
+        .map((n) => String(n ?? '').trim())
+        .filter(Boolean);
+      const preferredSession = matches.find((session: any) =>
+        normalizedPreferred.some((name) => namesLikelySame(name, session?.userName ?? ''))
+      );
+      const matchedSession = preferredSession
+        ?? [...matches].sort((a: any, b: any) => b.startMs - a.startMs)[0];
       if (!matchedSession) return null;
+      const matchedUserId = String(matchedSession.userId ?? '').trim();
       const matchedUser = usersById.get(matchedUserId);
       return {
         userId: matchedUserId,
@@ -2345,7 +2351,7 @@ export function ReportsView() {
         };
       }
 
-      const sessionOperator = resolveOperatorBySessionWindow(sale);
+      const sessionOperator = resolveOperatorBySessionWindow(sale, [saleOperatorNameRaw, bankActorName]);
       if (sessionOperator?.name) {
         return sessionOperator;
       }
