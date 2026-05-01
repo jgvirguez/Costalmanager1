@@ -40,7 +40,7 @@ import { buildExcelFriendlyCsv } from '../../utils/csvExport';
 import { isCreditSaleByBusinessRule } from '../../utils/salesClassification';
 import { printService } from '../../services/printService';
 
-type ReportTab = 'overview' | 'sales' | 'profit' | 'margins' | 'treasury' | 'zclosure' | 'purchases' | 'expenses' | 'shrinkage' | 'cashier' | 'advances';
+type ReportTab = 'overview' | 'sales' | 'profit' | 'margins' | 'inventory' | 'treasury' | 'zclosure' | 'purchases' | 'expenses' | 'shrinkage' | 'cashier' | 'advances';
 type CashierViewMode = 'GENERAL' | 'METHODS' | 'DETAIL';
 type CashierDetailRateMode = 'LINE' | 'BCV' | 'INTERNAL';
 type OverviewMovementType = 'ALL' | 'VENTA' | 'COMPRA' | 'DEVOLUCION' | 'EGRESO' | 'ANTICIPO' | 'COBRO_AR' | 'PAGO_AP' | 'MERMA';
@@ -123,6 +123,9 @@ export function ReportsView() {
     start: new Date(new Date().setDate(new Date().getDate() - 30)).toISOString().split('T')[0],
     end: new Date().toISOString().split('T')[0]
   });
+  const [invView, setInvView] = React.useState<'stock' | 'valorizacion' | 'lotes' | 'kardex'>('stock');
+  const [invSearch, setInvSearch] = React.useState('');
+  const [invWarehouse, setInvWarehouse] = React.useState<'ALL' | 'Galpon D3' | 'Pesa D2' | 'exibicion D1'>('ALL');
   const [zDate, setZDate] = React.useState(new Date().toISOString().split('T')[0]);
   const [zSelectedCashierIds, setZSelectedCashierIds] = React.useState<string[]>([]);
   const [zMethodFilter, setZMethodFilter] = React.useState<string>('ALL');
@@ -235,6 +238,7 @@ export function ReportsView() {
     zclosure: canViewSalesReports,
     cashier: canViewSalesReports,
     margins: canViewInventoryReports,
+    inventory: canViewInventoryReports,
     shrinkage: canViewInventoryReports,
     treasury: canViewFinancialReports,
     purchases: canViewFinancialReports,
@@ -2712,6 +2716,7 @@ export function ReportsView() {
     { key: 'sales',      label: 'Ventas',          icon: ShoppingBag },
     { key: 'profit',     label: 'Utilidad vendida', icon: CircleDollarSign },
     { key: 'margins',    label: 'Márgenes',         icon: Package },
+    { key: 'inventory',  label: 'Inventario',        icon: Package },
     { key: 'treasury',   label: 'Tesorería',        icon: Wallet },
     { key: 'purchases',  label: 'Libro Compras',    icon: Truck },
     { key: 'expenses',   label: 'Egresos',          icon: TrendingDown },
@@ -2733,6 +2738,7 @@ export function ReportsView() {
       sales: 'Ventas',
       profit: 'Utilidad vendida',
       margins: 'Margenes',
+      inventory: 'Inventario',
       treasury: 'Tesoreria',
       zclosure: 'Cierre Caja',
       purchases: 'Libro de Compras',
@@ -5705,6 +5711,317 @@ export function ReportsView() {
                 </tbody>
               </table>
             </div>
+          </div>
+        </div>
+      )}
+
+      {activeTab === "inventory" && (
+        <div className="space-y-6">
+          {/* KPIs */}
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            {(() => {
+              const stocks = dataService.getStocks();
+              const withStock = stocks.filter(s => (s.lotes || []).reduce((a: number, l: any) => a + (Number(l.qty) || 0), 0) > 0);
+              const totalValCosto = inventoryStats.reduce((a, s) => a + (Number(s.valueUSD) || 0), 0);
+              const totalValVenta = reportService.getTotalValorization('sale');
+              const bajoMinimo = stocks.filter(s => {
+                const total = (s.lotes || []).reduce((a: number, l: any) => a + (Number(l.qty) || 0), 0);
+                const min = Number((s as any).minStock ?? 0) || 0;
+                return min > 0 && total < min;
+              }).length;
+              return (
+                <>
+                  <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-sm">
+                    <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Productos con Stock</p>
+                    <p className="text-3xl font-black text-slate-900 mt-1">{withStock.length}</p>
+                  </div>
+                  <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-sm">
+                    <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Valorización (Venta)</p>
+                    <p className="text-3xl font-black text-emerald-600 mt-1">$ {totalValVenta.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                  </div>
+                  <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-sm">
+                    <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Valorización (Costo)</p>
+                    <p className="text-3xl font-black text-blue-600 mt-1">$ {totalValCosto.toLocaleString('es-VE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</p>
+                  </div>
+                  <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-sm">
+                    <p className="text-[9px] font-black text-slate-400 uppercase tracking-widest">Bajo Mínimo</p>
+                    <p className={`text-3xl font-black mt-1 ${bajoMinimo > 0 ? 'text-red-500' : 'text-slate-900'}`}>{bajoMinimo}</p>
+                  </div>
+                </>
+              );
+            })()}
+          </div>
+
+          {/* Tabla de Inventario */}
+          <div className="bg-white rounded-[2.5rem] border border-slate-200 overflow-hidden shadow-sm">
+            <div className="p-6 border-b bg-[#f8fafc]/50 flex flex-wrap justify-between items-center gap-3">
+              <div>
+                <h3 className="font-headline font-black text-2xl tracking-tighter uppercase text-slate-900">Reportes de Inventario</h3>
+                <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mt-1">Valorización · Lotes · Kardex</p>
+              </div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <input
+                  type="text"
+                  value={invSearch}
+                  onChange={e => setInvSearch(e.target.value)}
+                  placeholder="Buscar producto..."
+                  className="px-4 py-2 rounded-xl border border-slate-200 text-[11px] font-bold text-slate-700 w-48 outline-none focus:border-emerald-400 bg-white"
+                />
+                <select
+                  value={invWarehouse}
+                  onChange={e => setInvWarehouse(e.target.value as any)}
+                  className="px-3 py-2 rounded-xl border border-slate-200 text-[11px] font-bold text-slate-700 bg-white outline-none focus:border-emerald-400"
+                >
+                  <option value="ALL">Todos los almacenes</option>
+                  <option value="Galpon D3">Galpón D3</option>
+                  <option value="Pesa D2">Pesa D2</option>
+                  <option value="exibicion D1">Exhibición D1</option>
+                </select>
+                <button
+                  onClick={() => {
+                    const stocks = dataService.getStocks();
+                    const rows = stocks.map((s: any) => {
+                      const lotes = s.lotes || [];
+                      const total = lotes.reduce((a: number, l: any) => a + (Number(l.qty) || 0), 0);
+                      const valCosto = lotes.reduce((a: number, l: any) => a + ((Number(l.qty) || 0) * (Number(l.costUSD) || 0)), 0);
+                      const valVenta = total * (Number(s.priceUSD) || 0);
+                      const margen = valCosto > 0 ? ((valVenta - valCosto) / valCosto * 100) : 0;
+                      return {
+                        codigo: s.code, descripcion: s.description, unidad: s.unit,
+                        galpon: s.d3 ?? 0, pesa: s.d2 ?? 0, exhibicion: s.a1 ?? 0, total,
+                        p_costo_usd: (Number(s.avgCostUSD) || lotes.reduce((a: number, l: any) => a + (Number(l.costUSD) || 0), 0) / (lotes.length || 1)).toFixed(4),
+                        p_venta_usd: (Number(s.priceUSD) || 0).toFixed(4),
+                        val_costo_usd: valCosto.toFixed(2),
+                        val_venta_usd: valVenta.toFixed(2),
+                        margen_pct: margen.toFixed(1),
+                        estado: total > 0 ? 'OK' : 'SIN STOCK'
+                      };
+                    });
+                    exportCSV(rows, `inventario_${new Date().toISOString().split('T')[0]}.csv`, { reportLabel: 'Inventario Valorizado', filterLabel: 'Corte actual', includeTotals: false });
+                  }}
+                  className="flex items-center gap-2 px-4 py-2 bg-slate-800 text-white rounded-xl text-[10px] font-black uppercase hover:bg-slate-700 transition-all"
+                >
+                  <Download className="w-3 h-3" /> CSV
+                </button>
+                <button
+                  onClick={() => reportService.exportInventoryToPDF({ pricing: valuationPricing, currency: valuationCurrency, vesRate: valuationVesRate })}
+                  className="flex items-center gap-2 px-4 py-2 bg-emerald-800 text-white rounded-xl text-[10px] font-black uppercase hover:bg-emerald-700 transition-all"
+                >
+                  <Download className="w-3 h-3" /> PDF
+                </button>
+              </div>
+            </div>
+
+            {/* Sub-tabs: Stock Actual / Lotes / Kardex */}
+            {(() => {
+              const stocks = dataService.getStocks();
+              const filtered = stocks.filter((s: any) => {
+                const q = invSearch.toLowerCase().trim();
+                const matchSearch = !q || s.code?.toLowerCase().includes(q) || s.description?.toLowerCase().includes(q);
+                const matchWh = invWarehouse === 'ALL' || (s.lotes || []).some((l: any) => l.warehouse === invWarehouse);
+                return matchSearch && matchWh;
+              });
+              return (
+                <div>
+                  <div className="px-8 border-b border-slate-100 flex gap-6">
+                    {(['stock', 'valorizacion', 'lotes'] as const).map(v => {
+                      const labels: Record<string, string> = { stock: 'Stock Actual', valorizacion: 'Valorización Completa', lotes: 'Lotes' };
+                      return (
+                        <button
+                          key={v}
+                          onClick={() => setInvView(v)}
+                          className={`py-3 text-[10px] font-black uppercase tracking-widest border-b-2 transition-all ${
+                            invView === v ? 'border-slate-900 text-slate-900' : 'border-transparent text-slate-400 hover:text-slate-600'
+                          }`}
+                        >{labels[v]}</button>
+                      );
+                    })}
+                  </div>
+
+                  <div className="overflow-x-auto">
+                    {invView === 'stock' && (
+                      <table className="w-full text-left">
+                        <thead className="bg-slate-50">
+                          <tr className="text-[9px] font-black text-slate-400 uppercase tracking-wider">
+                            <th className="px-5 py-3">Código</th>
+                            <th className="px-5 py-3">Descripción</th>
+                            <th className="px-4 py-3 text-right bg-blue-50/40">Galpón</th>
+                            <th className="px-4 py-3 text-right bg-amber-50/40">Pesa</th>
+                            <th className="px-4 py-3 text-right bg-emerald-50/40">Exhib.</th>
+                            <th className="px-5 py-3 text-right">Total</th>
+                            <th className="px-4 py-3 text-center">Estado</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                          {filtered.length === 0 ? (
+                            <tr><td colSpan={7} className="py-16 text-center text-slate-300 font-black uppercase text-sm">Sin productos</td></tr>
+                          ) : filtered.map((s: any) => {
+                            const total = (s.lotes || []).reduce((a: number, l: any) => a + (Number(l.qty) || 0), 0);
+                            return (
+                              <tr key={s.code} className="hover:bg-slate-50 transition-colors">
+                                <td className="px-5 py-3 text-[10px] font-black font-mono text-slate-500">{s.code}</td>
+                                <td className="px-5 py-3 text-[11px] font-black text-slate-900 uppercase">{s.description}</td>
+                                <td className="px-4 py-3 text-right text-[11px] font-mono text-blue-600 bg-blue-50/20">{formatQuantity(s.d3 ?? 0)}</td>
+                                <td className="px-4 py-3 text-right text-[11px] font-mono text-amber-600 bg-amber-50/20">{formatQuantity(s.d2 ?? 0)}</td>
+                                <td className="px-4 py-3 text-right text-[11px] font-mono text-emerald-600 bg-emerald-50/20">{formatQuantity(s.a1 ?? 0)}</td>
+                                <td className="px-5 py-3 text-right text-[12px] font-black font-mono text-slate-900">{formatQuantity(total)} <span className="text-[9px] text-slate-400">{s.unit}</span></td>
+                                <td className="px-4 py-3 text-center">
+                                  <span className={`inline-flex px-2 py-1 rounded-lg text-[9px] font-black ${total > 0 ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-600'}`}>
+                                    {total > 0 ? 'OK' : 'SIN STOCK'}
+                                  </span>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    )}
+                    {invView === 'valorizacion' && (
+                      <table className="w-full text-left">
+                        <thead className="bg-slate-50">
+                          <tr className="text-[9px] font-black text-slate-400 uppercase tracking-wider">
+                            <th className="px-5 py-3">Código</th>
+                            <th className="px-5 py-3">Descripción</th>
+                            <th className="px-4 py-3 text-right bg-blue-50/40">Galpón</th>
+                            <th className="px-4 py-3 text-right bg-amber-50/40">Pesa</th>
+                            <th className="px-4 py-3 text-right bg-emerald-50/40">Exhib.</th>
+                            <th className="px-4 py-3 text-right">Total</th>
+                            <th className="px-4 py-3 text-right">P.Costo $</th>
+                            <th className="px-4 py-3 text-right">P.Venta $</th>
+                            <th className="px-4 py-3 text-right">Val.Costo $</th>
+                            <th className="px-4 py-3 text-right">Val.Venta $</th>
+                            <th className="px-4 py-3 text-right">Margen $</th>
+                            <th className="px-4 py-3 text-center">Estado</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                          {filtered.length === 0 ? (
+                            <tr><td colSpan={12} className="py-16 text-center text-slate-300 font-black uppercase text-sm">Sin productos</td></tr>
+                          ) : filtered.map((s: any) => {
+                            const lotes = s.lotes || [];
+                            const total = lotes.reduce((a: number, l: any) => a + (Number(l.qty) || 0), 0);
+                            const valCosto = lotes.reduce((a: number, l: any) => a + ((Number(l.qty) || 0) * (Number(l.costUSD) || 0)), 0);
+                            const pVenta = Number(s.priceUSD) || 0;
+                            const valVenta = total * pVenta;
+                            const margen = valVenta - valCosto;
+                            const avgCosto = lotes.length > 0 ? lotes.reduce((a: number, l: any) => a + (Number(l.costUSD) || 0), 0) / lotes.length : 0;
+                            return (
+                              <tr key={s.code} className="hover:bg-slate-50 transition-colors">
+                                <td className="px-5 py-3 text-[10px] font-black font-mono text-slate-500">{s.code}</td>
+                                <td className="px-5 py-3 text-[11px] font-black text-slate-900 uppercase max-w-[180px] truncate">{s.description}</td>
+                                <td className="px-4 py-3 text-right text-[10px] font-mono text-blue-600 bg-blue-50/20">{formatQuantity(s.d3 ?? 0)}</td>
+                                <td className="px-4 py-3 text-right text-[10px] font-mono text-amber-600 bg-amber-50/20">{formatQuantity(s.d2 ?? 0)}</td>
+                                <td className="px-4 py-3 text-right text-[10px] font-mono text-emerald-600 bg-emerald-50/20">{formatQuantity(s.a1 ?? 0)}</td>
+                                <td className="px-4 py-3 text-right text-[10px] font-black font-mono text-slate-900">{formatQuantity(total)} <span className="text-[8px] text-slate-400">{s.unit}</span></td>
+                                <td className="px-4 py-3 text-right text-[10px] font-mono text-slate-600">$ {avgCosto.toFixed(4)}</td>
+                                <td className="px-4 py-3 text-right text-[10px] font-mono text-emerald-700">$ {pVenta.toFixed(4)}</td>
+                                <td className="px-4 py-3 text-right text-[10px] font-black font-mono text-blue-700">$ {valCosto.toFixed(2)}</td>
+                                <td className="px-4 py-3 text-right text-[10px] font-black font-mono text-emerald-700">$ {valVenta.toFixed(2)}</td>
+                                <td className="px-4 py-3 text-right text-[10px] font-black font-mono">
+                                  <span className={margen >= 0 ? 'text-emerald-600' : 'text-red-600'}>
+                                    {margen >= 0 ? '' : '-'}$ {Math.abs(margen).toFixed(2)}
+                                  </span>
+                                </td>
+                                <td className="px-4 py-3 text-center">
+                                  <span className={`inline-flex px-2 py-1 rounded-lg text-[9px] font-black ${total > 0 ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-600'}`}>
+                                    {total > 0 ? 'OK' : 'SIN STOCK'}
+                                  </span>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    )}
+                    {invView === 'lotes' && (
+                      <table className="w-full text-left">
+                        <thead className="bg-slate-50">
+                          <tr className="text-[9px] font-black text-slate-400 uppercase tracking-wider">
+                            <th className="px-5 py-3">SKU</th>
+                            <th className="px-5 py-3">Producto</th>
+                            <th className="px-4 py-3">Lote</th>
+                            <th className="px-4 py-3">Almacén</th>
+                            <th className="px-4 py-3 text-right">Qty</th>
+                            <th className="px-4 py-3 text-right">Costo Unit. $</th>
+                            <th className="px-4 py-3 text-right">Val. Costo $</th>
+                            <th className="px-4 py-3 text-center">Vto.</th>
+                            <th className="px-4 py-3 text-center">Estado</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                          {filtered.flatMap((s: any) =>
+                            (s.lotes || [])
+                              .filter((l: any) => invWarehouse === 'ALL' || l.warehouse === invWarehouse)
+                              .map((l: any) => {
+                                const qty = Number(l.qty) || 0;
+                                const cost = Number(l.costUSD) || 0;
+                                const valCosto = qty * cost;
+                                const now = new Date();
+                                const exp = l.expiry ? new Date(l.expiry) : null;
+                                const expired = exp && exp < now;
+                                const expLabel = exp ? exp.toLocaleDateString('es-VE') : '—';
+                                return (
+                                  <tr key={`${s.code}-${l.id}`} className="hover:bg-slate-50 transition-colors">
+                                    <td className="px-5 py-3 text-[10px] font-black font-mono text-slate-500">{s.code}</td>
+                                    <td className="px-5 py-3 text-[11px] font-black text-slate-900 uppercase max-w-[160px] truncate">{s.description}</td>
+                                    <td className="px-4 py-3 text-[10px] font-mono text-slate-600">{String(l.batch ?? l.id ?? '').slice(0, 10)}</td>
+                                    <td className="px-4 py-3 text-[10px] font-bold text-slate-600">{l.warehouse ?? '—'}</td>
+                                    <td className="px-4 py-3 text-right text-[11px] font-black font-mono text-slate-900">{formatQuantity(qty)} <span className="text-[8px] text-slate-400">{s.unit}</span></td>
+                                    <td className="px-4 py-3 text-right text-[10px] font-mono text-slate-600">$ {cost.toFixed(4)}</td>
+                                    <td className="px-4 py-3 text-right text-[10px] font-black font-mono text-blue-700">$ {valCosto.toFixed(2)}</td>
+                                    <td className="px-4 py-3 text-center text-[10px] font-mono">
+                                      <span className={expired ? 'text-red-600 font-black' : 'text-slate-500'}>{expLabel}</span>
+                                    </td>
+                                    <td className="px-4 py-3 text-center">
+                                      <span className={`inline-flex px-2 py-1 rounded-lg text-[9px] font-black ${qty > 0 && !expired ? 'bg-emerald-100 text-emerald-700' : qty === 0 ? 'bg-slate-100 text-slate-400' : 'bg-red-100 text-red-600'}`}>
+                                        {qty === 0 ? 'VACÍO' : expired ? 'VENCIDO' : 'OK'}
+                                      </span>
+                                    </td>
+                                  </tr>
+                                );
+                              })
+                          ).filter(Boolean).length === 0
+                            ? <tr><td colSpan={9} className="py-16 text-center text-slate-300 font-black uppercase text-sm">Sin lotes</td></tr>
+                            : filtered.flatMap((s: any) =>
+                                (s.lotes || [])
+                                  .filter((l: any) => invWarehouse === 'ALL' || l.warehouse === invWarehouse)
+                                  .map((l: any) => {
+                                    const qty = Number(l.qty) || 0;
+                                    const cost = Number(l.costUSD) || 0;
+                                    const valCosto = qty * cost;
+                                    const now = new Date();
+                                    const exp = l.expiry ? new Date(l.expiry) : null;
+                                    const expired = exp && exp < now;
+                                    const expLabel = exp ? exp.toLocaleDateString('es-VE') : '—';
+                                    return (
+                                      <tr key={`${s.code}-${l.id}`} className="hover:bg-slate-50 transition-colors">
+                                        <td className="px-5 py-3 text-[10px] font-black font-mono text-slate-500">{s.code}</td>
+                                        <td className="px-5 py-3 text-[11px] font-black text-slate-900 uppercase max-w-[160px] truncate">{s.description}</td>
+                                        <td className="px-4 py-3 text-[10px] font-mono text-slate-600">{String(l.batch ?? l.id ?? '').slice(0, 10)}</td>
+                                        <td className="px-4 py-3 text-[10px] font-bold text-slate-600">{l.warehouse ?? '—'}</td>
+                                        <td className="px-4 py-3 text-right text-[11px] font-black font-mono text-slate-900">{formatQuantity(qty)} <span className="text-[8px] text-slate-400">{s.unit}</span></td>
+                                        <td className="px-4 py-3 text-right text-[10px] font-mono text-slate-600">$ {cost.toFixed(4)}</td>
+                                        <td className="px-4 py-3 text-right text-[10px] font-black font-mono text-blue-700">$ {valCosto.toFixed(2)}</td>
+                                        <td className="px-4 py-3 text-center text-[10px] font-mono">
+                                          <span className={expired ? 'text-red-600 font-black' : 'text-slate-500'}>{expLabel}</span>
+                                        </td>
+                                        <td className="px-4 py-3 text-center">
+                                          <span className={`inline-flex px-2 py-1 rounded-lg text-[9px] font-black ${qty > 0 && !expired ? 'bg-emerald-100 text-emerald-700' : qty === 0 ? 'bg-slate-100 text-slate-400' : 'bg-red-100 text-red-600'}`}>
+                                            {qty === 0 ? 'VACÍO' : expired ? 'VENCIDO' : 'OK'}
+                                          </span>
+                                        </td>
+                                      </tr>
+                                    );
+                                  })
+                              )
+                          }
+                        </tbody>
+                      </table>
+                    )}
+                  </div>
+                </div>
+              );
+            })()}
           </div>
         </div>
       )}

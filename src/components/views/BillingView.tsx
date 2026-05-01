@@ -1674,6 +1674,8 @@ export function BillingView({ scaleWeight, exchangeRateBCV = 36.50, exchangeRate
             amountUSD: p.amountUSD,
             amountVES: p.amountVES,
             bank: p.bank,
+            bankAccountId: p.bankAccountId,
+            bankAccountLabel: p.bankAccountLabel,
             reference: p.reference,
             note: p.note,
             currency: p.currency || 'USD',

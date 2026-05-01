@@ -1,0 +1,19 @@
+[
+  {
+    "origin": [
+      "https://costalmanager.web.app",
+      "https://costalmanager.firebaseapp.com",
+      "http://localhost:2000",
+      "http://localhost:5173"
+    ],
+    "method": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    "maxAgeSeconds": 3600,
+    "responseHeader": [
+      "Content-Type",
+      "Authorization",
+      "Content-Length",
+      "User-Agent",
+      "x-goog-resumable"
+    ]
+  }
+]

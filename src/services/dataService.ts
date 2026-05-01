@@ -1134,6 +1134,9 @@ export interface ARPaymentRecord {
   amountVES: number;
   rateUsed: number;
   bank?: string;
+  bankId?: string;
+  accountId?: string;
+  accountLabel?: string;
   reference?: string;
   note: string;
   supports: ARPaymentSupport[];
@@ -1826,6 +1829,21 @@ export class DataService {
     const normalized = String(method ?? '').trim().toLowerCase();
     if (normalized === 'cash_usd' || normalized === 'zelle' || normalized === 'digital_usd') return 'USD';
     return 'VES';
+  }
+
+  private normalizeMoneyMethod(method: string): string {
+    const normalized = String(method ?? '').trim().toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '');
+    if (normalized === 'transferencia' || normalized === 'transferencia bs') return 'transfer';
+    if (normalized === 'pago movil' || normalized === 'pago móvil') return 'mobile';
+    if (normalized === 'efectivo usd') return 'cash_usd';
+    if (normalized === 'efectivo bs' || normalized === 'efectivo ves') return 'cash_ves';
+    if (normalized === 'debito') return 'debit';
+    if (normalized === 'credito') return 'credit';
+    if (normalized === 'otros' || normalized === 'otro') return 'others';
+    if (normalized === 'transferencia / digital usd') return 'digital_usd';
+    return normalized || String(method ?? '').trim();
   }
 
   // Resuelve el banco de "Efectivo" para un método en efectivo.
@@ -9810,6 +9828,26 @@ export class DataService {
       ...(meta ? { meta } : {})
     }, { merge: true });
 
+    const { error: arSupabaseError } = await supabase.from('ar_entries').upsert({
+      id: entry.id,
+      timestamp: entry.timestamp.toISOString(),
+      customer_name: entry.customerName,
+      customer_id: entry.customerId,
+      description: entry.description,
+      amount_usd: entry.amountUSD,
+      balance_usd: entry.balanceUSD,
+      due_date: entry.dueDate.toISOString(),
+      status: entry.status,
+      sale_correlativo: entry.saleCorrelativo,
+      late_fee_usd: 0,
+      meta: meta ?? {},
+      operation_type: 'AR_ENTRY'
+    }, { onConflict: 'id' });
+
+    if (arSupabaseError) {
+      throw new Error(`No se pudo sincronizar CxC con Supabase: ${String(arSupabaseError.message ?? arSupabaseError)}`);
+    }
+
     // Always update local array and notify - the realtime listener will sync from Firestore
     const existingIndex = this.arEntries.findIndex(e => e.id === entry.id);
     if (existingIndex >= 0) {
@@ -9980,6 +10018,9 @@ export class DataService {
       amountVES?: number;
       rateUsed?: number;
       bank?: string;
+      bankId?: string;
+      bankAccountId?: string;
+      bankAccountLabel?: string;
       reference?: string;
     }
   ): Promise<CompanyLoan> {
@@ -10061,6 +10102,9 @@ export class DataService {
       amountVES?: number;
       rateUsed?: number;
       bank?: string;
+      bankId?: string;
+      bankAccountId?: string;
+      bankAccountLabel?: string;
       reference?: string;
     }
   ) {
@@ -10083,13 +10127,36 @@ export class DataService {
       } as any;
     }
 
+    const method = this.normalizeMoneyMethod(String(payload?.method ?? 'AR_PAYMENT'));
     const rateUsed = Number(payload?.rateUsed ?? 0) || 0;
-    const currency = (payload?.currency ?? 'USD') as 'USD' | 'VES';
+    const currency = (payload?.currency ?? this.resolvePaymentCurrency(method)) as 'USD' | 'VES';
     const amountVES = Number(payload?.amountVES ?? 0) || 0;
     const amountUSD = Number(paymentUSD) || 0;
-    const method = String(payload?.method ?? 'AR_PAYMENT');
     if (!(amountUSD > 0)) {
       throw new Error('Monto de cobro inválido para CxC.');
+    }
+    const bankNameInput = String(payload?.bank ?? '').trim();
+    const isCashMethod = method === 'cash_usd' || method === 'cash_ves';
+    const skipBankLedger =
+      (!bankNameInput && !isCashMethod) ||
+      bankNameInput.toUpperCase() === 'OTRO' ||
+      bankNameInput === 'Ant. Cliente' ||
+      method === 'others';
+    let bankResolution: { bankId: string; bankName: string; accountId: string; accountLabel: string } | null = null;
+    if (!skipBankLedger) {
+      if (isCashMethod) {
+        bankResolution = this.resolveCashBank(method as 'cash_usd' | 'cash_ves');
+      } else {
+        bankResolution = this.resolveBankAccountForMethod({
+          bankId: String(payload?.bankId ?? '').trim(),
+          bankName: bankNameInput,
+          paymentMethod: method,
+          accountId: String(payload?.bankAccountId ?? '').trim()
+        });
+      }
+      if (!bankResolution) {
+        throw new Error('Debe seleccionar método, moneda, banco y cuenta válidos para afectar bancos.');
+      }
     }
 
     const supports: ARPaymentSupport[] = [];
@@ -10107,7 +10174,10 @@ export class DataService {
       amountUSD,
       amountVES,
       rateUsed,
-      bank: payload?.bank ?? '',
+      bank: bankResolution?.bankName ?? payload?.bank ?? '',
+      bankId: bankResolution?.bankId ?? String(payload?.bankId ?? '').trim(),
+      accountId: bankResolution?.accountId ?? String(payload?.bankAccountId ?? '').trim(),
+      accountLabel: bankResolution?.accountLabel ?? String(payload?.bankAccountLabel ?? '').trim(),
       reference: payload?.reference ?? '',
       note: payload?.note ?? '',
       supports: [],
@@ -10158,7 +10228,9 @@ export class DataService {
           customerId: entry.customerId,
           customerName: entry.customerName,
           method,
-          bank: String(payload?.bank ?? '')
+          bank: bankResolution?.bankName ?? String(payload?.bank ?? ''),
+          bankId: bankResolution?.bankId ?? '',
+          accountId: bankResolution?.accountId ?? ''
         }
       });
     } catch (ledgerError: any) {
@@ -10173,15 +10245,12 @@ export class DataService {
 
     // Alimentar módulo Bancos (solo append): registrar transacción por banco+método.
     try {
-      const bankName = String(payload?.bank ?? '').trim();
-      const skipBankLedger =
-        !bankName ||
-        bankName.toUpperCase() === 'OTRO' ||
-        bankName === 'Ant. Cliente';
-      if (!skipBankLedger) {
+      if (bankResolution) {
         const bankTx: BankTransactionRecord = {
-          bankId: this.resolveBankIdByName(bankName),
-          bankName,
+          bankId: bankResolution.bankId,
+          bankName: bankResolution.bankName,
+          accountId: bankResolution.accountId,
+          accountLabel: bankResolution.accountLabel,
           method,
           source: 'AR_PAYMENT',
           sourceId: paymentRef.id,
@@ -10338,6 +10407,9 @@ export class DataService {
       amountUSD: number;
       amountVES?: number;
       bank?: string;
+      bankId?: string;
+      bankAccountId?: string;
+      bankAccountLabel?: string;
       reference?: string;
       note?: string;
       currency?: 'USD' | 'VES';
@@ -10397,6 +10469,9 @@ export class DataService {
         amountVES,
         rateUsed: payment.rateUsed,
         bank: payment.bank,
+        bankId: payment.bankId,
+        bankAccountId: payment.bankAccountId,
+        bankAccountLabel: payment.bankAccountLabel,
         reference: payment.reference,
         note: String(payment.note ?? '').trim() || `Cobro en Caja${sessionId ? ` (Sesión: ${sessionId.slice(0, 8)})` : ''}`
       });

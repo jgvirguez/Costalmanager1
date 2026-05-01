@@ -1,0 +1,36 @@
+1. Auditoría de Integridad y Coherencia (Base de Datos)
+Este es el primer paso. Si la base de datos tiene fallas de diseño, el Libro Mayor Analítico nunca cuadrará.
+
+Prompt: "Actúa como un Arquitecto de Datos Senior. Analiza el esquema de mi sistema administrativo [Pega aquí tu esquema SQL/JSON]. Busca incoherencias de normalización, falta de llaves foráneas que podrían causar datos huérfanos y errores en los tipos de datos (ej. usar Float para moneda en lugar de Numeric/Int). Evalúa si la estructura actual permite una trazabilidad completa para auditoría (campos de auditoría, logs de cambios y estados de documentos)."
+
+2. Auditoría de Seguridad (Vulnerabilidades)
+Como usas Firebase y Supabase, tu mayor riesgo no es el SQL Injection clásico, sino las Políticas de Acceso.
+
+Prompt: "Analiza mis Supabase RLS (Row Level Security) y mis Firebase Security Rules [Pega tus reglas]. Identifica vulnerabilidades donde un usuario autenticado podría leer o modificar datos de otro departamento o empresa (Multi-tenancy leak). Revisa si existen permisos de 'escritura' excesivamente abiertos y sugiéreme el principio de 'menor privilegio' para cada colección/tabla."
+
+3. Rendimiento y Escalabilidad (Performance)
+Ideal para detectar por qué el sistema se pone lento al generar reportes contables pesados.
+
+Prompt: "Revisa el siguiente código de mis funciones de servidor / queries de cliente [Pega el código de tus funciones más pesadas]. Identifica problemas de rendimiento como:
+
+N+1 queries (consultas dentro de bucles).
+
+Falta de índices en campos de filtrado frecuente (fechas, IDs).
+
+Sobrecarga de datos innecesaria (fetch de todas las columnas en lugar de solo las necesarias).
+Propón una estrategia de caching o tablas de balance/saldos para optimizar el Libro Mayor Analítico."
+
+4. Coherencia de Lógica de Negocio (Funcionamiento Correcto)
+Aquí es donde validas que el sistema "piense" como un contador.
+
+Prompt: "Soy desarrollador y necesito validar la lógica contable de mi sistema. El flujo es el siguiente: [Describe un flujo, ej: Registro de factura -> Asiento automático -> Mayorización].
+Considerando que es un sistema administrativo, ¿qué escenarios de error estoy olvidando? (ej. anulación de documentos en periodos cerrados, edición de asientos ya mayorizados, desbalance entre Debe y Haber por redondeos). Genera una lista de casos de prueba (Edge Cases) que mi código debe manejar para asegurar que el sistema sea infalible."
+
+Estrategia de Ejecución: "El Método del Contexto Dividido"
+Dado que tu sistema es grande, te sugiero seguir este orden para no perder precisión:
+
+Día 1: El Esqueleto. Pasa el esquema de base de datos y pide mejoras en coherencia y rendimiento de queries.
+
+Día 2: Los Músculos. Pasa las funciones que procesan dinero (Nómina, Facturación, Mayorización) y pide validación de lógica y errores.
+
+Día 3: La Piel. Pasa tus reglas de seguridad y pide búsqueda de vulnerabilidades.

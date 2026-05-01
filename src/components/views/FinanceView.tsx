@@ -575,8 +575,11 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
   const [showARCollectModal, setShowARCollectModal] = useState(false);
   const [arCollectTarget, setArCollectTarget] = useState<any>(null);
   const [arCollectAmount, setArCollectAmount] = useState('');
-  const [arCollectMethod, setArCollectMethod] = useState('Transferencia');
+  const [arCollectMethod, setArCollectMethod] = useState('transfer');
   const [arCollectBank, setArCollectBank] = useState('');
+  const [arCollectBankId, setArCollectBankId] = useState('');
+  const [arCollectAccountId, setArCollectAccountId] = useState('');
+  const [arCollectRate, setArCollectRate] = useState(String(exchangeRate));
   const [arCollectRef, setArCollectRef] = useState('');
   const [arCollectNote, setArCollectNote] = useState('');
   const [arCollectSubmitting, setArCollectSubmitting] = useState(false);
@@ -949,6 +952,14 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
     const compatible = accounts.filter((account: any) => String(account?.currency ?? '').trim().toUpperCase() === currency);
     return compatible.length > 0 ? compatible : accounts;
   };
+
+  const getARCollectBankOptions = (method: string) => {
+    const value = String(method ?? '').trim().toLowerCase();
+    if (value === 'cash_usd' || value === 'cash_ves' || value === 'others') return [];
+    return getAPPaymentBankOptions(value);
+  };
+
+  const getARCollectAccountOptions = (bankId: string, method: string) => getAPPaymentAccountOptions(bankId, method);
 
   const buildAPPaymentLine = (amountUSD = '', method = 'transfer') => {
     const bankOptions = getAPPaymentBankOptions(method);
@@ -1913,8 +1924,14 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
   const handleARPayment = (ar: any) => {
     setArCollectTarget(ar);
     setArCollectAmount('');
-    setArCollectMethod('Transferencia');
+    setArCollectMethod('transfer');
     setArCollectBank('');
+    const bankOptions = getARCollectBankOptions('transfer');
+    const bankId = String(bankOptions[0]?.id ?? '');
+    const accountOptions = getARCollectAccountOptions(bankId, 'transfer');
+    setArCollectBankId(bankId);
+    setArCollectAccountId(String(accountOptions[0]?.id ?? ''));
+    setArCollectRate(String(exchangeRate));
     setArCollectRef('');
     setArCollectNote('');
     setArCollectError('');
@@ -1984,7 +2001,7 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
     setArCollectSubmitting(true);
     setArCollectError('');
     try {
-      if (arCollectMethod === 'Otros') {
+      if (arCollectMethod === 'others') {
         const cid = String(arCollectTarget.customerId ?? '').trim();
         if (!cid) {
           setArCollectError('El registro CxC no tiene cliente asociado.');
@@ -2043,27 +2060,43 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
         void dataService.getClientAdvanceBalance(cid).then((b) => setArCollectAdvanceBalance(Number(b) || 0));
       } else {
         const isLoan = isCompanyLoanAREntry(arCollectTarget);
+        const currency = getAPPaymentCurrency(arCollectMethod);
+        const selectedBank = activeBanks.find((item: any) => String(item?.id ?? '') === String(arCollectBankId ?? '')) ?? null;
+        const selectedAccount = getARCollectAccountOptions(arCollectBankId, arCollectMethod)
+          .find((item: any) => String(item?.id ?? '') === String(arCollectAccountId ?? '')) ?? null;
+        const rateUsed = currency === 'VES' ? (Number(String(arCollectRate || '').replace(',', '.')) || 0) : 0;
+        if (currency === 'VES' && rateUsed <= 0) {
+          setArCollectError('Ingrese la tasa usada para recibir este abono en Bs.');
+          return;
+        }
+        const amountVES = currency === 'VES' ? Math.round(amt * rateUsed * 100) / 100 : 0;
         if (isLoan) {
           const loanId = String(arCollectTarget?.meta?.loanId ?? '').trim();
           if (!loanId) throw new Error('El préstamo no tiene vínculo de auditoría (loanId).');
           await dataService.registerCompanyLoanPayment(loanId, amt, {
             method: arCollectMethod,
-            bank: arCollectBank || undefined,
+            bank: selectedBank?.name || arCollectBank || undefined,
+            bankId: selectedBank?.id ? String(selectedBank.id) : undefined,
+            bankAccountId: selectedAccount?.id ? String(selectedAccount.id) : undefined,
+            bankAccountLabel: selectedAccount?.label ? String(selectedAccount.label) : undefined,
             reference: arCollectRef || undefined,
             note: arCollectNote || undefined,
-            currency: 'USD',
-            amountVES: 0,
-            rateUsed: 0
+            currency,
+            amountVES,
+            rateUsed
           });
         } else {
           await dataService.registerARPaymentWithSupport(arCollectTarget.id, amt, {
             method: arCollectMethod,
-            bank: arCollectBank || undefined,
+            bank: selectedBank?.name || arCollectBank || undefined,
+            bankId: selectedBank?.id ? String(selectedBank.id) : undefined,
+            bankAccountId: selectedAccount?.id ? String(selectedAccount.id) : undefined,
+            bankAccountLabel: selectedAccount?.label ? String(selectedAccount.label) : undefined,
             reference: arCollectRef || undefined,
             note: arCollectNote || undefined,
-            currency: 'USD',
-            amountVES: 0,
-            rateUsed: 0
+            currency,
+            amountVES,
+            rateUsed
           });
         }
         const newBalance = Math.max(0, balance - amt);
@@ -2073,8 +2106,11 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
           customerId: arCollectTarget.customerId || '',
           saleCorrelativo: arCollectTarget.saleCorrelativo,
           amountUSD: amt,
+          amountVES,
+          rateUsed,
+          currency,
           method: arCollectMethod,
-          bank: arCollectBank || undefined,
+          bank: selectedBank?.name || arCollectBank || undefined,
           reference: arCollectRef || undefined,
           note: arCollectNote || undefined,
           operatorName: dataService.getCurrentUser()?.name || 'Sistema',
@@ -7237,7 +7273,14 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
                     onChange={async (e) => {
                       const v = e.target.value;
                       setArCollectMethod(v);
-                      if (v === 'Otros' && arCollectTarget?.customerId) {
+                      const bankOptions = getARCollectBankOptions(v);
+                      const nextBankId = String(bankOptions[0]?.id ?? '');
+                      const accountOptions = getARCollectAccountOptions(nextBankId, v);
+                      setArCollectBankId(nextBankId);
+                      setArCollectAccountId(String(accountOptions[0]?.id ?? ''));
+                      setArCollectBank('');
+                      if (getAPPaymentCurrency(v) === 'VES') setArCollectRate(String(exchangeRate));
+                      if (v === 'others' && arCollectTarget?.customerId) {
                         setArCollectAdvanceBalance(null);
                         try {
                           const b = await dataService.getClientAdvanceBalance(String(arCollectTarget.customerId));
@@ -7249,13 +7292,39 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
                     }}
                     className="w-full bg-slate-50 border-2 border-slate-200 focus:border-emerald-400 rounded-xl px-3 py-2.5 text-[11px] font-black outline-none"
                   >
-                    {['Transferencia','Pago Móvil','Efectivo USD','Efectivo Bs','Zelle','Cheque','Débito','Otros'].map(m => (
-                      <option key={m} value={m}>{m}</option>
+                    {paymentMethodOptions.filter(m => m.id !== 'credit').concat([{ id: 'others', label: 'Otros' }]).map(m => (
+                      <option key={m.id} value={m.id}>{m.label}</option>
                     ))}
                   </select>
                 </div>
               </div>
-              {arCollectMethod === 'Otros' && (
+              {getAPPaymentCurrency(arCollectMethod) === 'VES' && arCollectMethod !== 'others' && (
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="text-[8px] font-black uppercase tracking-widest text-slate-400 block mb-1">Tasa recibida</label>
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.0001"
+                      value={arCollectRate}
+                      onChange={e => setArCollectRate(e.target.value)}
+                      placeholder="Ej: 48.712"
+                      className="w-full bg-slate-50 border-2 border-slate-200 focus:border-emerald-400 rounded-xl px-3 py-2 text-[11px] font-black outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[8px] font-black uppercase tracking-widest text-slate-400 block mb-1">Bs al banco</label>
+                    <div className="w-full bg-emerald-50 border-2 border-emerald-100 rounded-xl px-3 py-2 text-[11px] font-black text-emerald-700">
+                      Bs {(() => {
+                        const amount = Number(String(arCollectAmount || '').replace(',', '.')) || 0;
+                        const rate = Number(String(arCollectRate || '').replace(',', '.')) || 0;
+                        return (Math.round(amount * rate * 100) / 100).toFixed(2);
+                      })()}
+                    </div>
+                  </div>
+                </div>
+              )}
+              {arCollectMethod === 'others' && (
                 <div className="rounded-xl border border-amber-200 bg-amber-50/90 px-3 py-2.5 text-[10px] text-amber-950 space-y-1">
                   <p className="font-black uppercase tracking-widest text-[9px] text-amber-800">Otros — cruce con anticipo del cliente</p>
                   <p className="font-bold leading-snug">
@@ -7269,15 +7338,57 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
               )}
               <div>
                 <label className="text-[8px] font-black uppercase tracking-widest text-slate-400 block mb-1">
-                  Banco / Entidad {arCollectMethod === 'Otros' ? <span className="text-slate-400 font-bold normal-case">(opcional)</span> : null}
+                  Banco / Entidad {arCollectMethod === 'others' ? <span className="text-slate-400 font-bold normal-case">(opcional)</span> : null}
                 </label>
-                <input
-                  type="text" value={arCollectBank} onChange={e => setArCollectBank(e.target.value)}
-                  placeholder={arCollectMethod === 'Otros' ? 'No requiere banco al usar anticipo' : 'Ej: Banesco, Mercantil...'}
-                  disabled={arCollectMethod === 'Otros'}
-                  className="w-full bg-slate-50 border-2 border-slate-200 focus:border-emerald-400 rounded-xl px-3 py-2 text-[11px] font-black outline-none disabled:opacity-50 disabled:cursor-not-allowed"
-                />
+                {(() => {
+                  const bankOptions = getARCollectBankOptions(arCollectMethod);
+                  const isCash = arCollectMethod === 'cash_usd' || arCollectMethod === 'cash_ves';
+                  if (arCollectMethod === 'others' || isCash) {
+                    return (
+                      <input
+                        type="text" value={arCollectBank} onChange={e => setArCollectBank(e.target.value)}
+                        placeholder={arCollectMethod === 'others' ? 'No requiere banco al usar anticipo' : 'Caja/Efectivo automático'}
+                        disabled={arCollectMethod === 'others' || isCash}
+                        className="w-full bg-slate-50 border-2 border-slate-200 focus:border-emerald-400 rounded-xl px-3 py-2 text-[11px] font-black outline-none disabled:opacity-50 disabled:cursor-not-allowed"
+                      />
+                    );
+                  }
+                  return (
+                    <select
+                      value={arCollectBankId}
+                      onChange={(e) => {
+                        const nextBankId = e.target.value;
+                        setArCollectBankId(nextBankId);
+                        const accountOptions = getARCollectAccountOptions(nextBankId, arCollectMethod);
+                        setArCollectAccountId(String(accountOptions[0]?.id ?? ''));
+                      }}
+                      className="w-full bg-slate-50 border-2 border-slate-200 focus:border-emerald-400 rounded-xl px-3 py-2 text-[11px] font-black outline-none"
+                    >
+                      <option value="">Seleccione banco</option>
+                      {bankOptions.map((bank: any) => (
+                        <option key={String(bank?.id ?? '')} value={String(bank?.id ?? '')}>{String(bank?.name ?? '')}</option>
+                      ))}
+                    </select>
+                  );
+                })()}
               </div>
+              {arCollectMethod !== 'others' && arCollectMethod !== 'cash_usd' && arCollectMethod !== 'cash_ves' && (
+                <div>
+                  <label className="text-[8px] font-black uppercase tracking-widest text-slate-400 block mb-1">Cuenta</label>
+                  <select
+                    value={arCollectAccountId}
+                    onChange={(e) => setArCollectAccountId(e.target.value)}
+                    className="w-full bg-slate-50 border-2 border-slate-200 focus:border-emerald-400 rounded-xl px-3 py-2 text-[11px] font-black outline-none"
+                  >
+                    <option value="">Seleccione cuenta</option>
+                    {getARCollectAccountOptions(arCollectBankId, arCollectMethod).map((account: any) => (
+                      <option key={String(account?.id ?? '')} value={String(account?.id ?? '')}>
+                        {String(account?.label ?? account?.accountNumber ?? account?.id ?? '')} · {String(account?.currency ?? '')}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
               <div>
                 <label className="text-[8px] font-black uppercase tracking-widest text-slate-400 block mb-1">Referencia</label>
                 <input
@@ -7312,7 +7423,7 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
                   disabled={
                     arCollectSubmitting ||
                     !arCollectAmount ||
-                    (arCollectMethod === 'Otros' && (arCollectAdvanceBalance ?? 0) < 0.01)
+                    (arCollectMethod === 'others' && (arCollectAdvanceBalance ?? 0) < 0.01)
                   }
                   className="flex-1 py-2.5 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-2xl text-[10px] font-black uppercase tracking-widest transition-all flex items-center justify-center gap-2"
                 >
