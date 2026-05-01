@@ -1364,6 +1364,8 @@ export class DataService {
   private bankTransactionsUnsubscribe: (() => void) | null = null;
   private bankTransactionsCache: Array<BankTransactionRecord & { id: string }> = [];
   private usersRealtimeChannel: any = null;
+  /** Evita doble arranque del listener de usuarios antes de que exista request.auth en Firestore. */
+  private usersRtSyncInFlight = false;
   private banks: BankEntity[] = [];
   private banksUnsubscribe: (() => void) | null = null;
   private cashBoxSessions: CashBoxSession[] = [];
@@ -1399,7 +1401,8 @@ export class DataService {
   private ledgerService = new LedgerService();
 
   constructor() {
-    this.init();
+    // init() no se llama aquí: sin request.auth las reglas Firestore lo rechazan.
+    // Tras Firebase login, App.tsx invoca reloadAfterAuth() → init(true).
   }
 
   private normalizePermissions(permissions: Array<string | PermissionKey> | undefined, role?: UserRole): PermissionKey[] {
@@ -4477,9 +4480,15 @@ export class DataService {
       return;
     }
     
-    // Si ya hay una inicialización en progreso, esperarla
+    // Si ya hay una inicialización en progreso: sin force, solo compartir la misma promesa.
+    // Con force (p. ej. tras login), esperar a que termine y re-ejecutar _doInit: el constructor
+    // dispara init() antes de que Firebase restaure request.auth; si reloadAfterAuth() llamaba
+    // init(true) mientras el primer _doInit seguía activo, se devolvía esa promesa y nunca se
+    // volvía a cargar Firestore con sesión válida → permission-denied en AR/usuarios/préstamos.
     if (this.initPromise) {
-      return this.initPromise;
+      if (!force) return this.initPromise;
+      await this.initPromise;
+      if (this.initPromise) return this.initPromise;
     }
 
     // Si había un trailing reload pendiente, cancelarlo (vamos a recargar ahora)
@@ -4498,6 +4507,12 @@ export class DataService {
   }
 
   private async _doInit(): Promise<void> {
+    try {
+      await auth.authStateReady();
+    } catch { /* noop */ }
+    if (!auth.currentUser) {
+      return;
+    }
     this.ensureOperationalRealtimeSync();
     let purchaseEntriesByBatchId = new Map<string, any>();
     try {
@@ -5314,15 +5329,32 @@ export class DataService {
       try { this.usersRealtimeChannel(); } catch { /* noop */ }
       this.usersRealtimeChannel = null;
     }
+    this.usersRtSyncInFlight = false;
   }
 
   reloadAfterAuth() {
-    this.resetRealtimeSubscriptions();
-    void this.init(true);
+    void (async () => {
+      try {
+        await auth.authStateReady();
+      } catch { /* noop */ }
+      if (!auth.currentUser) return;
+      this.resetRealtimeSubscriptions();
+      await this.init(true);
+    })();
   }
 
   ensureUsersRealtimeSync() {
-    if (this.usersRealtimeChannel) return;
+    if (this.usersRealtimeChannel || this.usersRtSyncInFlight) return;
+    this.usersRtSyncInFlight = true;
+    void this.ensureUsersRealtimeSyncImpl();
+  }
+
+  private async ensureUsersRealtimeSyncImpl(): Promise<void> {
+    try {
+      try {
+        await auth.authStateReady();
+      } catch { /* noop */ }
+      if (!auth.currentUser || this.usersRealtimeChannel) return;
     const mapUser = (id: string, u: any): User => {
       let parsedPermissions: Array<string | PermissionKey> | undefined;
       if (Array.isArray(u.permissions)) {
@@ -5379,6 +5411,9 @@ export class DataService {
         }
       }
     );
+    } finally {
+      this.usersRtSyncInFlight = false;
+    }
   }
 
   getBanks() { this.ensureBanksSubscription(); return this.banks; }
@@ -9761,6 +9796,7 @@ export class DataService {
   }
 
   async applyOverduePenalties(): Promise<void> {
+    if (!auth.currentUser) return;
     const now = new Date();
     const LATE_FEE_RATE = 0.01; // 1% sobre el monto original de la factura
     const toUpdate = this.arEntries.filter(e =>

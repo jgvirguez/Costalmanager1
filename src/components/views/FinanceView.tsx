@@ -67,10 +67,7 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
   const financeInternalRate = Number(internalRate) > 0 ? Number(internalRate) : (Number(exchangeRate) > 0 ? Number(exchangeRate) : 1);
   const canEditBanks = hasPermission('FINANCE_VIEW') || hasPermission('ALL');
   
-  const [activeSubTab, setActiveSubTab] = useState<'indicators' | 'invoices' | 'ar' | 'ap' | 'ledger' | 'expenses' | 'banks' | 'credit' | 'calendar' | 'advances' | 'approvals'>('indicators');
-  const [poAlerts, setPoAlerts] = useState<Array<{ id: string; purchaseOrderId: string; purchaseOrderCorrelativo: string; supplier: string; createdAt: string }>>([]);
-  const [loadingPoAlerts, setLoadingPoAlerts] = useState(false);
-  const [expandedApprovalOcId, setExpandedApprovalOcId] = useState<string | null>(null);
+  const [activeSubTab, setActiveSubTab] = useState<'indicators' | 'invoices' | 'ar' | 'ap' | 'ledger' | 'expenses' | 'banks' | 'credit' | 'calendar' | 'advances'>('indicators');
   const [invoiceHistoryLoading, setInvoiceHistoryLoading] = useState(false);
   const [invoiceHistorySearch, setInvoiceHistorySearch] = useState('');
   /** Filtros estructurados: Historial Facturas (Finanzas) */
@@ -162,11 +159,6 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
   const clients = clientService.getClients();
   const users = dataService.getUsers();
   const currentUser = dataService.getCurrentUser();
-  const purchaseOrders = dataService.getPurchaseOrders();
-  const approvablePurchaseOrders = useMemo(
-    () => purchaseOrders.filter((o) => o.status === 'SUBMITTED'),
-    [purchaseOrders]
-  );
 
   const fmt = (value: any, decimals: number = 2) =>
     (Number(value ?? 0) || 0).toLocaleString('es-VE', {
@@ -448,21 +440,6 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
     if (activeSubTab !== 'advances' || advancesSubTab !== 'client') return;
     setAdvancesData(dataService.getClientAdvancesSnapshot(advShowApplied));
   }, [activeSubTab, advancesSubTab, advShowApplied, tick]);
-
-  const loadPOAlerts = useCallback(async () => {
-    setLoadingPoAlerts(true);
-    try {
-      const list = await dataService.getPurchaseOrderApprovalAlerts(true);
-      setPoAlerts(Array.isArray(list) ? (list as any) : []);
-    } finally {
-      setLoadingPoAlerts(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (activeSubTab !== 'approvals') return;
-    void loadPOAlerts();
-  }, [activeSubTab, tick, currentUser?.id, loadPOAlerts]);
 
   useEffect(() => {
     if (activeSubTab !== 'invoices') return;
@@ -2170,7 +2147,6 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
            {[
              { id: 'indicators', label: 'Dashboard', icon: Wallet },
              { id: 'invoices', label: 'Historial Facturas', icon: ReceiptText },
-             { id: 'approvals', label: 'Aprobaciones OC', icon: UserCheck },
              { id: 'credit', label: 'Crédito', icon: Scale },
              { id: 'expenses', label: 'Gastos', icon: AlertCircle },
              { id: 'ar', label: 'Cuentas x Cobrar', icon: ArrowUpRight },
@@ -2208,7 +2184,7 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
                 icon={TrendingUp}
               />
               <FinanceCard 
-                title="Cartera por Cobrar (AR)" 
+                title="Cuentas por cobrar" 
                 value={fmt(totalAR)} 
                 unit="USD" 
                 trend={`${arEntries.filter(e => e.status !== 'PAID').length} Pendientes`} 
@@ -2216,7 +2192,7 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
                 icon={ArrowUpRight}
               />
               <FinanceCard 
-                title="Pasivos Circulantes (AP)" 
+                title="Cuentas por pagar" 
                 value={fmt(totalAP)} 
                 unit="USD" 
                 trend={`${apEntries.filter(e => e.status !== 'PAID').length} Proveedores`} 
@@ -2780,177 +2756,6 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
         </div>
       )}
 
-      {activeSubTab === 'approvals' && (
-        <div className="space-y-6 animate-in slide-in-from-right-4 duration-500">
-          <div className="bg-white rounded-[2.5rem] border border-slate-200 overflow-hidden shadow-sm">
-            <div className="p-8 border-b border-slate-100 bg-[#f8fafc]/50">
-              <div className="flex flex-wrap justify-between items-center gap-3">
-                <h3 className="font-headline font-black text-lg uppercase tracking-tight">Bandeja de Aprobación de Órdenes de Compra</h3>
-                <div className="flex items-center gap-2">
-                  <span className="text-[10px] font-black text-amber-700 bg-amber-50 px-4 py-1.5 rounded-full uppercase">
-                    Pendientes: {approvablePurchaseOrders.length}
-                  </span>
-                  <span className="text-[10px] font-black text-blue-700 bg-blue-50 px-4 py-1.5 rounded-full uppercase">
-                    Alertas: {poAlerts.length}
-                  </span>
-                  <button
-                    onClick={() => void loadPOAlerts()}
-                    className="px-3 py-1.5 bg-slate-900 text-white rounded-xl text-[9px] font-black uppercase hover:bg-slate-700 transition-all"
-                  >
-                    Recargar
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            <div className="p-6 space-y-4">
-              {loadingPoAlerts ? (
-                <div className="p-6 text-center text-[11px] font-black uppercase text-slate-400">Cargando alertas...</div>
-              ) : poAlerts.length === 0 ? (
-                <div className="p-6 text-center text-[11px] font-black uppercase text-slate-400">Sin alertas pendientes.</div>
-              ) : (
-                <div className="space-y-2">
-                  {poAlerts.map((a) => (
-                    <div key={a.id} className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-100 bg-amber-50/60 px-4 py-3">
-                      <div>
-                        <div className="text-[10px] font-black uppercase text-slate-900">
-                          {a.purchaseOrderCorrelativo || a.purchaseOrderId} · {a.supplier}
-                        </div>
-                        <div className="text-[9px] font-bold text-slate-500">
-                          Enviada: {a.createdAt ? new Date(a.createdAt).toLocaleString('es-VE') : '-'}
-                        </div>
-                      </div>
-                      <button
-                        onClick={() => void dataService.markPurchaseOrderApprovalAlertRead(a.id).then(() => loadPOAlerts())}
-                        className="px-3 py-1.5 bg-white border border-slate-200 rounded-lg text-[9px] font-black uppercase hover:bg-slate-50"
-                      >
-                        Marcar leída
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              <div className="rounded-2xl border border-slate-200 overflow-x-auto">
-                <table className="w-full text-left">
-                  <thead>
-                    <tr className="bg-slate-50/50 text-[8px] font-black uppercase text-slate-400 border-b border-slate-100">
-                      <th className="px-6 py-4">OC</th>
-                      <th className="px-6 py-4">Proveedor</th>
-                      <th className="px-6 py-4">Líneas</th>
-                      <th className="px-6 py-4">Enviada</th>
-                      <th className="px-6 py-4 text-right">Acciones</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {approvablePurchaseOrders.length === 0 && (
-                      <tr>
-                        <td colSpan={5} className="px-6 py-10 text-center text-[10px] font-black uppercase text-slate-400">
-                          No hay OC pendientes de aprobación.
-                        </td>
-                      </tr>
-                    )}
-                    {approvablePurchaseOrders.map((oc) => {
-                      const isExpanded = expandedApprovalOcId === oc.id;
-                      return (
-                        <React.Fragment key={oc.id}>
-                          <tr className="border-b border-slate-100">
-                            <td className="px-6 py-4 text-[10px] font-black text-slate-900 font-mono">{oc.correlativo}</td>
-                            <td className="px-6 py-4 text-[10px] font-bold text-slate-700 uppercase">{oc.supplier}</td>
-                            <td className="px-6 py-4 text-[10px] font-bold text-slate-500">{oc.lines.length}</td>
-                            <td className="px-6 py-4 text-[10px] font-bold text-slate-500">
-                              {oc.submittedAt ? new Date(oc.submittedAt).toLocaleString('es-VE') : '-'}
-                            </td>
-                            <td className="px-6 py-4 text-right space-x-2">
-                              <button
-                                onClick={() => setExpandedApprovalOcId((prev) => (prev === oc.id ? null : oc.id))}
-                                className="px-3 py-1.5 bg-slate-100 text-slate-700 rounded-lg text-[9px] font-black uppercase hover:bg-slate-200 inline-flex items-center gap-1"
-                              >
-                                {isExpanded ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
-                                Detalle
-                              </button>
-                              <button
-                                disabled={!canEditFinance}
-                                onClick={async () => {
-                                  try {
-                                    await dataService.approvePurchaseOrder(oc.id);
-                                    await dataService.markPurchaseOrderApprovalAlertsReadByOrder(oc.id);
-                                    await loadPOAlerts();
-                                  } catch (e: any) {
-                                    alert(e?.message ?? 'No se pudo aprobar la OC.');
-                                  }
-                                }}
-                                className="px-3 py-1.5 bg-emerald-600 text-white rounded-lg text-[9px] font-black uppercase hover:bg-emerald-700 disabled:opacity-50"
-                              >
-                                Aprobar
-                              </button>
-                            </td>
-                          </tr>
-                          {isExpanded && (
-                            <tr className="border-b border-slate-100 bg-slate-50/40">
-                              <td colSpan={5} className="px-6 py-5">
-                                <div className="grid grid-cols-1 md:grid-cols-4 gap-3 mb-4">
-                                  <div className="rounded-xl border border-slate-200 bg-white px-3 py-2">
-                                    <div className="text-[8px] font-black uppercase tracking-widest text-slate-400">Proveedor</div>
-                                    <div className="text-[10px] font-black text-slate-900 uppercase mt-1">{oc.supplier}</div>
-                                  </div>
-                                  <div className="rounded-xl border border-slate-200 bg-white px-3 py-2">
-                                    <div className="text-[8px] font-black uppercase tracking-widest text-slate-400">Documento</div>
-                                    <div className="text-[10px] font-black text-slate-700 mt-1">{oc.supplierDocument || '-'}</div>
-                                  </div>
-                                  <div className="rounded-xl border border-slate-200 bg-white px-3 py-2">
-                                    <div className="text-[8px] font-black uppercase tracking-widest text-slate-400">Creada por</div>
-                                    <div className="text-[10px] font-black text-slate-700 mt-1">{oc.createdBy || '-'}</div>
-                                  </div>
-                                  <div className="rounded-xl border border-slate-200 bg-white px-3 py-2">
-                                    <div className="text-[8px] font-black uppercase tracking-widest text-slate-400">Nota</div>
-                                    <div className="text-[10px] font-bold text-slate-700 mt-1">{oc.note || 'Sin nota'}</div>
-                                  </div>
-                                </div>
-
-                                <div className="rounded-xl border border-slate-200 overflow-hidden bg-white">
-                                  <table className="w-full text-left">
-                                    <thead>
-                                      <tr className="bg-slate-50 text-[8px] font-black uppercase text-slate-400 border-b border-slate-100">
-                                        <th className="px-3 py-2">SKU</th>
-                                        <th className="px-3 py-2">Producto</th>
-                                        <th className="px-3 py-2">Almacén</th>
-                                        <th className="px-3 py-2 text-right">Cant. OC</th>
-                                        <th className="px-3 py-2 text-right">Recibido</th>
-                                        <th className="px-3 py-2 text-right">Pendiente</th>
-                                      </tr>
-                                    </thead>
-                                    <tbody>
-                                      {oc.lines.map((line) => {
-                                        const pending = Math.max(0, Number(line.qtyOrdered ?? 0) - Number(line.qtyReceived ?? 0));
-                                        return (
-                                          <tr key={line.id} className="border-b border-slate-100 last:border-b-0 text-[10px]">
-                                            <td className="px-3 py-2 font-mono font-black text-slate-900">{line.sku}</td>
-                                            <td className="px-3 py-2 font-bold text-slate-700 uppercase">{line.productDescription}</td>
-                                            <td className="px-3 py-2 font-bold text-slate-500">{line.warehouse}</td>
-                                            <td className="px-3 py-2 text-right font-black text-slate-700">{Number(line.qtyOrdered ?? 0).toFixed(4)}</td>
-                                            <td className="px-3 py-2 text-right font-black text-blue-700">{Number(line.qtyReceived ?? 0).toFixed(4)}</td>
-                                            <td className="px-3 py-2 text-right font-black text-amber-700">{pending.toFixed(4)}</td>
-                                          </tr>
-                                        );
-                                      })}
-                                    </tbody>
-                                  </table>
-                                </div>
-                              </td>
-                            </tr>
-                          )}
-                        </React.Fragment>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
       {activeSubTab === 'credit' && (
         <div className="space-y-6 animate-in fade-in slide-in-from-top-4 duration-500">
           <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
@@ -3268,7 +3073,7 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
            <div className="bg-white rounded-[2.5rem] border border-slate-200 overflow-hidden shadow-sm">
               <div className="p-8 border-b border-slate-100 bg-[#f8fafc]/50">
                 <div className="flex flex-wrap justify-between items-center gap-3 mb-4">
-                  <h3 className="font-headline font-black text-lg uppercase tracking-tight">Cartera de Clientes Especiales (AR)</h3>
+                  <h3 className="font-headline font-black text-lg uppercase tracking-tight">Cuentas por cobrar (clientes especiales)</h3>
                   <div className="flex items-center gap-2 flex-wrap">
                     <span className="text-[10px] font-black text-red-600 bg-red-50 px-4 py-1.5 rounded-full uppercase">Por Cobrar: $ {totalAR.toFixed(2)}</span>
                     {totalAdvances > 0.005 && (
@@ -3754,8 +3559,7 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
               <div className="p-8 border-b border-slate-100 bg-[#f8fafc]/50">
                 <div className="flex flex-wrap justify-between items-center gap-3 mb-4">
                   <div>
-                    <h3 className="font-headline font-black text-lg uppercase tracking-tight">Pasivos Circulantes (AP)</h3>
-                    <div className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mt-1">Registre compras y el stock entrará directo al inventario</div>
+                    <h3 className="font-headline font-black text-lg uppercase tracking-tight">Cuentas por pagar</h3>
                   </div>
                   <div className="flex items-center gap-2 flex-wrap">
                     <span className="text-[10px] font-black text-red-600 bg-red-50 px-4 py-1.5 rounded-full uppercase">Total Deuda: {usd(totalAP)}</span>

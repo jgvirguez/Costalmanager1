@@ -683,12 +683,40 @@ class ReportService {
     doc: any,
     startY: number,
     rows: Array<{ indicador: string; valor1: string; valor2?: string }>,
-    headers?: { valor1?: string; valor2?: string }
+    headers?: { valor1?: string; valor2?: string; omitValor2Column?: boolean }
   ) {
+    const omitValor2 = Boolean(headers?.omitValor2Column);
     const hasValor1 = Boolean(headers && Object.prototype.hasOwnProperty.call(headers, 'valor1'));
     const hasValor2 = Boolean(headers && Object.prototype.hasOwnProperty.call(headers, 'valor2'));
-    const valor1Header = hasValor1 ? String(headers?.valor1 ?? '') : 'VALOR 1';
+    const valor1Header = omitValor2
+      ? (hasValor1 ? String(headers?.valor1 ?? '') : '')
+      : (hasValor1 ? String(headers?.valor1 ?? '') : 'VALOR 1');
     const valor2Header = hasValor2 ? String(headers?.valor2 ?? '') : 'VALOR 2';
+
+    if (omitValor2) {
+      autoTable(doc, {
+        startY,
+        head: [['INDICADOR', valor1Header]],
+        body: rows.map((r) => [r.indicador, r.valor1]),
+        theme: 'grid',
+        tableWidth: 130,
+        margin: { left: 14 },
+        styles: { fontSize: 8, cellPadding: 2 },
+        headStyles: { fillColor: [2, 44, 34], textColor: [255, 255, 255], fontStyle: 'bold' },
+        bodyStyles: { textColor: [0, 0, 0] },
+        columnStyles: {
+          0: { fontStyle: 'bold' },
+          1: { halign: 'right' }
+        },
+        didParseCell: (data: any) => {
+          if (data.section === 'head' && data.column.index === 1) {
+            data.cell.styles.halign = 'right';
+          }
+        }
+      });
+      return;
+    }
+
     autoTable(doc, {
       startY,
       head: [['INDICADOR', valor1Header, valor2Header]],
@@ -1009,11 +1037,16 @@ class ReportService {
     });
 
     const summaryY = this.resolveSummaryStartY(doc, Number((doc as any).lastAutoTable?.finalY ?? 52) + 8, 40);
-    this.renderExecutiveSummaryBox(doc, summaryY, [
-      { indicador: 'MOVIMIENTOS', valor1: String(list.length) },
-      { indicador: 'NETO USD', valor1: this.formatUSD(totalUSD) },
-      { indicador: 'NETO VES', valor1: this.formatVES(totalVES) }
-    ]);
+    this.renderExecutiveSummaryBox(
+      doc,
+      summaryY,
+      [
+        { indicador: 'MOVIMIENTOS', valor1: String(list.length) },
+        { indicador: 'TOTAL USD', valor1: this.formatUSD(totalUSD) },
+        { indicador: 'TOTAL BS', valor1: this.formatVES(totalVES) }
+      ],
+      { valor1: '', omitValor2Column: true }
+    );
 
     this.applyStandardPdfFooter(doc, { executiveSignatures: true });
     this.savePdfWithAudit(doc, `VISION_GENERAL_CONTABLE_${new Date().toISOString().split('T')[0]}.pdf`, 'Vision General Contable', String(context?.filterLabel ?? '').trim());
@@ -1376,7 +1409,7 @@ class ReportService {
       ? `${dates[0].toLocaleDateString('es-VE')} a ${dates[dates.length - 1].toLocaleDateString('es-VE')}`
       : 'Sin registros';
     doc.setFontSize(18); doc.setTextColor(100, 20, 20);
-    doc.text('PASIVOS CIRCULANTES — CUENTAS POR PAGAR (AP)', 14, 22);
+    doc.text('CUENTAS POR PAGAR', 14, 22);
     doc.setFontSize(9); doc.setTextColor(150);
     doc.text(`Periodo: ${periodLabel}`, 14, 30);
     const filterLabel = String(options?.filterLabel ?? '').trim() || 'Sin filtros adicionales';
