@@ -1630,7 +1630,30 @@ export class DataService {
     const bankName = String(tx.bankName ?? '').trim();
     if (!bankName) return;
     if (bankName.toUpperCase() === 'OTRO') return;
-    await addDoc(collection(db, 'bank_transactions'), tx as any);
+    const resolvedBankId = String(tx.bankId ?? '').trim() || this.resolveBankIdByName(bankName) || '';
+    const txCurrency = String(tx?.currency ?? '').trim().toUpperCase() === 'VES' ? 'VES' : 'USD';
+    const requiredOutflow = txCurrency === 'VES'
+      ? Math.abs(Number(tx?.amountVES ?? 0) < 0 ? Number(tx?.amountVES ?? 0) : 0)
+      : Math.abs(Number(tx?.amountUSD ?? 0) < 0 ? Number(tx?.amountUSD ?? 0) : 0);
+
+    // Guardrail global: no permitir salidas bancarias si el banco no tiene saldo disponible suficiente.
+    // Se valida a nivel BANCO (no cuenta), por diseño operativo con múltiples cuentas por banco.
+    if (resolvedBankId && requiredOutflow > 0.0001) {
+      const availableBalance = await this.getAvailableBankBalance({
+        bankId: resolvedBankId,
+        currency: txCurrency
+      });
+      if (availableBalance + 0.005 < requiredOutflow) {
+        throw new Error(
+          `Saldo insuficiente en banco ${bankName}. Disponible ${txCurrency === 'VES' ? 'Bs' : '$'} ${availableBalance.toFixed(2)} para salida de ${txCurrency === 'VES' ? 'Bs' : '$'} ${requiredOutflow.toFixed(2)}.`
+        );
+      }
+    }
+
+    await addDoc(collection(db, 'bank_transactions'), {
+      ...(tx as any),
+      bankId: resolvedBankId || String(tx.bankId ?? '').trim()
+    });
   }
 
   private isMissingSupabaseColumn(error: any, table: string, column: string) {
@@ -8968,13 +8991,17 @@ export class DataService {
           actorUserId: payload.user?.id ?? '',
           createdAt: new Date().toISOString()
         };
-        await addDoc(collection(db, 'bank_transactions'), withdrawalTx as any);
+        await this.appendBankTransaction(withdrawalTx);
       } else {
         console.warn(
           'CAJA-01: no se registró bank_transaction para retiro de caja (ningún banco/cuenta resuelto para el método; configure banco con método y cuentas).'
         );
       }
-    } catch (e) {
+    } catch (e: any) {
+      const msg = String(e?.message ?? e ?? '');
+      if (msg.toLowerCase().includes('saldo insuficiente en banco')) {
+        throw e;
+      }
       console.warn('CAJA-01: no se pudo registrar bank_transaction para retiro de caja:', e);
     }
 
@@ -9755,20 +9782,19 @@ export class DataService {
 
     const groupedUsage = new Map<string, number>();
     for (const line of normalizedLines) {
-      const key = `${line.bankResolution.bankId}|${line.bankResolution.accountId}|${line.currency}`;
+      const key = `${line.bankResolution.bankId}|${line.currency}`;
       const current = groupedUsage.get(key) ?? 0;
       groupedUsage.set(key, roundMoney(current + (line.currency === 'VES' ? line.amountVES : line.amountUSD)));
     }
 
     for (const [key, total] of groupedUsage.entries()) {
-      const [bankId, accountId, currencyValue] = key.split('|');
+      const [bankId, currencyValue] = key.split('|');
       const availableBalance = await this.getAvailableBankBalance({
         bankId,
-        accountId,
         currency: (currencyValue === 'VES' ? 'VES' : 'USD') as 'USD' | 'VES'
       });
       if (availableBalance + 0.005 < total) {
-        throw new Error(`Saldo insuficiente en la cuenta seleccionada. Disponible ${currencyValue === 'VES' ? 'Bs' : '$'} ${availableBalance.toFixed(2)} para consumir ${currencyValue === 'VES' ? 'Bs' : '$'} ${total.toFixed(2)}.`);
+        throw new Error(`Saldo insuficiente en el banco seleccionado. Disponible ${currencyValue === 'VES' ? 'Bs' : '$'} ${availableBalance.toFixed(2)} para consumir ${currencyValue === 'VES' ? 'Bs' : '$'} ${total.toFixed(2)}.`);
       }
     }
 

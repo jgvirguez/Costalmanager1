@@ -1283,9 +1283,12 @@ class ReportService {
   }
 
   exportCompanyLoansToPDF(loans: any[], arLoanEntries?: any[]) {
-    const doc = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' });
-    const pageWidth = Number(doc?.internal?.pageSize?.getWidth?.() ?? 297);
-    const leftRightMargin = 10;
+    // Carta (Letter) horizontal = 279.4 x 215.9 mm — coincide con hoja estándar en VE/US y evita recorte al imprimir A4-forzado en carta.
+    const doc = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'letter' });
+    const pageWidth = Number(doc.internal.pageSize.getWidth());
+    const tableSideMargin = 10;
+    const tableBottomReserve = 40;
+    const textMaxW = pageWidth - tableSideMargin * 2;
     const now = new Date().toLocaleString();
     const generatedBy = this.getReportOperatorLabel();
     const list = Array.isArray(loans) ? loans : [];
@@ -1310,14 +1313,16 @@ class ReportService {
 
     doc.setFontSize(16);
     doc.setTextColor(2, 44, 34);
-    doc.text('CARTERA DE PRESTAMOS INTERNOS', 14, 18);
-    doc.setFontSize(9);
+    doc.text('CARTERA DE PRESTAMOS INTERNOS', tableSideMargin, 16);
+    doc.setFontSize(8.5);
     doc.setTextColor(110);
-    doc.text(`Generado: ${now} | Operador: ${generatedBy}`, 14, 24);
-    doc.text(`Registros prestamos: ${list.length} | Documentos CxC vinculados en vista: ${arList.length}`, 14, 29);
+    doc.text(`Generado: ${now} | Operador: ${generatedBy}`, tableSideMargin, 22, { maxWidth: textMaxW });
+    doc.text(`Registros prestamos: ${list.length} | Documentos CxC vinculados en vista: ${arList.length}`, tableSideMargin, 27, { maxWidth: textMaxW });
 
     autoTable(doc, {
-      startY: 34,
+      startY: 32,
+      margin: { left: tableSideMargin, right: tableSideMargin, bottom: tableBottomReserve },
+      tableWidth: pageWidth - tableSideMargin * 2,
       head: [['INDICADOR', 'VALOR']],
       body: [
         ['Total prestado (historico)', this.formatUSD(principalTotal)],
@@ -1331,8 +1336,8 @@ class ReportService {
       ],
       theme: 'striped',
       headStyles: { fillColor: [2, 44, 34], textColor: [255, 255, 255] },
-      styles: { fontSize: 8 },
-      columnStyles: { 1: { halign: 'right', fontStyle: 'bold' } }
+      styles: { fontSize: 8, cellPadding: 1.2, overflow: 'linebreak' },
+      columnStyles: { 0: { cellWidth: textMaxW * 0.55 }, 1: { halign: 'right', fontStyle: 'bold', cellWidth: textMaxW * 0.45 } }
     });
 
     const rows = list.map((l: any) => {
@@ -1359,28 +1364,32 @@ class ReportService {
         this.formatUSD(recoveredLoan),
         due.toLocaleDateString('es-VE'),
         isOverdue ? 'VENCIDO' : statusLabel,
-        String(l?.sourceBankName ?? l?.sourceMethod ?? '').slice(0, 28)
+        String(l?.sourceBankName ?? l?.sourceMethod ?? '')
       ];
     });
 
+    const tw = pageWidth - tableSideMargin * 2;
     autoTable(doc, {
-      startY: Number((doc as any).lastAutoTable?.finalY ?? 64) + 6,
-      margin: { left: leftRightMargin, right: leftRightMargin },
-      tableWidth: pageWidth - (leftRightMargin * 2),
+      startY: Number((doc as any).lastAutoTable?.finalY ?? 64) + 5,
+      margin: { left: tableSideMargin, right: tableSideMargin, bottom: tableBottomReserve },
+      tableWidth: tw,
+      showHead: 'everyPage',
       head: [['PRESTAMO', 'TIPO', 'BENEFICIARIO', 'CI/RIF', 'MONTO', 'SALDO', 'RECUPERADO', 'VENCE', 'ESTADO', 'ORIGEN']],
       body: rows.length > 0 ? rows : [['—', '—', 'SIN PRESTAMOS REGISTRADOS', '', '', '', '', '', '', '']],
       theme: 'striped',
-      headStyles: { fillColor: [2, 44, 34], textColor: [255, 255, 255], fontStyle: 'bold' },
-      styles: { fontSize: 7.5 },
+      headStyles: { fillColor: [2, 44, 34], textColor: [255, 255, 255], fontStyle: 'bold', fontSize: 6.5 },
+      styles: { fontSize: 6.5, cellPadding: 1, overflow: 'linebreak', valign: 'middle' },
       columnStyles: {
-        2: { cellWidth: 40 },
-        3: { cellWidth: 20 },
-        4: { halign: 'right' },
-        5: { halign: 'right', fontStyle: 'bold' },
-        6: { halign: 'right' },
-        7: { halign: 'center' },
-        8: { halign: 'center', cellWidth: 18 },
-        9: { cellWidth: 28 }
+        0: { cellWidth: 24 },
+        1: { cellWidth: 18, halign: 'center' },
+        2: { cellWidth: 46 },
+        3: { cellWidth: 22 },
+        4: { cellWidth: 22, halign: 'right' },
+        5: { cellWidth: 22, halign: 'right', fontStyle: 'bold' },
+        6: { cellWidth: 22, halign: 'right' },
+        7: { cellWidth: 18, halign: 'center' },
+        8: { cellWidth: 16, halign: 'center' },
+        9: { cellWidth: 35 }
       },
       didParseCell: (data: any) => {
         if (data.section === 'body' && data.column.index === 8 && data.cell.raw === 'VENCIDO') {

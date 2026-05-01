@@ -38,8 +38,6 @@ import {
 } from 'lucide-react';
 import { dataService, ClientAdvance, SupplierAdvance, ExpenseCategory, EXPENSE_CATEGORIES, OperationalExpense, PurchaseInvoiceHistoryEntry, CompanyLoan, type MayorCuentaMovimientoRow } from '../../services/dataService';
 import {
-  computeNetBankBalanceFromTransactions,
-  getOpeningBalanceForAccount,
   isBankTransactionCountedForBalance,
   ledgerDeltaForBankAggregate,
   sumOpeningBalancesForBank
@@ -970,10 +968,10 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
     () =>
       showAPPaymentModal
         ? apPayLines
-            .filter((l) => String(l.bankId ?? '').trim() && String(l.accountId ?? '').trim())
+            .filter((l) => String(l.bankId ?? '').trim())
             .map((l) => ({
               bankId: String(l.bankId),
-              accountId: String(l.accountId),
+              accountId: '',
               currency: (getAPPaymentCurrency(l.method) === 'VES' ? 'VES' : 'USD') as 'USD' | 'VES'
             }))
         : [],
@@ -1033,21 +1031,6 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
       note: '',
       files: [] as File[]
     };
-  };
-
-  const getAPPaymentAccountBalance = (bankId: string, accountId: string, currency: 'USD' | 'VES') => {
-    if (!bankId || !accountId) return 0;
-    const bank = activeBanks.find((b: any) => String(b?.id ?? '') === String(bankId));
-    const acc = bank?.accounts?.find((a: any) => String(a?.id ?? '') === String(accountId));
-    const opening =
-      acc && String(acc?.currency ?? '').trim().toUpperCase() === currency ? getOpeningBalanceForAccount(acc) : 0;
-    return computeNetBankBalanceFromTransactions({
-      transactions: allBankTransactions,
-      bankId,
-      accountId,
-      currency,
-      openingBalance: opening
-    });
   };
 
   const apPayTotalUSD = React.useMemo(
@@ -1239,16 +1222,16 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
     }
     const groupedUsage = new Map<string, number>();
     for (const line of normalizedLines) {
-      const key = `${String(line.bank.id ?? '')}|${String(line.account.id ?? '')}|${line.currency}`;
+      const key = `${String(line.bank.id ?? '')}|${line.currency}`;
       const current = groupedUsage.get(key) ?? 0;
       groupedUsage.set(key, Math.round((current + (line.currency === 'VES' ? line.amountVES : line.amountUSD)) * 100) / 100);
     }
     for (const [key, totalUsed] of groupedUsage.entries()) {
-      const [bankId, accountId, currency] = key.split('|');
+      const [bankId, currency] = key.split('|');
       const cur = currency === 'VES' ? 'VES' : 'USD';
-      const available = await dataService.getAvailableBankBalance({ bankId, accountId, currency: cur });
+      const available = await dataService.getAvailableBankBalance({ bankId, currency: cur });
       if (available + 0.005 < totalUsed) {
-        setApPayError(`Saldo insuficiente en la cuenta seleccionada. Disponible ${currency === 'VES' ? 'Bs' : '$'} ${available.toFixed(2)} para consumir ${currency === 'VES' ? 'Bs' : '$'} ${totalUsed.toFixed(2)}.`);
+        setApPayError(`Saldo insuficiente en el banco seleccionado. Disponible ${currency === 'VES' ? 'Bs' : '$'} ${available.toFixed(2)} para consumir ${currency === 'VES' ? 'Bs' : '$'} ${totalUsed.toFixed(2)}.`);
         return;
       }
     }
@@ -4048,12 +4031,15 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
                              const rateUsed = currency === 'VES' ? (Number((line.rateUsed || '').replace(',', '.')) || 0) : 0;
                              const amountUSD = Number((line.amountUSD || '').replace(',', '.')) || 0;
                              const requiredVES = currency === 'VES' ? Math.round(amountUSD * rateUsed * 100) / 100 : 0;
-                             const apBalKey = bankBalanceMapKey(String(line.bankId ?? ''), String(line.accountId ?? ''), currency);
+                            const apBalKey = bankBalanceMapKey(String(line.bankId ?? ''), '', currency);
                              const apBalRow = apPayBankBalances.get(apBalKey);
-                             const availableBalance =
-                               apBalRow && !apBalRow.loading && !apBalRow.error
-                                 ? apBalRow.balance
-                                 : getAPPaymentAccountBalance(String(line.bankId ?? ''), String(line.accountId ?? ''), currency);
+                            // CxP debe mostrar exactamente el mismo saldo del módulo Bancos
+                            // (fuente oficial: getAvailableBankBalance vía useBankBalances),
+                            // evitando diferencias temporales por cálculos locales con ventanas parciales.
+                            const availableBalance =
+                              apBalRow && !apBalRow.loading && !apBalRow.error
+                                ? apBalRow.balance
+                                : 0;
                              return (
                                <div key={line.id} className="rounded-[1.75rem] border border-slate-200 bg-white p-5 space-y-4">
                                  <div className="flex items-center justify-between gap-3">
@@ -4134,10 +4120,13 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
                                    <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-4">
                                      <div className="text-[8px] font-black uppercase tracking-widest text-slate-400">Saldo disponible</div>
                                      <div className="mt-2 text-[16px] font-black text-emerald-700 font-mono flex items-baseline gap-2 flex-wrap">
-                                       {currency === 'VES' ? 'Bs' : '$'} {availableBalance.toFixed(2)}
-                                       {apBalRow?.loading && (
-                                         <span className="text-[9px] font-bold text-slate-400 normal-case">sincronizando…</span>
-                                       )}
+                                      {apBalRow?.loading ? (
+                                        <span className="text-[9px] font-bold text-slate-400 normal-case">sincronizando…</span>
+                                      ) : apBalRow?.error ? (
+                                        <span className="text-[9px] font-bold text-amber-500 normal-case">sin datos</span>
+                                      ) : (
+                                        <>{currency === 'VES' ? 'Bs' : '$'} {availableBalance.toFixed(2)}</>
+                                      )}
                                      </div>
                                    </div>
                                    <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-4">
@@ -5901,9 +5890,9 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
       )}
 
       {showBankTxModal && (
-        <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-6">
-          <div className="w-full max-w-5xl bg-white rounded-[2rem] shadow-2xl overflow-hidden border border-slate-200">
-            <div className="p-8 border-b bg-slate-50/30 flex justify-between items-start">
+        <div className="fixed inset-0 z-50 bg-black/40 flex items-start justify-center p-3 md:p-6 overflow-hidden">
+          <div className="w-full max-w-5xl max-h-[92vh] bg-white rounded-[1.25rem] md:rounded-[2rem] shadow-2xl overflow-hidden border border-slate-200 flex flex-col">
+            <div className="sticky top-0 z-10 p-4 md:p-8 border-b bg-slate-50/95 backdrop-blur-sm flex justify-between items-start shrink-0">
               <div>
                 <h4 className="font-headline font-black text-lg uppercase tracking-tight">Movimientos del Banco</h4>
                 <div className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mt-1">
@@ -5923,7 +5912,7 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
               >Cerrar</button>
             </div>
 
-            <div className="p-8">
+            <div className="p-4 md:p-8 overflow-y-auto min-h-0">
               {bankTxLoading ? (
                 <div className="p-12 text-center opacity-40 font-black uppercase tracking-widest text-[10px]">Cargando...</div>
               ) : bankTxError ? (
@@ -6018,33 +6007,6 @@ export function FinanceView({ exchangeRate = 36.50, internalRate, onStartARColle
                       </div>
                     </div>
                   )}
-
-                  <div className="mb-6 p-4 rounded-2xl border border-indigo-200 bg-indigo-50/60">
-                    <div className="text-[9px] font-black uppercase tracking-widest text-indigo-800">
-                      Saldo operativo (libro)
-                    </div>
-                    <p className="text-[8px] text-slate-600 font-bold mt-1 leading-relaxed">
-                      Mismo criterio que CxP y validación de salidas: saldo inicial + movimientos que cuentan para balance
-                      (no pendientes / anulados). La tabla puede estar filtrada y no coincide con la suma de totales arriba.
-                    </p>
-                    <div className="mt-3 flex flex-wrap gap-4 text-[11px] font-black font-mono">
-                      {bankTxOpBal.loading ? (
-                        <span className="text-slate-500 uppercase tracking-widest text-[9px]">Calculando…</span>
-                      ) : (
-                        <>
-                          {bankTxOpBal.usd !== null && (
-                            <span className="text-emerald-800">USD: {usd(bankTxOpBal.usd, 2)}</span>
-                          )}
-                          {bankTxOpBal.ves !== null && (
-                            <span className="text-slate-900">Bs: {bs(bankTxOpBal.ves, 2)}</span>
-                          )}
-                          {bankTxOpBal.usd === null && bankTxOpBal.ves === null && (
-                            <span className="text-slate-400 uppercase text-[9px]">No disponible</span>
-                          )}
-                        </>
-                      )}
-                    </div>
-                  </div>
 
                   {bankTxList.length === 0 ? (
                     <div className="p-12 text-center opacity-30 font-black uppercase tracking-widest text-[10px]">Sin movimientos</div>
